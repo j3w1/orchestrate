@@ -28,6 +28,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup = subparsers.add_parser("setup", help="discover and write the small project profile")
     _project_argument(setup)
     setup.add_argument("--force", action="store_true", help="refresh bounded name-based discovery")
+    setup.add_argument(
+        "--acknowledge-profile",
+        action="store_true",
+        help="select reviewed profile changes as the host-local operational configuration",
+    )
     setup.add_argument("--json", action="store_true")
 
     run = subparsers.add_parser("implement", help="prepare and supervise one implementation owner")
@@ -128,15 +133,24 @@ def _execute(args: argparse.Namespace, raw_argv: list[str]) -> tuple[dict[str, A
     root = Path(getattr(args, "project", ".")).resolve()
     if _needs_bootstrap(args.command):
         exit_code = launch_controller(root, raw_argv, client=client)
-        return {"schema": "orchestrate-report/v1", "status": "completed", "controllerExitCode": exit_code}, False
+        return {"_bootstrapPassthrough": True, "controllerExitCode": exit_code}, False
     if args.command == "setup":
-        profile = setup_project(root, force=args.force)
+        profile = setup_project(
+            root,
+            force=args.force,
+            acknowledge_profile=args.acknowledge_profile,
+        )
         with StateStore(profile.root):
             pass
         return {
             "schema": "orchestrate-report/v1",
             "status": "configured",
             "profile": os.fspath(profile.path),
+            "profileSelection": {
+                "digest": profile.digest,
+                "source": profile.selection_source,
+                "historyDigest": profile.selection_history_digest,
+            },
             "reader": profile.value["reader"]["kind"],
             "instructions": profile.value["instructions"],
             "taskEntrypoints": profile.value["taskEntrypoints"],
@@ -159,7 +173,7 @@ def _execute(args: argparse.Namespace, raw_argv: list[str]) -> tuple[dict[str, A
         if not inner_args:
             raise OrchestrateError("bootstrap requires orchestrate arguments after --", code="bootstrap_arguments_missing")
         exit_code = launch_controller(root, inner_args, client=client)
-        return {"schema": "orchestrate-report/v1", "status": "completed", "controllerExitCode": exit_code}, False
+        return {"_bootstrapPassthrough": True, "controllerExitCode": exit_code}, False
     if args.command == "doctor":
         try:
             if args.active_run_probe:
@@ -208,7 +222,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         emit_json = bool(getattr(args, "json", False))
     except (OrchestrateError, OrcaCommandError) as exc:
         report = _error(exc)
-        emit_json = bool(getattr(args, "json", False))
+        emit_json = bool(getattr(args, "json", False)) or (
+            args.command == "bootstrap" and "--json" in getattr(args, "arguments", [])
+        )
+    if report.get("_bootstrapPassthrough") is True:
+        exit_code = report.get("controllerExitCode")
+        return exit_code if isinstance(exit_code, int) else 1
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n" if emit_json else _human_text(report)
     exit_code = 0 if report.get("status") not in {"blocked", "worker_failed"} else 1
     if report.get("status") == "interrupted":

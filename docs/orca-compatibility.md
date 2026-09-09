@@ -12,7 +12,11 @@ The strict client resolves one executable for the process, invokes argument arra
 
 A caller with no Orca terminal association failed closed with `no_active_sender_terminal`. Scrubbing environment variables from a subprocess launched by an active terminal is not proof of an independent controller: installed source shows an implicit active-terminal fallback that may select another live identity.
 
-A plain Python process in a fresh ordinary Orca shell successfully owned a Run. A fresh Python process in that same shell rebound the Run and created a Task. A source-backed architecture assessment confirmed that a dedicated ordinary-terminal bootstrap fits the approved plan and requires no established public API change. It must not pass another terminal through `--from`, transplant identity, or let a dispatched worker route around dispatch depth.
+A plain Python process in a fresh ordinary Orca shell successfully owned a Run. In the ordinary PowerShell terminal observed for this correction, `ORCA_TERMINAL_HANDLE`, `ORCA_AGENT_HOOK_TOKEN`, and `ORCA_AGENT_HOOK_ENDPOINT` were present while `ORCA_AGENT_LAUNCH_TOKEN` was absent; `terminal show` omitted `agentIdentity`, `worker-list` succeeded, and no record matched that terminal. A separate reviewer agent's terminal reported `agentIdentity=codex`. These facts mean hook credentials are not agent identity. The implementation therefore binds the exact terminal, worktree, Dispatch inventory, and Run state without clearing environment values, substituting `--from`, or treating terminal resource state as Dispatch status.
+
+A fresh Python process in that same ordinary shell rebound the Run and created a Task. A source-backed architecture assessment confirmed that a dedicated ordinary-terminal bootstrap fits the approved plan and requires no established public API change. It must not pass another terminal through `--from`, transplant identity, or let a dispatched worker route around dispatch depth.
+
+The observed `worker-start` result is flat: exact `runId`, `taskId`, `dispatchId`, `state`, `stage`, `setup`, `launch.requested`, `launch.effective`, `effects`, `residualResources`, and `mutation`. `worker-show` supplies the corresponding Dispatch identity and worker `startOptions`/resource readback. The observed `request-show` result carries `requestId`, `state`, `method`, timestamps, `receipt`, and `interpretation`; only the nested mutation request ID is a retry identity. Terminal create/send/close return their operation-specific resource receipt but no `result.mutation`, so bootstrap records intentions before calls and never retries an uncertain effect.
 
 ## Historical failed launch
 
@@ -36,6 +40,8 @@ result.wait = {
 ```
 
 Fast-exiting terminal output was not durably readable from the terminal stream. The bootstrap therefore requires both that native exit receipt and its own atomically written host-local result; missing or contradictory evidence cannot become exit code zero.
+
+Observed structured release readbacks establish owned-and-released and retained `user_takeover` states using exact resource ID, ownership/release/reason, Dispatch ownership, timestamp/error, and archive fields. Live external retention and `no_owned_resource` have not been exercised for this candidate and are not accepted by the implementation.
 
 ## Gate state
 

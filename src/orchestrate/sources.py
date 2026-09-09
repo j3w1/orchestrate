@@ -11,7 +11,7 @@ import subprocess
 from typing import Any
 
 from .errors import OrchestrateError
-from .profile import ProjectProfile
+from .profile import PROFILE_NAME, ProjectProfile, instruction_inventory
 from .safeio import approved_project_path, is_sensitive_source, read_project_bytes
 
 
@@ -65,7 +65,7 @@ def _status_map(root: Path) -> dict[str, str]:
 
 
 def _assert_readable_source(root: Path, relative: str) -> tuple[Path, bytes]:
-    return (root / relative).resolve(), read_project_bytes(root, relative)
+    return root / relative, read_project_bytes(root, relative)
 
 
 def _head_blob(root: Path, relative: str) -> bytes | None:
@@ -98,11 +98,13 @@ def _index_bytes(root: Path, relative: str) -> bytes | None:
 def build_source_index(profile: ProjectProfile, *, extra_sources: set[str] | None = None) -> SourceIndex:
     root = profile.root
     status = _status_map(root)
+    instructions = set(instruction_inventory(root))
     configured = {
         *profile.value["instructions"],
+        *instructions,
         *profile.value["taskEntrypoints"],
         *profile.value["commandManifests"],
-        ".orchestrate.json",
+        PROFILE_NAME,
         *(extra_sources or set()),
         *profile.value.get("candidateSources", []),
     }
@@ -128,6 +130,7 @@ def build_source_index(profile: ProjectProfile, *, extra_sources: set[str] | Non
             continue
         _, raw = _assert_readable_source(root, relative)
         head = _head_blob(root, relative)
+        changed_authority = relative == PROFILE_NAME and head != raw
         changed_instruction = (
             relative in profile.value["instructions"]
             or Path(relative).name in {"AGENTS.md", "CLAUDE.md"}
@@ -142,7 +145,7 @@ def build_source_index(profile: ProjectProfile, *, extra_sources: set[str] | Non
                 "indexSha256": (
                     _sha256(index) if (index := _index_bytes(root, relative)) is not None else None
                 ),
-                "authority": "candidate-restrict-only" if changed_instruction else "consulted",
+                "authority": "candidate-restrict-only" if changed_authority or changed_instruction else "consulted",
             }
         )
 
@@ -178,6 +181,14 @@ def build_source_index(profile: ProjectProfile, *, extra_sources: set[str] | Non
     value: dict[str, Any] = {
         "schema": SOURCE_INDEX_SCHEMA,
         "reader": profile.value["reader"]["kind"],
+        "operationalProfile": {
+            "selectedDigest": profile.digest,
+            "candidateDigest": profile.candidate_digest,
+            "selectionSource": profile.selection_source,
+            "selectionHistoryDigest": profile.selection_history_digest,
+            "candidateChanged": profile.candidate_changed,
+        },
+        "instructionInventory": sorted(instructions),
         "candidate": candidate,
         "sources": records,
         "limitations": [

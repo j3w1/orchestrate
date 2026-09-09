@@ -28,6 +28,8 @@ orchestrate doctor --json
 orchestrate implement "Make test_fixture.py pass by changing only fixture.py, then run py -3.13 -m unittest -v" --project $fixture --json
 ```
 
+The explicit initial setup selects the generated profile in host-local state. Review the file before implementation. If you edit it, run `orchestrate setup --project $fixture --acknowledge-profile --json` only after reviewing that exact change; a Git commit alone does not update the operational selection.
+
 The command creates a dedicated focused ordinary terminal when called outside Orca. Record the returned Run and Task. If waiting is interrupted, do not start a second objective:
 
 ```powershell

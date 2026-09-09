@@ -5,16 +5,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
 from typing import Any
+import uuid
 
 from .errors import OrchestrateError
 from .safeio import approved_project_path, read_project_bytes
+from .state import RunLock, make_private_state_directory, project_key, require_private_state_target, state_home, utc_now
 
 
 PROFILE_SCHEMA = "orchestrate-profile/v1"
 PROFILE_NAME = ".orchestrate.json"
+PROFILE_SELECTION_SCHEMA = "orchestrate-operational-profile-selection/v1"
 INSTRUCTION_NAMES = ("AGENTS.md", "CLAUDE.md")
+MAX_INSTRUCTION_PATHS = 256
+MAX_GIT_PATH_BYTES = 4 * 1024 * 1024
 TASK_ENTRYPOINTS = (
     "CURRENT.md",
     "docs/implementation-plan.md",
@@ -57,11 +64,233 @@ def _find_repo_root(start: Path) -> Path:
     )
 
 
+def _git_bytes(root: Path, *arguments: str, allow_failure: bool = False) -> bytes | None:
+    completed = subprocess.run(
+        ("git", "-C", os.fspath(root), *arguments),
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode:
+        if allow_failure:
+            return None
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise OrchestrateError(f"Git instruction inventory failed: {detail}", code="git_inspection_failed")
+    if len(completed.stdout) > MAX_GIT_PATH_BYTES:
+        raise OrchestrateError(
+            "Git instruction inventory exceeded its bounded output limit",
+            code="instruction_inventory_too_large",
+        )
+    return completed.stdout
+
+
+def instruction_inventory(root: Path) -> tuple[str, ...]:
+    """List conventional tracked, untracked, and ignored instruction files."""
+
+    repo = _find_repo_root(root)
+    commands = (
+        ("ls-files", "-z", "--cached"),
+        ("ls-files", "-z", "--others", "--exclude-standard"),
+        ("ls-files", "-z", "--others", "--ignored", "--exclude-standard"),
+    )
+    paths: set[str] = set()
+    for arguments in commands:
+        raw = _git_bytes(repo, *arguments)
+        assert raw is not None
+        try:
+            names = raw.decode("utf-8", errors="strict").split("\0")
+        except UnicodeDecodeError as exc:
+            raise OrchestrateError("Git instruction paths are not strict UTF-8", code="git_path_encoding") from exc
+        paths.update(
+            name.replace("\\", "/")
+            for name in names
+            if name and Path(name).name in INSTRUCTION_NAMES
+        )
+        if len(paths) > MAX_INSTRUCTION_PATHS:
+            raise OrchestrateError(
+                f"More than {MAX_INSTRUCTION_PATHS} conventional instruction files require an explicit scope decision",
+                code="instruction_inventory_too_large",
+            )
+    return tuple(sorted(paths))
+
+
+def _profile_candidate(root: Path) -> tuple[bytes, dict[str, Any]]:
+    path = root / PROFILE_NAME
+    if not path.is_file():
+        raise OrchestrateError(
+            f"{PROFILE_NAME} is missing; run 'orchestrate setup' first",
+            code="profile_missing",
+        )
+    try:
+        raw = read_project_bytes(root, PROFILE_NAME)
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OrchestrateError(f"Cannot read {path}: {exc}", code="profile_unreadable") from exc
+    return raw, validate_profile(value, root=root)
+
+
+def _selection_path(root: Path) -> Path:
+    home = state_home()
+    directory = require_private_state_target(
+        root,
+        home / "operational-profiles" / project_key(root),
+    )
+    return directory / "selection.json"
+
+
+def _selection_record(root: Path) -> tuple[dict[str, Any], str]:
+    path = _selection_path(root)
+    try:
+        raw = path.read_bytes()
+        record = json.loads(raw)
+    except FileNotFoundError as exc:
+        raise OrchestrateError(
+            "No host-local operational profile selection exists; run orchestrate setup explicitly",
+            code="profile_selection_missing",
+        ) from exc
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OrchestrateError(
+            "The host-local operational profile selection history is unreadable",
+            code="profile_selection_invalid",
+        ) from exc
+    if (
+        not isinstance(record, dict)
+        or record.get("schema") != PROFILE_SELECTION_SCHEMA
+        or record.get("projectKey") != project_key(root)
+        or not isinstance(record.get("activeDigest"), str)
+        or not isinstance(record.get("history"), list)
+        or not record["history"]
+    ):
+        raise OrchestrateError(
+            "The host-local operational profile selection history is invalid",
+            code="profile_selection_invalid",
+        )
+    active: dict[str, Any] | None = None
+    for entry in record["history"]:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("digest"), str)
+            or not isinstance(entry.get("selectedRaw"), str)
+            or not isinstance(entry.get("selectedAt"), str)
+            or entry.get("source") not in {"initial-setup-selection", "explicit-configuration-acknowledgment"}
+        ):
+            raise OrchestrateError(
+                "The host-local operational profile selection history is invalid",
+                code="profile_selection_invalid",
+            )
+        selected_raw = entry["selectedRaw"].encode("utf-8")
+        if hashlib.sha256(selected_raw).hexdigest() != entry["digest"]:
+            raise OrchestrateError(
+                "The host-local operational profile selection digest does not match its source bytes",
+                code="profile_selection_invalid",
+            )
+        try:
+            decoded = json.loads(selected_raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise OrchestrateError(
+                "The selected operational profile source is invalid",
+                code="profile_selection_invalid",
+            ) from exc
+        if not isinstance(decoded, dict) or decoded.get("schema") != PROFILE_SCHEMA:
+            raise OrchestrateError(
+                "The selected operational profile source is invalid",
+                code="profile_selection_invalid",
+            )
+        if entry["digest"] == record["activeDigest"]:
+            active = entry
+    if active is None:
+        raise OrchestrateError(
+            "The active operational profile digest is absent from its selection history",
+            code="profile_selection_invalid",
+        )
+    return record, hashlib.sha256(raw).hexdigest()
+
+
+def _write_profile_selection(
+    root: Path,
+    raw: bytes,
+    *,
+    acknowledge: bool,
+    allow_initial: bool,
+) -> None:
+    path = _selection_path(root)
+    make_private_state_directory(root, path.parent)
+    with RunLock(path.parent / "selection.lock"):
+        _write_profile_selection_locked(
+            root,
+            path,
+            raw,
+            acknowledge=acknowledge,
+            allow_initial=allow_initial,
+        )
+
+
+def _write_profile_selection_locked(
+    root: Path,
+    path: Path,
+    raw: bytes,
+    *,
+    acknowledge: bool,
+    allow_initial: bool,
+) -> None:
+    digest = hashlib.sha256(raw).hexdigest()
+    if path.exists():
+        record, _ = _selection_record(root)
+        if record["activeDigest"] == digest:
+            return
+        if not acknowledge:
+            raise OrchestrateError(
+                "The project profile differs from the selected operational configuration; review it and rerun setup with --acknowledge-profile",
+                code="profile_selection_changed",
+                data={"selectedDigest": record["activeDigest"], "candidateDigest": digest},
+            )
+        source = "explicit-configuration-acknowledgment"
+    else:
+        if not allow_initial and not acknowledge:
+            raise OrchestrateError(
+                "An existing project profile has no selection history; review it and rerun setup with --acknowledge-profile",
+                code="profile_selection_missing",
+            )
+        record = {
+            "schema": PROFILE_SELECTION_SCHEMA,
+            "projectKey": project_key(root),
+            "activeDigest": digest,
+            "history": [],
+        }
+        source = "initial-setup-selection" if allow_initial else "explicit-configuration-acknowledgment"
+    record["activeDigest"] = digest
+    record["history"].append(
+        {
+            "digest": digest,
+            "selectedRaw": raw.decode("utf-8"),
+            "selectedAt": utc_now(),
+            "source": source,
+        }
+    )
+    encoded = _canonical_json(record)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(encoded)
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        temporary.replace(path)
+    except OSError as exc:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise OrchestrateError(
+            "The host-local operational profile selection could not be written",
+            code="profile_selection_unavailable",
+        ) from exc
+
+
 def discover_profile(root: Path) -> dict[str, Any]:
     """Perform bounded name-based discovery without running hooks or checks."""
 
     repo = _find_repo_root(root)
-    instructions = [name for name in INSTRUCTION_NAMES if (repo / name).is_file()]
+    instructions = list(instruction_inventory(repo))
     tasks = [name for name in TASK_ENTRYPOINTS if (repo / name).is_file()]
     manifests = [name for name in COMMAND_MANIFESTS if (repo / name).is_file()]
     reader = (
@@ -137,35 +366,65 @@ class ProjectProfile:
     path: Path
     value: dict[str, Any]
     digest: str
+    candidate_digest: str
+    selection_source: str
+    selection_history_digest: str
+    candidate_changed: bool
 
     @classmethod
     def load(cls, root: Path) -> "ProjectProfile":
         repo = _find_repo_root(root)
         path = repo / PROFILE_NAME
-        if not path.is_file():
-            raise OrchestrateError(
-                f"{PROFILE_NAME} is missing; run 'orchestrate setup' first",
-                code="profile_missing",
-            )
+        raw, _candidate = _profile_candidate(repo)
+        candidate_digest = hashlib.sha256(raw).hexdigest()
+        selection, selection_history_digest = _selection_record(repo)
+        matching = [
+            entry for entry in selection["history"]
+            if entry["digest"] == selection["activeDigest"]
+        ]
+        selected = matching[-1]
+        selected_raw = selected["selectedRaw"].encode("utf-8")
         try:
-            raw = read_project_bytes(repo, PROFILE_NAME)
-            value = json.loads(raw)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise OrchestrateError(f"Cannot read {path}: {exc}", code="profile_unreadable") from exc
-        validated = validate_profile(value, root=repo)
-        return cls(repo, path, validated, hashlib.sha256(raw).hexdigest())
+            selected_value = json.loads(selected_raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise OrchestrateError(
+                "The selected operational profile source cannot be decoded",
+                code="profile_selection_invalid",
+            ) from exc
+        operational = validate_profile(selected_value, root=repo)
+        return cls(
+            repo,
+            path,
+            operational,
+            selection["activeDigest"],
+            candidate_digest,
+            selected["source"],
+            selection_history_digest,
+            raw != selected_raw,
+        )
 
 
-def setup_project(root: Path, *, force: bool = False) -> ProjectProfile:
+def setup_project(
+    root: Path,
+    *,
+    force: bool = False,
+    acknowledge_profile: bool = False,
+) -> ProjectProfile:
     repo = _find_repo_root(root)
     path = repo / PROFILE_NAME
-    if path.exists() and not force:
-        return ProjectProfile.load(repo)
-    approved_project_path(repo, PROFILE_NAME, require_file=False)
-    value = discover_profile(repo)
-    raw = _canonical_json(value)
-    try:
-        path.write_bytes(raw)
-    except OSError as exc:
-        raise OrchestrateError(f"Cannot write {path}: {exc}", code="profile_write_failed") from exc
-    return ProjectProfile(repo, path, validate_profile(value, root=repo), hashlib.sha256(raw).hexdigest())
+    created = not path.exists()
+    if created or force:
+        approved_project_path(repo, PROFILE_NAME, require_file=False)
+        raw = _canonical_json(discover_profile(repo))
+        try:
+            path.write_bytes(raw)
+        except OSError as exc:
+            raise OrchestrateError(f"Cannot write {path}: {exc}", code="profile_write_failed") from exc
+    raw, _ = _profile_candidate(repo)
+    _write_profile_selection(
+        repo,
+        raw,
+        acknowledge=acknowledge_profile,
+        allow_initial=created,
+    )
+    return ProjectProfile.load(repo)

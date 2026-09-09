@@ -3,21 +3,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 from typing import Any
 
 from .errors import OrchestrateError
-from .profile import ProjectProfile
+from .profile import ProjectProfile, instruction_inventory
 from .safeio import approved_project_path
 from .sources import read_project_text, read_source_text
 
 
-CE_TASK_ID = re.compile(r"\bCE-\d{4,}\b")
+CE_TASK_ID = re.compile(r"\bCE-[0-9]{4}\b")
 MARKDOWN_LINK = re.compile(r"\[[^]]*\]\(([^)]+)\)")
 BACKTICK_PATH = re.compile(r"`([^`]+\.(?:md|json))`")
+CE_MANIFEST_KIND = "ce-systems-project-log-manifest"
+CE_QUERY_COMMAND = "pnpm run project-log:query -- <term>"
+CE_QUERY_SCRIPT = "scripts/quality/project-log.mjs"
+CE_QUERY_PACKAGE_SCRIPT = "node scripts/quality/project-log.mjs query"
+CE_QUERY_MAX_ENTRIES = 12
+CE_QUERY_MAX_BYTES = 32768
+CE_QUERY_STDOUT_LIMIT = 65536
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,46 +82,186 @@ def _line_targets(profile: ProjectProfile, source: str, line: str) -> list[str]:
     return result
 
 
-def _contains_exact_task(value: object, task_id: str) -> bool:
-    if isinstance(value, str):
-        return task_id in set(CE_TASK_ID.findall(value))
-    if isinstance(value, dict):
-        return any(_contains_exact_task(key, task_id) or _contains_exact_task(nested, task_id) for key, nested in value.items())
-    if isinstance(value, list):
-        return any(_contains_exact_task(item, task_id) for item in value)
-    return False
+def _manifest_shards(value: object, task_id: str, root: Path) -> list[dict[str, Any]]:
+    """Validate the public CE shard manifest and select every exact-task shard."""
 
-
-def _path_values(value: object) -> list[str]:
-    if isinstance(value, str):
-        clean = value.split("#", 1)[0].lower()
-        return [value] if clean.endswith((".md", ".json")) else []
-    if isinstance(value, dict):
-        return [path for nested in value.values() for path in _path_values(nested)]
-    if isinstance(value, list):
-        return [path for nested in value for path in _path_values(nested)]
-    return []
-
-
-def _manifest_routes(value: object, task_id: str) -> list[str]:
-    routes: list[str] = []
-    if isinstance(value, dict):
-        direct_match = any(
-            _contains_exact_task(key, task_id)
-            or (not isinstance(nested, (dict, list)) and _contains_exact_task(nested, task_id))
-            for key, nested in value.items()
+    if (
+        not isinstance(value, dict)
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+        or value.get("kind") != CE_MANIFEST_KIND
+        or not isinstance(value.get("shards"), list)
+    ):
+        raise OrchestrateError("The CE project-log manifest has an unknown schema", code="ce_manifest_invalid")
+    access = value.get("agent_access")
+    if (
+        not isinstance(access, dict)
+        or access.get("default_loading") != "manifest-only"
+        or access.get("closed_shards_preloaded") is not False
+        or access.get("query_command") != CE_QUERY_COMMAND
+    ):
+        raise OrchestrateError("The CE project-log query contract is unavailable", code="ce_manifest_invalid")
+    required_strings = ("path", "state", "sha256", "git_blob_sha")
+    required_integers = (
+        "sequence",
+        "bytes",
+        "entry_count",
+        "legacy_start_byte",
+        "legacy_end_byte_exclusive",
+    )
+    selected: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    seen_sequences: set[int] = set()
+    for shard in value["shards"]:
+        if (
+            not isinstance(shard, dict)
+            or any(not isinstance(shard.get(key), str) for key in required_strings)
+            or any(shard.get(key) is not None and not isinstance(shard.get(key), str) for key in ("first_heading", "last_heading"))
+            or any(type(shard.get(key)) is not int or shard[key] < 0 for key in required_integers)
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", shard["sha256"])
+            or not re.fullmatch(r"[0-9a-fA-F]{40,64}", shard["git_blob_sha"])
+            or not isinstance(shard.get("task_ids"), list)
+            or not all(isinstance(item, str) and CE_TASK_ID.fullmatch(item) for item in shard["task_ids"])
+        ):
+            raise OrchestrateError("The CE project-log manifest contains a malformed shard", code="ce_manifest_invalid")
+        path = shard["path"]
+        if "\\" in path:
+            raise OrchestrateError("The CE project-log manifest contains a non-canonical shard path", code="ce_manifest_invalid")
+        if (
+            path in seen_paths
+            or shard["sequence"] in seen_sequences
+            or len(set(shard["task_ids"])) != len(shard["task_ids"])
+            or shard["legacy_end_byte_exclusive"] < shard["legacy_start_byte"]
+        ):
+            raise OrchestrateError("The CE project-log manifest repeats or contradicts a shard identity", code="ce_manifest_invalid")
+        seen_paths.add(path)
+        seen_sequences.add(shard["sequence"])
+        if task_id in shard["task_ids"]:
+            approved_project_path(root, path)
+            selected.append({**shard, "path": path})
+    if not selected:
+        raise OrchestrateError(
+            f"The project-log manifest has no exact shard for {task_id}",
+            code="ce_log_unresolved",
         )
-        if direct_match:
-            routes.extend(_path_values(value))
-        for key, nested in value.items():
-            if _contains_exact_task(key, task_id):
-                routes.extend(_path_values(nested))
-            if isinstance(nested, (dict, list)):
-                routes.extend(_manifest_routes(nested, task_id))
-    elif isinstance(value, list):
-        for item in value:
-            routes.extend(_manifest_routes(item, task_id))
-    return routes
+    return selected
+
+
+def _git_source_state(root: Path, paths: list[str]) -> bytes:
+    completed = subprocess.run(
+        ("git", "-C", os.fspath(root), "status", "--porcelain=v1", "-z", "--", *paths),
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode:
+        raise OrchestrateError("CE query source binding could not be inspected", code="ce_query_source_unavailable")
+    return completed.stdout
+
+
+def _require_tracked_query_sources(root: Path, paths: list[str]) -> None:
+    for path in paths:
+        tracked = subprocess.run(
+            ("git", "-C", os.fspath(root), "ls-files", "--error-unmatch", "--", path),
+            capture_output=True,
+            check=False,
+        )
+        if tracked.returncode:
+            raise OrchestrateError("The CE query implementation is not a tracked source", code="ce_query_source_unavailable")
+    if _git_source_state(root, paths):
+        raise OrchestrateError("The CE query implementation or manifest is mutable", code="ce_query_source_changed")
+
+
+def _run_ce_query(
+    profile: ProjectProfile,
+    task_id: str,
+    *,
+    manifest_text: str,
+    package_text: str,
+    script_text: str,
+) -> dict[str, Any]:
+    paths = ["package.json", CE_QUERY_SCRIPT, "docs/project-log/manifest.json"]
+    _require_tracked_query_sources(profile.root, paths)
+    baseline = _git_source_state(profile.root, paths)
+    arguments = (
+        "pnpm",
+        "--silent",
+        "run",
+        "project-log:query",
+        "--",
+        task_id,
+        "--json",
+        "--max-entries",
+        str(CE_QUERY_MAX_ENTRIES),
+        "--max-bytes",
+        str(CE_QUERY_MAX_BYTES),
+    )
+    try:
+        completed = subprocess.run(
+            arguments,
+            cwd=profile.root,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OrchestrateError("The bounded CE project-log query is unavailable", code="ce_query_unavailable") from exc
+    if completed.returncode:
+        raise OrchestrateError("The bounded CE project-log query failed", code="ce_query_failed")
+    if len(completed.stdout) > CE_QUERY_STDOUT_LIMIT:
+        raise OrchestrateError("The CE project-log query exceeded its output boundary", code="ce_query_incomplete")
+    try:
+        result = json.loads(completed.stdout.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OrchestrateError("The CE project-log query did not return strict JSON", code="ce_query_invalid") from exc
+    stable = {
+        "gitState": _git_source_state(profile.root, paths) == baseline,
+        "manifest": read_project_text(profile, "docs/project-log/manifest.json") == manifest_text,
+        "package": read_project_text(profile, "package.json") == package_text,
+        "queryScript": read_project_text(profile, CE_QUERY_SCRIPT) == script_text,
+    }
+    if not all(stable.values()):
+        raise OrchestrateError(
+            "The CE query source binding changed during execution",
+            code="ce_query_source_changed",
+            data={"stable": stable},
+        )
+    if not isinstance(result, dict):
+        raise OrchestrateError("The CE project-log query returned an unknown shape", code="ce_query_invalid")
+    return result
+
+
+def _validate_ce_query(result: object, task_id: str, shards: list[dict[str, Any]]) -> dict[str, Any]:
+    expected_paths = [item["path"] for item in shards]
+    if (
+        not isinstance(result, dict)
+        or set(result) != {"term", "exact_task", "selected_shards", "matches", "omitted_matches"}
+        or result.get("term") != task_id
+        or result.get("exact_task") != task_id
+        or result.get("selected_shards") != expected_paths
+        or not isinstance(result.get("matches"), list)
+        or type(result.get("omitted_matches")) is not int
+        or result["omitted_matches"] < 0
+    ):
+        raise OrchestrateError("The CE project-log query did not bind the exact task and shards", code="ce_query_invalid")
+    sequences = {item["path"]: item["sequence"] for item in shards}
+    for match in result["matches"]:
+        if (
+            not isinstance(match, dict)
+            or set(match) != {"path", "sequence", "heading", "text"}
+            or match.get("path") not in sequences
+            or type(match.get("sequence")) is not int
+            or match.get("sequence") != sequences[match["path"]]
+            or not isinstance(match.get("heading"), str)
+            or not isinstance(match.get("text"), str)
+        ):
+            raise OrchestrateError("The CE project-log query returned an unrelated or malformed match", code="ce_query_invalid")
+    if result["omitted_matches"]:
+        raise OrchestrateError(
+            "The CE project-log query omitted matching entries and is incomplete",
+            code="ce_query_incomplete",
+            data={"omittedMatches": result["omitted_matches"]},
+        )
+    return result
 
 
 def _read_ce(profile: ProjectProfile, objective: str | None, instructions: dict[str, str], manifests: dict[str, str]) -> ReaderResult:
@@ -159,24 +308,39 @@ def _read_ce(profile: ProjectProfile, objective: str | None, instructions: dict[
         manifest_value = json.loads(raw_manifest)
     except json.JSONDecodeError as exc:
         raise OrchestrateError("The project-log manifest is invalid JSON", code="ce_manifest_invalid") from exc
-    log_targets: list[str] = []
-    for raw_target in _manifest_routes(manifest_value, task_id):
-        relative = _relative_target(profile, manifest_path, raw_target)
-        if relative and (profile.root / relative).is_file():
-            log_targets.append(relative)
-    log_targets = sorted(set(log_targets))
-    if not log_targets:
+    selected_shards = _manifest_shards(manifest_value, task_id, profile.root)
+    package_text = manifests.get("package.json")
+    if not isinstance(package_text, str):
         raise OrchestrateError(
-            f"The project-log manifest has no exact route for {task_id}",
-            code="ce_log_unresolved",
+            "The selected CE operational profile does not include package.json command authority",
+            code="ce_query_authority_missing",
         )
-    log_documents = {path: read_project_text(profile, path) for path in log_targets}
+    try:
+        package = json.loads(package_text)
+    except json.JSONDecodeError as exc:
+        raise OrchestrateError("The CE package command manifest is invalid JSON", code="ce_query_authority_missing") from exc
+    scripts = package.get("scripts") if isinstance(package, dict) else None
+    if not isinstance(scripts, dict) or scripts.get("project-log:query") != CE_QUERY_PACKAGE_SCRIPT:
+        raise OrchestrateError("The CE project-log query command is not exactly bound", code="ce_query_authority_missing")
+    script_text = read_project_text(profile, CE_QUERY_SCRIPT)
+    query_result = _validate_ce_query(
+        _run_ce_query(
+            profile,
+            task_id,
+            manifest_text=raw_manifest,
+            package_text=package_text,
+            script_text=script_text,
+        ),
+        task_id,
+        selected_shards,
+    )
+    log_targets = [item["path"] for item in selected_shards]
     task_sources = {
         registry_path: registry,
         manifest_path: raw_manifest,
         task_path: task_text,
+        CE_QUERY_SCRIPT: script_text,
         **context_documents,
-        **log_documents,
     }
     consulted = frozenset({*instructions, *manifests, *task_sources})
     return ReaderResult(
@@ -191,13 +355,25 @@ def _read_ce(profile: ProjectProfile, objective: str | None, instructions: dict[
             "contextPackets": context_targets,
             "logManifest": manifest_path,
             "logs": log_targets,
+            "logShards": selected_shards,
+            "projectLogQuery": {
+                "command": "pnpm --silent run project-log:query -- <exact-task> --json --max-entries 12 --max-bytes 32768",
+                "resultSha256": hashlib.sha256(
+                    json.dumps(query_result, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+                "matches": query_result["matches"],
+                "omittedMatches": query_result["omitted_matches"],
+            },
         },
         consulted,
     )
 
 
 def read_project(profile: ProjectProfile, objective: str | None = None) -> ReaderResult:
-    instructions = _configured_text(profile, "instructions")
+    instructions = {
+        relative: read_project_text(profile, relative)
+        for relative in instruction_inventory(profile.root)
+    }
     manifests = _configured_text(profile, "commandManifests")
     kind = profile.value["reader"]["kind"]
     if kind == "ce-gd":

@@ -77,26 +77,88 @@ class DoctorTests(unittest.TestCase):
     def worktree_response(self) -> dict[str, Any]:
         return {"ok": True, "result": {"worktree": {"id": "worktree_1", "path": str(self.root)}}}
 
+    def caller_responses(self, run_id: str | None = None) -> list[dict[str, Any]]:
+        return [
+            {
+                "ok": True,
+                "result": {
+                    "terminal": {
+                        "handle": "term_plain",
+                        "worktreeId": "worktree_1",
+                        "worktreePath": str(self.root),
+                        "executionHostId": "local",
+                        "connected": True,
+                        "writable": True,
+                    }
+                },
+            },
+            self.worktree_response(),
+            {"ok": True, "result": {"workers": []}},
+            {"ok": True, "result": {"run": None if run_id is None else {"id": run_id}}},
+            self.worktree_response(),
+        ]
+
     def mint_probe(self) -> dict[str, Any]:
         client = FakeClient(
-            [
-                self.worktree_response(),
+            [*self.caller_responses(),
                 {"ok": True, "result": {"run": None}},
-                {"ok": True, "id": "request_run", "result": {"run": {"id": "run_probe"}}},
+                {
+                    "ok": True,
+                    "result": {
+                        "run": {"id": "run_probe"},
+                        "mutation": {"requestId": "request_run", "replayed": False},
+                    },
+                },
             ]
         )
         return create_run_probe(client, project=self.root)  # type: ignore[arg-type]
 
     def worker_responses(self, objective: str, messages: list[Any], *, outcome: str = "succeeded") -> list[dict[str, Any]]:
         native = "completed" if outcome == "succeeded" else "failed"
+        launch = {
+            "requested": {"agent": "codex", "model": None, "effort": None},
+            "effective": {"agent": "codex", "model": None, "effort": None},
+        }
+        terminal_effect = {"kind": "terminal", "role": "agent", "action": "created", "id": "term_probe"}
         return [
-            self.worktree_response(),
+            *self.caller_responses("run_probe"),
             {"ok": True, "result": {"run": {"id": "run_probe", "objective": objective}}},
             {"ok": True, "result": {"tasks": []}},
             {"ok": True, "result": {"run": {"id": "run_probe"}}},
-            {"ok": True, "result": {"run": {"id": "run_probe"}}},
-            {"ok": True, "result": {"task": {"id": "task_probe"}}},
-            {"ok": True, "result": {"dispatch": {"id": "dispatch_probe"}}},
+            {
+                "ok": True,
+                "result": {
+                    "run": {"id": "run_probe"},
+                    "mutation": {"requestId": "request_use", "replayed": False},
+                },
+            },
+            {
+                "ok": True,
+                "result": {
+                    "task": {"id": "task_probe"},
+                    "mutation": {"requestId": "request_task", "replayed": False},
+                },
+            },
+            {
+                "ok": True,
+                "result": {
+                    "runId": "run_probe",
+                    "taskId": "task_probe",
+                    "dispatchId": "dispatch_probe",
+                    "state": "ready",
+                    "stage": "input_accepted",
+                    "setup": {"state": "not_applicable"},
+                    "launch": launch,
+                    "effects": [
+                        {"kind": "worktree", "action": "reused", "id": "worktree_1"},
+                        {"kind": "setup", "action": "not_applicable", "state": "not_applicable"},
+                        terminal_effect,
+                        {"kind": "dispatch_input", "role": "agent", "id": "term_probe", "state": "accepted"},
+                    ],
+                    "residualResources": [terminal_effect],
+                    "mutation": {"requestId": "request_worker", "replayed": False},
+                },
+            },
             {"ok": True, "result": {"deliveryId": "delivery_probe", "messages": messages}},
             {
                 "ok": True,
@@ -115,15 +177,41 @@ class DoctorTests(unittest.TestCase):
                     "tasks": [{"id": "task_probe", "run_id": "run_probe", "status": native}]
                 },
             },
-            {"ok": True, "result": {"releaseState": "released"}},
+            {
+                "ok": True,
+                "result": {
+                    "dispatchId": "dispatch_probe",
+                    "state": "released",
+                    "mutation": {"requestId": "request_release", "replayed": False},
+                },
+            },
             {
                 "ok": True,
                 "result": {
                     "dispatch": {"id": "dispatch_probe"},
-                    "terminalResource": {"releaseState": "released"},
+                    "terminalResource": {
+                        "id": "terminal-resource-probe",
+                        "ownershipState": "released",
+                        "releaseState": "released",
+                        "retainedReason": None,
+                        "originDispatchId": "dispatch_probe",
+                        "ownerDispatchId": "dispatch_probe",
+                        "terminalHandle": "term_probe",
+                        "worktreeId": "worktree_1",
+                        "releaseRequestedAt": "2026-01-01T00:00:00Z",
+                        "releaseCompletedAt": "2026-01-01T00:00:01Z",
+                        "releaseError": None,
+                        "archive": {"source": "transcript", "status": "captured"},
+                    },
                 },
             },
-            {"ok": True, "result": {"messages": []}},
+            {
+                "ok": True,
+                "result": {
+                    "messages": [],
+                    "mutation": {"requestId": "request_ack", "replayed": False},
+                },
+            },
         ]
 
     def done_message(self, *, outcome: str = "succeeded", files: list[str] | None = None) -> dict[str, Any]:
@@ -169,7 +257,10 @@ class DoctorTests(unittest.TestCase):
     def test_run_probe_mints_one_use_receipt_with_full_success_receipt(self) -> None:
         report = self.mint_probe()
         self.assertTrue(report["probeToken"].startswith("probe_"))
-        self.assertEqual(report["receipts"]["runCreate"]["id"], "request_run")
+        self.assertEqual(
+            report["receipts"]["runCreate"]["result"]["mutation"]["requestId"],
+            "request_run",
+        )
         receipt = json.loads((Path(self.state_temp.name) / "probes" / f"{report['probeToken']}.json").read_text())
         self.assertEqual(receipt["state"], "ready")
         self.assertEqual(receipt["baseline"]["root"], str(self.root.resolve()))
@@ -182,10 +273,12 @@ class DoctorTests(unittest.TestCase):
 
     def test_agent_caller_is_rejected_before_native_mutation(self) -> None:
         with patch.dict(os.environ, {"ORCA_AGENT_HOOK_TOKEN": "present"}):
-            client = FakeClient([])
+            terminal = self.caller_responses()[0]
+            terminal["result"]["terminal"]["agentIdentity"] = "codex"
+            client = FakeClient([terminal])
             with self.assertRaisesRegex(ProbeContractError, "reasoning-agent"):
                 create_run_probe(client, project=self.root)  # type: ignore[arg-type]
-            self.assertEqual(client.calls, [])
+            self.assertEqual(len(client.calls), 1)
 
     def test_worker_probe_releases_before_acknowledging(self) -> None:
         minted = self.mint_probe()
@@ -212,7 +305,7 @@ class DoctorTests(unittest.TestCase):
     def test_malformed_fifo_entry_is_not_filtered_or_acknowledged(self) -> None:
         minted = self.mint_probe()
         receipt = json.loads((Path(self.state_temp.name) / "probes" / f"{minted['probeToken']}.json").read_text())
-        client = FakeClient(self.worker_responses(receipt["objective"], [17, self.done_message()])[:8])
+        client = FakeClient(self.worker_responses(receipt["objective"], [17, self.done_message()])[:12])
         with self.assertRaisesRegex(ProbeContractError, "delivery id or messages"):
             run_worker_probe(client, minted["probeToken"], project=self.root, wait_timeout_ms=10)  # type: ignore[arg-type]
         self.assertFalse(any("--ack" in call or "worker-release" in call for call in client.calls))
@@ -222,7 +315,7 @@ class DoctorTests(unittest.TestCase):
             "timed out",
             OrcaCommandResult(("orca", "orchestration", "run-create"), -1, "", "keepalive", None),
         )
-        client = FakeClient([self.worktree_response(), {"ok": True, "result": {"run": None}}, timeout])
+        client = FakeClient([*self.caller_responses(), {"ok": True, "result": {"run": None}}, timeout])
         with self.assertRaises(ProbeContractError) as caught:
             create_run_probe(client, project=self.root)  # type: ignore[arg-type]
         self.assertEqual(caught.exception.data["stage"], "runCreate")

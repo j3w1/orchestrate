@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -12,12 +12,13 @@ from pathlib import Path
 import sqlite3
 import sys
 import uuid
-from typing import Any
+from typing import Any, Iterator
 
 from .errors import OrchestrateError
 
 
 STATE_SCHEMA = "orchestrate-state/v1"
+SYNC_STATE_COMPONENTS = {"box", "dropbox", "google drive", "googledrive", "iclouddrive", "syncthing"}
 
 
 def utc_now() -> str:
@@ -28,7 +29,7 @@ def state_home(environment: dict[str, str] | None = None) -> Path:
     env = os.environ if environment is None else environment
     override = env.get("ORCHESTRATE_HOME", "").strip()
     if override:
-        return Path(override).resolve()
+        return Path(os.path.abspath(override))
     if sys.platform == "win32":
         base = env.get("LOCALAPPDATA", "").strip()
         if not base:
@@ -41,6 +42,68 @@ def state_home(environment: dict[str, str] | None = None) -> Path:
 def project_key(root: Path) -> str:
     normalized = os.path.normcase(os.fspath(root.resolve())).encode("utf-8")
     return hashlib.sha256(normalized).hexdigest()
+
+
+def require_private_state_target(project_root: Path, target: Path) -> Path:
+    """Reject positively identified project-contained or synchronized state."""
+
+    project = project_root.resolve()
+    lexical_project = Path(os.path.abspath(os.fspath(project_root)))
+    lexical = Path(os.path.abspath(os.fspath(target)))
+    selected = lexical.resolve()
+    try:
+        inside_project = (
+            lexical == lexical_project
+            or lexical.is_relative_to(lexical_project)
+            or selected == project
+            or selected.is_relative_to(project)
+        )
+    except (OSError, ValueError):
+        inside_project = False
+    if inside_project:
+        raise OrchestrateError(
+            "Host-local orchestrate state cannot be stored inside the project tree",
+            code="state_storage_unsafe",
+        )
+    if sys.platform == "win32" and os.fspath(lexical).startswith("\\\\"):
+        raise OrchestrateError(
+            "Host-local orchestrate state cannot use a UNC network root",
+            code="state_storage_unsafe",
+        )
+
+    lowered = tuple(part.casefold() for part in selected.parts)
+    component_sync = any(
+        part in SYNC_STATE_COMPONENTS or part == "onedrive" or part.startswith("onedrive ")
+        for part in lowered
+    )
+    environment_sync = False
+    for name in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer"):
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            sync_root = Path(raw).resolve()
+            if selected == sync_root or selected.is_relative_to(sync_root):
+                environment_sync = True
+                break
+        except (OSError, ValueError):
+            continue
+    if component_sync or environment_sync:
+        raise OrchestrateError(
+            "Host-local orchestrate state cannot use a recognized synchronized-storage root",
+            code="state_storage_unsafe",
+        )
+    return selected
+
+
+def make_private_state_directory(project_root: Path, target: Path) -> Path:
+    directory = require_private_state_target(project_root, target)
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        pass
+    return directory
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,10 +177,12 @@ class RunLock(AbstractContextManager["RunLock"]):
 class StateStore(AbstractContextManager["StateStore"]):
     def __init__(self, root: Path, *, home: Path | None = None) -> None:
         self.root = root.resolve()
-        self.home = state_home() if home is None else home.resolve()
+        self.home = state_home() if home is None else Path(os.path.abspath(os.fspath(home)))
         self.project_key = project_key(self.root)
-        self.directory = self.home / "projects" / self.project_key
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.directory = make_private_state_directory(
+            self.root,
+            self.home / "projects" / self.project_key,
+        )
         self.path = self.directory / "state.sqlite3"
         self.connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
         self.connection.row_factory = sqlite3.Row
@@ -130,6 +195,19 @@ class StateStore(AbstractContextManager["StateStore"]):
 
     def __exit__(self, *_: object) -> None:
         self.connection.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Provide a real transaction while the connection otherwise autocommits."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        else:
+            self.connection.execute("COMMIT")
 
     def _migrate(self) -> None:
         existing = self.connection.execute(
@@ -258,7 +336,9 @@ class StateStore(AbstractContextManager["StateStore"]):
         terminal = ("worker_succeeded", "worker_failed", "blocked", "completed")
         placeholders = ",".join("?" for _ in terminal)
         rows = self.connection.execute(
-            f"SELECT * FROM runs WHERE phase NOT IN ({placeholders}) ORDER BY created_at",
+            f"""SELECT * FROM runs
+                  WHERE phase NOT IN ({placeholders}) OR delivery_id IS NOT NULL
+                  ORDER BY created_at""",
             terminal,
         ).fetchall()
         return [self._row_to_run(row) for row in rows]
@@ -349,9 +429,21 @@ class StateStore(AbstractContextManager["StateStore"]):
         ).fetchall()
 
     def save_packet(self, run_local_id: str, task_id: str, packet: dict[str, Any]) -> None:
+        encoded = json.dumps(packet, sort_keys=True)
+        existing = self.connection.execute(
+            "SELECT packet_json FROM packets WHERE run_local_id = ? AND task_id = ?",
+            (run_local_id, task_id),
+        ).fetchone()
+        if existing is not None:
+            if existing["packet_json"] != encoded:
+                raise OrchestrateError(
+                    "The immutable Task packet conflicts with its stored identity",
+                    code="packet_identity_conflict",
+                )
+            return
         self.connection.execute(
-            "INSERT OR REPLACE INTO packets VALUES (?, ?, ?, ?)",
-            (run_local_id, task_id, json.dumps(packet, sort_keys=True), utc_now()),
+            "INSERT INTO packets VALUES (?, ?, ?, ?)",
+            (run_local_id, task_id, encoded, utc_now()),
         )
 
     def get_packet(self, run_local_id: str, task_id: str) -> dict[str, Any]:
@@ -365,19 +457,44 @@ class StateStore(AbstractContextManager["StateStore"]):
 
     def journal_delivery(self, run_local_id: str, delivery_id: str, response: dict[str, Any], messages: list[dict[str, Any]]) -> None:
         now = utc_now()
-        with self.connection:
+        encoded_response = json.dumps(response, sort_keys=True)
+        normalized: list[tuple[str, int, str, str]] = []
+        for ordinal, message in enumerate(messages):
+            encoded_message = json.dumps(message, sort_keys=True)
+            message_id = message.get("id")
+            if not isinstance(message_id, str):
+                message_id = f"ordinal-{ordinal}-{hashlib.sha256(encoded_message.encode()).hexdigest()}"
+            message_type = message.get("type") if isinstance(message.get("type"), str) else "malformed"
+            normalized.append((message_id, ordinal, message_type, encoded_message))
+        with self.transaction():
+            existing = self.connection.execute(
+                "SELECT response_json FROM deliveries WHERE run_local_id = ? AND delivery_id = ?",
+                (run_local_id, delivery_id),
+            ).fetchone()
+            if existing is not None:
+                existing_messages = self.connection.execute(
+                    """SELECT message_id, ordinal, message_type, payload_json FROM delivery_messages
+                       WHERE run_local_id = ? AND delivery_id = ? ORDER BY ordinal""",
+                    (run_local_id, delivery_id),
+                ).fetchall()
+                existing_normalized = [
+                    (row["message_id"], row["ordinal"], row["message_type"], row["payload_json"])
+                    for row in existing_messages
+                ]
+                if existing["response_json"] != encoded_response or existing_normalized != normalized:
+                    raise OrchestrateError(
+                        "The immutable FIFO Delivery conflicts with its stored identity",
+                        code="delivery_identity_conflict",
+                    )
+                return
             self.connection.execute(
-                "INSERT OR IGNORE INTO deliveries VALUES (?, ?, ?, 0, ?)",
-                (run_local_id, delivery_id, json.dumps(response, sort_keys=True), now),
+                "INSERT INTO deliveries VALUES (?, ?, ?, 0, ?)",
+                (run_local_id, delivery_id, encoded_response, now),
             )
-            for ordinal, message in enumerate(messages):
-                message_id = message.get("id")
-                if not isinstance(message_id, str):
-                    message_id = f"ordinal-{ordinal}-{hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest()}"
-                message_type = message.get("type") if isinstance(message.get("type"), str) else "malformed"
+            for message_id, ordinal, message_type, encoded_message in normalized:
                 self.connection.execute(
-                    "INSERT OR IGNORE INTO delivery_messages VALUES (?, ?, ?, ?, ?, ?, 'observed')",
-                    (run_local_id, delivery_id, message_id, ordinal, message_type, json.dumps(message, sort_keys=True)),
+                    "INSERT INTO delivery_messages VALUES (?, ?, ?, ?, ?, ?, 'observed')",
+                    (run_local_id, delivery_id, message_id, ordinal, message_type, encoded_message),
                 )
 
     def messages(self, run_local_id: str, delivery_id: str) -> list[sqlite3.Row]:
@@ -391,6 +508,53 @@ class StateStore(AbstractContextManager["StateStore"]):
             "UPDATE delivery_messages SET effect_status = ? WHERE run_local_id = ? AND delivery_id = ? AND message_id = ?",
             (status, run_local_id, delivery_id, message_id),
         )
+
+    def delivery_messages(self, run_local_id: str, delivery_id: str) -> list[dict[str, Any]]:
+        rows = self.messages(run_local_id, delivery_id)
+        return [json.loads(row["payload_json"]) for row in rows]
+
+    def finalize_worker_message(
+        self,
+        *,
+        run_local_id: str,
+        delivery_id: str,
+        message_id: str,
+        outcome: str,
+        subject: str,
+        payload: object,
+    ) -> RunRecord:
+        """Commit evidence, terminal phase, and message effect atomically."""
+
+        evidence_id = "evidence_" + hashlib.sha256(
+            f"{run_local_id}\0{delivery_id}\0{message_id}\0worker-claim".encode("utf-8")
+        ).hexdigest()
+        now = utc_now()
+        phase = "worker_succeeded" if outcome == "succeeded" else "worker_failed"
+        verification = "pending" if outcome == "succeeded" else "not_run"
+        with self.transaction():
+            self.connection.execute(
+                "INSERT OR IGNORE INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    evidence_id,
+                    run_local_id,
+                    "worker-claim",
+                    outcome,
+                    subject,
+                    json.dumps(payload, sort_keys=True),
+                    now,
+                ),
+            )
+            self.connection.execute(
+                """UPDATE runs SET worker_outcome = ?, phase = ?, verification_status = ?, updated_at = ?
+                   WHERE local_id = ?""",
+                (outcome, phase, verification, now, run_local_id),
+            )
+            self.connection.execute(
+                """UPDATE delivery_messages SET effect_status = 'processed'
+                   WHERE run_local_id = ? AND delivery_id = ? AND message_id = ?""",
+                (run_local_id, delivery_id, message_id),
+            )
+        return self.get_run(run_local_id)
 
     def save_question(self, *, message_id: str, run_local_id: str, delivery_id: str, body: str) -> None:
         self.connection.execute(
@@ -417,10 +581,15 @@ class StateStore(AbstractContextManager["StateStore"]):
         ).fetchall()
 
     def mark_delivery_acked(self, run_local_id: str, delivery_id: str) -> None:
-        self.connection.execute(
-            "UPDATE deliveries SET acked = 1 WHERE run_local_id = ? AND delivery_id = ?",
-            (run_local_id, delivery_id),
-        )
+        with self.transaction():
+            self.connection.execute(
+                "UPDATE deliveries SET acked = 1 WHERE run_local_id = ? AND delivery_id = ?",
+                (run_local_id, delivery_id),
+            )
+            self.connection.execute(
+                "UPDATE runs SET delivery_id = NULL, updated_at = ? WHERE local_id = ? AND delivery_id = ?",
+                (utc_now(), run_local_id, delivery_id),
+            )
 
     def add_evidence(self, run_local_id: str, *, kind: str, status: str, subject: str, payload: object) -> None:
         self.connection.execute(

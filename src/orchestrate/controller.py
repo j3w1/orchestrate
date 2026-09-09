@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
-import os
 from pathlib import Path
 import time
 from typing import Any
 
 from .config import load_owner_model
 from .errors import OrchestrateError
+from .identity import ControllerIdentity, require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError
 from .packets import make_packet, packet_spec
 from .profile import ProjectProfile
@@ -37,37 +37,6 @@ def _entity_id(payload: Mapping[str, Any], entity: str) -> str:
     return nested["id"]
 
 
-def require_plain_controller(environment: Mapping[str, str] | None = None) -> None:
-    env = os.environ if environment is None else environment
-    if not env.get("ORCA_TERMINAL_HANDLE"):
-        raise OrchestrateError(
-            "No owned Orca terminal is present; use the bootstrap command",
-            code="controller_terminal_missing",
-        )
-    agent_markers = (
-        "ORCA_AGENT_HOOK_TOKEN",
-        "ORCA_AGENT_HOOK_ENDPOINT",
-        "ORCA_AGENT_LAUNCH_TOKEN",
-    )
-    if any(env.get(key) for key in agent_markers):
-        raise OrchestrateError(
-            "A reasoning-agent terminal cannot act as the persistent controller; use a dedicated ordinary Orca terminal",
-            code="agent_terminal_not_controller",
-        )
-
-
-def _verify_workspace(client: OrcaClient, root: Path) -> None:
-    payload = client.run_json("worktree", "current", "--json")
-    worktree = _result(payload).get("worktree")
-    if not isinstance(worktree, Mapping) or not isinstance(worktree.get("path"), str):
-        raise OrchestrateError("worktree current omitted the exact path", code="orca_contract_error")
-    if Path(worktree["path"]).resolve() != root.resolve():
-        raise OrchestrateError(
-            "The ordinary controller terminal is not in the exact project worktree",
-            code="controller_worktree_mismatch",
-        )
-
-
 def _request_id(payload: Mapping[str, Any] | None) -> str | None:
     if not isinstance(payload, Mapping):
         return None
@@ -82,9 +51,24 @@ def _request_id(payload: Mapping[str, Any] | None) -> str | None:
         mutation = data.get("mutation")
         if isinstance(mutation, Mapping) and isinstance(mutation.get("requestId"), str):
             return mutation["requestId"]
-        if isinstance(data.get("requestId"), str):
-            return data["requestId"]
     return None
+
+
+def _mutation_request_id(payload: Mapping[str, Any], *, expected: str | None = None) -> str:
+    request_id = _request_id(payload)
+    mutation = _result(payload).get("mutation")
+    if (
+        not isinstance(mutation, Mapping)
+        or not isinstance(request_id, str)
+        or not request_id
+        or not isinstance(mutation.get("replayed"), bool)
+        or (expected is not None and request_id != expected)
+    ):
+        raise OrchestrateError(
+            "Orca mutation response omitted its exact native request receipt",
+            code="orca_contract_error",
+        )
+    return request_id
 
 
 def _mutation(
@@ -113,10 +97,24 @@ def _mutation(
             code="mutation_outcome_uncertain",
             data={"operation": operation, "requestId": _request_id(payload), "orcaCode": exc.code},
         ) from exc
+    try:
+        request_id = _mutation_request_id(response)
+    except OrchestrateError as exc:
+        store.mark_intention(
+            intention_id,
+            "uncertain",
+            request_id=_request_id(response),
+            error=response,
+        )
+        raise OrchestrateError(
+            f"Orca mutation {operation} succeeded without a recoverable native request receipt",
+            code="mutation_outcome_uncertain",
+            data={"operation": operation, "requestId": _request_id(response)},
+        ) from exc
     store.mark_intention(
         intention_id,
         "applied",
-        request_id=_request_id(response),
+        request_id=request_id,
         response=response,
     )
     return response
@@ -140,7 +138,9 @@ def _apply_intention(store: StateStore, run: RunRecord, operation: str, response
             fields["phase"] = "task_created"
         return store.update_run(run.local_id, **fields)
     if operation == "worker-start":
-        identity = _entity_id(response, "dispatch")
+        identity = _result(response).get("dispatchId")
+        if not isinstance(identity, str):
+            raise OrchestrateError("worker-start response omitted dispatchId", code="orca_contract_error")
         if run.dispatch_id not in {None, identity}:
             raise OrchestrateError("Dispatch receipt conflicts with the local binding", code="intention_binding_mismatch")
         fields = {"dispatch_id": identity}
@@ -178,22 +178,113 @@ def _replay_applied_intentions(store: StateStore, run: RunRecord) -> RunRecord:
     return current
 
 
-def _request_state(payload: Mapping[str, Any]) -> str | None:
+def _request_state(
+    payload: Mapping[str, Any],
+    *,
+    expected_request_id: str,
+    expected_method: str | None = None,
+) -> str:
     result = _result(payload)
-    for key in ("status", "state"):
-        if isinstance(result.get(key), str):
-            return result[key]
-    request = result.get("request")
-    if isinstance(request, Mapping):
-        for key in ("status", "state"):
-            if isinstance(request.get(key), str):
-                return request[key]
-    return None
+    required = {
+        "requestId": str,
+        "state": str,
+        "method": str,
+        "createdAt": str,
+        "updatedAt": str,
+    }
+    if any(not isinstance(result.get(key), kind) for key, kind in required.items()):
+        raise OrchestrateError("request-show returned an unknown public shape", code="orca_contract_error")
+    if (
+        result["requestId"] != expected_request_id
+        or (expected_method is not None and result["method"] != expected_method)
+        or "receipt" not in result
+        or "interpretation" not in result
+    ):
+        raise OrchestrateError("request-show did not bind the exact native request", code="orca_contract_error")
+    return result["state"]
+
+
+def _stored_argument(arguments: list[object], name: str) -> str:
+    if name not in arguments or arguments.index(name) + 1 >= len(arguments):
+        raise OrchestrateError("Stored worker-start arguments are incomplete", code="orca_contract_error")
+    value = arguments[arguments.index(name) + 1]
+    if not isinstance(value, str):
+        raise OrchestrateError("Stored worker-start arguments are malformed", code="orca_contract_error")
+    return value
+
+
+def _reconcile_confirmed_worker_start(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    *,
+    intention_id: str,
+    arguments: list[object],
+    response: Mapping[str, Any],
+    request_id: str,
+) -> RunRecord:
+    agent = _stored_argument(arguments, "--agent")
+    model = _stored_argument(arguments, "--model")
+    effort = _stored_argument(arguments, "--effort")
+    worktree_selector = _stored_argument(arguments, "--worktree")
+    worktree_id, terminal_id = _validate_worker_start(
+        response,
+        run=run,
+        worktree_id=None,
+        agent=agent,
+        model=model,
+        effort=effort,
+    )
+    dispatch_id = _result(response)["dispatchId"]
+    readback = client.run_json(
+        "orchestration",
+        "worker-show",
+        "--dispatch",
+        str(dispatch_id),
+        "--json",
+    )
+    _validate_worker_start_readback(
+        readback,
+        run=run,
+        dispatch_id=dispatch_id,
+        worktree_id=worktree_id,
+        worktree_selector=worktree_selector,
+        terminal_id=terminal_id,
+        agent=agent,
+        model=model,
+        effort=effort,
+    )
+    store.mark_intention(
+        intention_id,
+        "applied",
+        request_id=request_id,
+        response=response,
+    )
+    return _apply_intention(store, run, "worker-start", response)
 
 
 def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) -> RunRecord:
     current = _replay_applied_intentions(store, run)
     for row in store.unsettled_intentions(run.local_id):
+        if row["status"] == "receipt_confirmed":
+            if row["operation"] != "worker-start" or not row["response_json"]:
+                raise OrchestrateError(
+                    "A confirmed mutation receipt has no bounded reconciliation path",
+                    code="unknown_external_effect",
+                    data={"operation": row["operation"], "intentionId": row["id"]},
+                )
+            arguments = json.loads(row["arguments_json"])
+            response = json.loads(row["response_json"])
+            current = _reconcile_confirmed_worker_start(
+                client,
+                store,
+                current,
+                intention_id=row["id"],
+                arguments=arguments,
+                response=response,
+                request_id=row["request_id"],
+            )
+            continue
         if row["status"] == "prepared":
             arguments = json.loads(row["arguments_json"])
             store.mark_intention(row["id"], "invoking")
@@ -212,13 +303,44 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                     code="mutation_outcome_uncertain",
                     data={"operation": row["operation"], "requestId": _request_id(payload)},
                 ) from exc
-            store.mark_intention(
-                row["id"],
-                "applied",
-                request_id=_request_id(replay),
-                response=replay,
-            )
-            current = _apply_intention(store, current, row["operation"], replay)
+            try:
+                replay_request_id = _mutation_request_id(replay)
+            except OrchestrateError as exc:
+                store.mark_intention(
+                    row["id"],
+                    "uncertain",
+                    request_id=_request_id(replay),
+                    error=replay,
+                )
+                raise OrchestrateError(
+                    "A prepared Orca mutation succeeded without a recoverable native request receipt",
+                    code="mutation_outcome_uncertain",
+                    data={"operation": row["operation"], "requestId": _request_id(replay)},
+                ) from exc
+            if row["operation"] == "worker-start":
+                store.mark_intention(
+                    row["id"],
+                    "receipt_confirmed",
+                    request_id=replay_request_id,
+                    response=replay,
+                )
+                current = _reconcile_confirmed_worker_start(
+                    client,
+                    store,
+                    current,
+                    intention_id=row["id"],
+                    arguments=arguments,
+                    response=replay,
+                    request_id=replay_request_id,
+                )
+            else:
+                store.mark_intention(
+                    row["id"],
+                    "applied",
+                    request_id=replay_request_id,
+                    response=replay,
+                )
+                current = _apply_intention(store, current, row["operation"], replay)
             continue
         request_id = row["request_id"]
         if not request_id:
@@ -227,8 +349,22 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                 code="unknown_external_effect",
                 data={"operation": row["operation"], "intentionId": row["id"]},
             )
+        arguments = json.loads(row["arguments_json"])
+        expected_method = (
+            f"{arguments[0]}.{arguments[1]}"
+            if isinstance(arguments, list)
+            and len(arguments) >= 2
+            and all(isinstance(item, str) for item in arguments[:2])
+            else None
+        )
+        if expected_method is None:
+            raise OrchestrateError("Stored mutation arguments are malformed", code="orca_contract_error")
         receipt = client.run_json("orchestration", "request-show", "--request", request_id, "--json")
-        state = _request_state(receipt)
+        state = _request_state(
+            receipt,
+            expected_request_id=request_id,
+            expected_method=expected_method,
+        )
         if state == "absent":
             raise OrchestrateError(
                 "Orca has no receipt for an uncertain mutation; absence is not proof of no effect",
@@ -240,10 +376,27 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                 f"Unrecognized request recovery state: {state}",
                 code="orca_contract_error",
             )
-        arguments = json.loads(row["arguments_json"])
         replay = client.run_json(*arguments, "--retry-request", request_id, "--json")
-        store.mark_intention(row["id"], "applied", request_id=request_id, response=replay)
-        current = _apply_intention(store, current, row["operation"], replay)
+        _mutation_request_id(replay, expected=request_id)
+        if row["operation"] == "worker-start":
+            store.mark_intention(
+                row["id"],
+                "receipt_confirmed",
+                request_id=request_id,
+                response=replay,
+            )
+            current = _reconcile_confirmed_worker_start(
+                client,
+                store,
+                current,
+                intention_id=row["id"],
+                arguments=arguments,
+                response=replay,
+                request_id=request_id,
+            )
+        else:
+            store.mark_intention(row["id"], "applied", request_id=request_id, response=replay)
+            current = _apply_intention(store, current, row["operation"], replay)
     return _replay_applied_intentions(store, current)
 
 
@@ -283,7 +436,25 @@ def _create_native_run(client: OrcaClient, store: StateStore, run: RunRecord) ->
         "run-create",
         ["orchestration", "run-create", "--objective", run.objective],
     )
-    return _apply_intention(store, run, "run-create", response)
+    current = _apply_intention(store, run, "run-create", response)
+    readback = client.run_json("orchestration", "run-show", "--id", str(current.native_run_id), "--json")
+    native = _result(readback).get("run")
+    if (
+        not isinstance(native, Mapping)
+        or native.get("id") != current.native_run_id
+        or native.get("objective") != current.objective
+    ):
+        raise OrchestrateError("run-create did not bind the exact native Run", code="orca_contract_error")
+    return current
+
+
+def _require_profile_selection(profile: ProjectProfile) -> None:
+    if profile.candidate_changed:
+        raise OrchestrateError(
+            "The candidate profile differs from the selected host-local operational configuration",
+            code="profile_selection_changed",
+            data={"selectedDigest": profile.digest, "candidateDigest": profile.candidate_digest},
+        )
 
 
 def _require_candidate_coverage(sources: SourceIndex) -> None:
@@ -291,7 +462,7 @@ def _require_candidate_coverage(sources: SourceIndex) -> None:
     if not isinstance(candidate, Mapping) or candidate.get("coverageComplete") is not True:
         uncovered = candidate.get("uncoveredChanges", []) if isinstance(candidate, Mapping) else []
         raise OrchestrateError(
-            "Dirty candidate coverage is incomplete; add only approved relevant paths to candidateSources",
+            "Dirty candidate coverage is incomplete; select only reviewed relevant paths in candidateSources",
             code="candidate_coverage_incomplete",
             data={"uncoveredChanges": uncovered},
         )
@@ -330,16 +501,29 @@ def _create_task_and_packet(client: OrcaClient, store: StateStore, run: RunRecor
         ],
     )
     current = _apply_intention(store, run, "task-create", response)
-    packet = make_packet(
-        objective=run.objective,
-        profile=profile,
-        sources=sources,
-        run_id=current.native_run_id,
-        task_id=current.task_id,
-        reader=reader,
-    )
-    store.save_packet(current.local_id, str(current.task_id), packet)
+    store.save_packet(current.local_id, str(current.task_id), draft)
+    _validate_task_binding(client, current, draft)
     return current
+
+
+def _validate_task_binding(client: OrcaClient, run: RunRecord, packet: Mapping[str, Any]) -> None:
+    if not run.native_run_id or not run.task_id:
+        raise OrchestrateError("Local Task binding is incomplete", code="orca_contract_error")
+    tasks = client.run_json("orchestration", "task-list", "--run", str(run.native_run_id), "--json")
+    task_rows = _result(tasks).get("tasks")
+    matching = [
+        item
+        for item in task_rows if isinstance(item, Mapping) and item.get("id") == run.task_id
+    ] if isinstance(task_rows, list) else []
+    expected_spec = packet_spec(packet)
+    if (
+        len(matching) != 1
+        or matching[0].get("run_id") != run.native_run_id
+        or matching[0].get("task_title") != run.objective[:120]
+        or matching[0].get("spec") != expected_spec
+        or matching[0].get("status") not in {"ready", "pending"}
+    ):
+        raise OrchestrateError("task-create did not bind the exact immutable Task packet", code="orca_contract_error")
 
 
 def _ensure_packet(store: StateStore, run: RunRecord, profile: ProjectProfile) -> None:
@@ -362,39 +546,236 @@ def _ensure_packet(store: StateStore, run: RunRecord, profile: ProjectProfile) -
         profile=profile,
         sources=sources,
         run_id=run.native_run_id,
-        task_id=run.task_id,
         reader=reader,
     )
     store.save_packet(run.local_id, str(run.task_id), recovered)
 
 
-def _start_worker(client: OrcaClient, store: StateStore, run: RunRecord, profile: ProjectProfile) -> RunRecord:
-    choice = load_owner_model()
-    response = _mutation(
-        client,
-        store,
-        run,
-        "worker-start",
-        [
-            "orchestration",
-            "worker-start",
-            "--run",
-            str(run.native_run_id),
-            "--task",
-            str(run.task_id),
-            "--worktree",
-            f"path:{profile.root.resolve()}",
-            "--agent",
-            choice.agent,
-            "--model",
-            choice.model,
-            "--effort",
-            choice.effort,
-            "--timeout-ms",
-            "60000",
-        ],
-        timeout_seconds=90,
+def _effect(
+    effects: list[object],
+    *,
+    kind: str,
+    role: str | None = None,
+) -> Mapping[str, Any]:
+    matching = [
+        item
+        for item in effects
+        if isinstance(item, Mapping) and item.get("kind") == kind and (role is None or item.get("role") == role)
+    ]
+    if len(matching) != 1:
+        raise OrchestrateError(f"worker-start omitted its exact {kind} effect", code="orca_contract_error")
+    return matching[0]
+
+
+def _validate_residual_resources(
+    resources: object,
+    *,
+    worktree_id: str,
+    terminal_id: str,
+) -> None:
+    if not isinstance(resources, list) or not all(isinstance(item, Mapping) for item in resources):
+        raise OrchestrateError("worker-start residualResources has an unknown shape", code="orca_contract_error")
+    for item in resources:
+        if item.get("kind") == "terminal" and item.get("id") == terminal_id:
+            continue
+        if item.get("kind") == "worktree" and item.get("id") == worktree_id:
+            continue
+        raise OrchestrateError("worker-start reported an unexpected residual resource", code="orca_contract_error")
+
+
+def _validate_worker_start(
+    payload: Mapping[str, Any],
+    *,
+    run: RunRecord,
+    worktree_id: str | None,
+    agent: str,
+    model: str,
+    effort: str,
+) -> tuple[str, str]:
+    result = _result(payload)
+    if (
+        result.get("runId") != run.native_run_id
+        or result.get("taskId") != run.task_id
+        or not isinstance(result.get("dispatchId"), str)
+        or result.get("state") != "ready"
+        or result.get("stage") != "input_accepted"
+        or not isinstance(result.get("setup"), Mapping)
+        or result["setup"].get("state") != "not_applicable"
+    ):
+        raise OrchestrateError("worker-start did not accept the exact Run and Task", code="orca_contract_error")
+    launch = result.get("launch")
+    expected_launch = {"agent": agent, "model": model, "effort": effort}
+    if (
+        not isinstance(launch, Mapping)
+        or launch.get("requested") != expected_launch
+        or launch.get("effective") != expected_launch
+    ):
+        raise OrchestrateError("worker-start substituted the requested launch", code="worker_launch_mismatch")
+    effects = result.get("effects")
+    if not isinstance(effects, list) or len(effects) != 4:
+        raise OrchestrateError("worker-start omitted its exact effects", code="orca_contract_error")
+    worktree = _effect(effects, kind="worktree")
+    actual_worktree_id = worktree.get("id")
+    if (
+        worktree.get("action") != "reused"
+        or not isinstance(actual_worktree_id, str)
+        or (worktree_id is not None and actual_worktree_id != worktree_id)
+    ):
+        raise OrchestrateError("worker-start used a different workspace", code="worker_workspace_mismatch")
+    setup = _effect(effects, kind="setup")
+    if setup.get("action") != "not_applicable" or setup.get("state") != "not_applicable":
+        raise OrchestrateError("worker-start attempted unexpected setup", code="worker_workspace_mismatch")
+    terminal = _effect(effects, kind="terminal", role="agent")
+    terminal_id = terminal.get("id")
+    if terminal.get("action") != "created" or not isinstance(terminal_id, str):
+        raise OrchestrateError("worker-start did not create the expected agent terminal", code="orca_contract_error")
+    dispatch_input = _effect(effects, kind="dispatch_input", role="agent")
+    if dispatch_input.get("id") != terminal_id or dispatch_input.get("state") != "accepted":
+        raise OrchestrateError("worker-start did not prove exact request receipt", code="worker_input_unproven")
+    _validate_residual_resources(
+        result.get("residualResources"),
+        worktree_id=actual_worktree_id,
+        terminal_id=terminal_id,
     )
+    return actual_worktree_id, terminal_id
+
+
+def _validate_worker_start_readback(
+    payload: Mapping[str, Any],
+    *,
+    run: RunRecord,
+    dispatch_id: str,
+    worktree_id: str,
+    worktree_selector: str,
+    terminal_id: str,
+    agent: str,
+    model: str,
+    effort: str,
+) -> None:
+    result = _result(payload)
+    dispatch = result.get("dispatch")
+    worker = result.get("worker")
+    if (
+        not isinstance(dispatch, Mapping)
+        or dispatch.get("id") != dispatch_id
+        or dispatch.get("run_id") != run.native_run_id
+        or dispatch.get("task_id") != run.task_id
+        or dispatch.get("status") != "dispatched"
+        or not isinstance(worker, Mapping)
+        or worker.get("state") != "ready"
+        or worker.get("stage") != "input_accepted"
+        or worker.get("worktree_id") != worktree_id
+        or worker.get("agent_terminal_handle") != terminal_id
+    ):
+        raise OrchestrateError("worker-show did not confirm the exact accepted worker", code="orca_contract_error")
+    options = worker.get("startOptions")
+    expected_launch = {"agent": agent, "model": model, "effort": effort}
+    if (
+        not isinstance(options, Mapping)
+        or options.get("worktree") != worktree_selector
+        or options.get("resolvedWorktreeId") != worktree_id
+        or options.get("terminal") is not None
+        or options.get("agent") != agent
+        or options.get("setup") != "not_applicable"
+        or options.get("setupSource") != "existing_worktree"
+        or not isinstance(options.get("launch"), Mapping)
+        or options["launch"].get("requested") != expected_launch
+        or options["launch"].get("effective") != expected_launch
+    ):
+        raise OrchestrateError("worker-show launch readback does not match the request", code="worker_launch_mismatch")
+    _validate_residual_resources(
+        worker.get("residualResources"),
+        worktree_id=worktree_id,
+        terminal_id=terminal_id,
+    )
+
+
+def _start_worker(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    profile: ProjectProfile,
+    *,
+    worktree_id: str | None,
+) -> RunRecord:
+    choice = load_owner_model()
+    arguments = [
+        "orchestration",
+        "worker-start",
+        "--run",
+        str(run.native_run_id),
+        "--task",
+        str(run.task_id),
+        "--worktree",
+        f"path:{profile.root.resolve()}",
+        "--agent",
+        choice.agent,
+        "--model",
+        choice.model,
+        "--effort",
+        choice.effort,
+        "--timeout-ms",
+        "60000",
+    ]
+    intention_id = store.prepare_intention(run.local_id, "worker-start", arguments)
+    store.mark_intention(intention_id, "invoking")
+    try:
+        response = client.run_json(*arguments, "--json", timeout_seconds=90)
+    except OrcaCommandError as exc:
+        payload = exc.result.payload if exc.result is not None else None
+        store.mark_intention(
+            intention_id,
+            "uncertain",
+            request_id=_request_id(payload),
+            error=payload or {"message": str(exc), "code": exc.code},
+        )
+        raise OrchestrateError(
+            f"Orca mutation worker-start did not produce a confirmed receipt: {exc}",
+            code="mutation_outcome_uncertain",
+            data={"operation": "worker-start", "requestId": _request_id(payload), "orcaCode": exc.code},
+        ) from exc
+    try:
+        request_id = _mutation_request_id(response)
+    except OrchestrateError as exc:
+        store.mark_intention(
+            intention_id,
+            "uncertain",
+            request_id=_request_id(response),
+            error=response,
+        )
+        raise OrchestrateError(
+            "Orca mutation worker-start succeeded without a recoverable native request receipt",
+            code="mutation_outcome_uncertain",
+            data={"operation": "worker-start", "requestId": _request_id(response)},
+        ) from exc
+    store.mark_intention(
+        intention_id,
+        "receipt_confirmed",
+        request_id=request_id,
+        response=response,
+    )
+    exact_worktree_id, terminal_id = _validate_worker_start(
+        response,
+        run=run,
+        worktree_id=worktree_id,
+        agent=choice.agent,
+        model=choice.model,
+        effort=choice.effort,
+    )
+    dispatch_id = _result(response)["dispatchId"]
+    readback = client.run_json("orchestration", "worker-show", "--dispatch", str(dispatch_id), "--json")
+    _validate_worker_start_readback(
+        readback,
+        run=run,
+        dispatch_id=dispatch_id,
+        worktree_id=exact_worktree_id,
+        worktree_selector=arguments[arguments.index("--worktree") + 1],
+        terminal_id=terminal_id,
+        agent=choice.agent,
+        model=choice.model,
+        effort=choice.effort,
+    )
+    store.mark_intention(intention_id, "applied", request_id=request_id, response=response)
     return _apply_intention(store, run, "worker-start", response)
 
 
@@ -431,36 +812,82 @@ def _validate_native_settlement(client: OrcaClient, run: RunRecord, outcome: str
 
 def _release_disposition(client: OrcaClient, store: StateStore, run: RunRecord) -> None:
     rows = store.connection.execute(
-        """SELECT arguments_json FROM intentions
+        """SELECT arguments_json, response_json FROM intentions
            WHERE run_local_id = ? AND operation = 'worker-release' AND status = 'applied'""",
         (run.local_id,),
     ).fetchall()
     released = False
+    release_response: Mapping[str, Any] | None = None
     for row in rows:
         arguments = json.loads(row["arguments_json"])
         if isinstance(arguments, list) and "--dispatch" in arguments:
             index = arguments.index("--dispatch")
             released = index + 1 < len(arguments) and arguments[index + 1] == run.dispatch_id
         if released:
+            if row["response_json"]:
+                decoded = json.loads(row["response_json"])
+                release_response = decoded if isinstance(decoded, Mapping) else None
             break
     if not released:
-        _mutation(
+        release_response = _mutation(
             client,
             store,
             run,
             "worker-release",
             ["orchestration", "worker-release", "--dispatch", str(run.dispatch_id)],
         )
+    if release_response is None:
+        raise OrchestrateError("Worker release receipt is unavailable", code="release_unconfirmed")
+    release_result = _result(release_response)
+    if (
+        release_result.get("dispatchId") != run.dispatch_id
+        or release_result.get("state") not in {"released", "retained"}
+    ):
+        raise OrchestrateError("Worker release receipt does not bind the exact Dispatch", code="release_unconfirmed")
     worker = client.run_json("orchestration", "worker-show", "--dispatch", str(run.dispatch_id), "--json")
     result = _result(worker)
+    dispatch = result.get("dispatch")
+    if not isinstance(dispatch, Mapping) or dispatch.get("id") != run.dispatch_id:
+        raise OrchestrateError("worker-show release readback belongs to another Dispatch", code="release_unconfirmed")
     resource = result.get("terminalResource")
     if not isinstance(resource, Mapping):
         raise OrchestrateError("worker-show omitted terminal release state", code="release_unconfirmed")
+    ownership = resource.get("ownershipState")
     state = resource.get("releaseState")
-    if state in {"released", "already_released"}:
+    reason = resource.get("retainedReason")
+    archive = resource.get("archive")
+    exact_owner = (
+        isinstance(resource.get("id"), str)
+        and resource.get("originDispatchId") == run.dispatch_id
+        and resource.get("ownerDispatchId") == run.dispatch_id
+        and isinstance(resource.get("terminalHandle"), str)
+        and isinstance(resource.get("worktreeId"), str)
+        and resource.get("releaseError") is None
+        and isinstance(archive, Mapping)
+    )
+    if (
+        exact_owner
+        and release_result.get("state") == "released"
+        and ownership == "released"
+        and state == "released"
+        and reason is None
+        and isinstance(resource.get("releaseRequestedAt"), str)
+        and isinstance(resource.get("releaseCompletedAt"), str)
+        and archive.get("source") == "transcript"
+        and archive.get("status") == "captured"
+    ):
         return
-    encoded = json.dumps(resource, sort_keys=True).lower()
-    if state == "retained" and ("external_terminal" in encoded or "no_owned_resource" in encoded):
+    if (
+        exact_owner
+        and release_result.get("state") == "retained"
+        and ownership == "user_owned"
+        and state == "retained"
+        and reason == "user_takeover"
+        and resource.get("releaseRequestedAt") is None
+        and resource.get("releaseCompletedAt") is None
+        and archive.get("source") is None
+        and archive.get("status") is None
+    ):
         return
     raise OrchestrateError(
         "Worker terminal release is not in a confirmed terminal disposition",
@@ -515,21 +942,15 @@ def _process_delivery(client: OrcaClient, store: StateStore, run: RunRecord, del
         if outcome not in {"succeeded", "failed"}:
             raise OrchestrateError("worker_done has no recognized outcome", code="delivery_unsupported")
         _validate_native_settlement(client, current, outcome)
-        store.add_evidence(
-            current.local_id,
-            kind="worker-claim",
-            status=outcome,
+        _release_disposition(client, store, current)
+        current = store.finalize_worker_message(
+            run_local_id=current.local_id,
+            delivery_id=delivery_id,
+            message_id=message_id,
+            outcome=outcome,
             subject=str(message.get("subject", "worker_done")),
             payload=message,
         )
-        _release_disposition(client, store, current)
-        current = store.update_run(
-            current.local_id,
-            worker_outcome=outcome,
-            phase="worker_succeeded" if outcome == "succeeded" else "worker_failed",
-            verification_status="pending" if outcome == "succeeded" else "not_run",
-        )
-        store.mark_message(current.local_id, delivery_id, message_id, "processed")
     if escalation_unresolved:
         current = store.update_run(current.local_id, phase="blocked")
     return current
@@ -556,8 +977,56 @@ def _ack_if_resolved(client: OrcaClient, store: StateStore, run: RunRecord) -> b
         ],
     )
     store.mark_delivery_acked(run.local_id, run.delivery_id)
-    store.update_run(run.local_id, delivery_id=None)
     return True
+
+
+def _reprocess_bound_delivery(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+) -> RunRecord:
+    if not run.delivery_id:
+        return run
+    messages = store.delivery_messages(run.local_id, run.delivery_id)
+    if not messages:
+        raise OrchestrateError(
+            "The bound FIFO Delivery is missing its immutable journal",
+            code="delivery_journal_missing",
+        )
+    return _process_delivery(client, store, run, run.delivery_id, messages)
+
+
+def _bind_native_run(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    identity: ControllerIdentity | None,
+) -> RunRecord:
+    if not run.native_run_id:
+        return run
+    if identity is None or identity.current_run_id != run.native_run_id:
+        response = _mutation(
+            client,
+            store,
+            run,
+            "run-use",
+            ["orchestration", "run-use", "--id", run.native_run_id],
+        )
+        if _entity_id(response, "run") != run.native_run_id:
+            raise OrchestrateError("run-use bound a different native Run", code="controller_run_conflict")
+    current = client.run_json("orchestration", "run-current", "--json")
+    native = _result(current).get("run")
+    if not isinstance(native, Mapping) or native.get("id") != run.native_run_id:
+        raise OrchestrateError("run-current did not confirm the exact selected Run", code="controller_run_conflict")
+    shown = client.run_json("orchestration", "run-show", "--id", run.native_run_id, "--json")
+    record = _result(shown).get("run")
+    if (
+        not isinstance(record, Mapping)
+        or record.get("id") != run.native_run_id
+        or record.get("objective") != run.objective
+    ):
+        raise OrchestrateError("The selected native Run no longer matches local provenance", code="controller_run_conflict")
+    return store.get_run(run.local_id)
 
 
 def _supervise(client: OrcaClient, store: StateStore, run: RunRecord, *, wait_timeout_ms: int) -> JsonObject:
@@ -600,13 +1069,18 @@ def implement(
     wait_timeout_ms: int = 300_000,
     require_context: bool = True,
 ) -> JsonObject:
-    if require_context:
-        require_plain_controller()
-        _verify_workspace(client, root)
     profile = ProjectProfile.load(root)
+    _require_profile_selection(profile)
+    if objective is None:
+        return resume(
+            profile.root,
+            None,
+            client=client,
+            wait_timeout_ms=wait_timeout_ms,
+            require_context=require_context,
+        )
+    identity = require_plain_controller(client, profile.root) if require_context else None
     with StateStore(profile.root) as store:
-        if objective is None:
-            return resume(profile.root, None, client=client, wait_timeout_ms=wait_timeout_ms, require_context=False)
         normalized = objective.strip()
         if not normalized:
             raise OrchestrateError("Objective must not be empty", code="objective_empty")
@@ -626,7 +1100,13 @@ def implement(
                 run = _create_native_run(client, store, run)
                 run = _create_task_and_packet(client, store, run, profile)
                 _ensure_packet(store, run, profile)
-                run = _start_worker(client, store, run, profile)
+                run = _start_worker(
+                    client,
+                    store,
+                    run,
+                    profile,
+                    worktree_id=identity.worktree_id if identity else None,
+                )
                 return _supervise(client, store, run, wait_timeout_ms=wait_timeout_ms)
 
 
@@ -638,22 +1118,23 @@ def resume(
     wait_timeout_ms: int = 300_000,
     require_context: bool = True,
 ) -> JsonObject:
-    if require_context:
-        require_plain_controller()
-        _verify_workspace(client, root)
     profile = ProjectProfile.load(root)
+    _require_profile_selection(profile)
     with StateStore(profile.root) as store:
         run = store.select_run(run_id)
+        identity = (
+            require_plain_controller(
+                client,
+                profile.root,
+                expected_run_id=run.native_run_id,
+                allow_expected_unbound=True,
+            )
+            if require_context and run.native_run_id
+            else (require_plain_controller(client, profile.root) if require_context else None)
+        )
         with store.lock(run.local_id):
             run = reconcile_intentions(client, store, run)
-            if run.native_run_id:
-                _mutation(
-                    client,
-                    store,
-                    run,
-                    "run-use",
-                    ["orchestration", "run-use", "--id", run.native_run_id],
-                )
+            run = _bind_native_run(client, store, run, identity)
             reader = read_project(profile, run.objective)
             current_sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
             if run.phase in {"preparing", "run_created", "task_created"}:
@@ -668,7 +1149,9 @@ def resume(
                     code="source_binding_changed",
                     data={"expected": run.source_digest, "actual": current_sources.digest},
                 )
-            if run.delivery_id and not store.pending_questions(run.local_id):
+            if run.delivery_id:
+                run = _reprocess_bound_delivery(client, store, run)
+            if run.delivery_id and not store.pending_questions(run.local_id) and run.phase != "blocked":
                 _ack_if_resolved(client, store, run)
                 run = store.get_run(run.local_id)
             if store.pending_questions(run.local_id) or run.phase in TERMINAL_PHASES:
@@ -679,7 +1162,18 @@ def resume(
                 run = _create_task_and_packet(client, store, run, profile)
             if run.phase == "task_created":
                 _ensure_packet(store, run, profile)
-                run = _start_worker(client, store, run, profile)
+                _validate_task_binding(
+                    client,
+                    run,
+                    store.get_packet(run.local_id, str(run.task_id)),
+                )
+                run = _start_worker(
+                    client,
+                    store,
+                    run,
+                    profile,
+                    worktree_id=identity.worktree_id if identity else None,
+                )
             return _supervise(client, store, run, wait_timeout_ms=wait_timeout_ms)
 
 
@@ -739,22 +1233,23 @@ def answer(
     client: OrcaClient,
     require_context: bool = True,
 ) -> JsonObject:
-    if require_context:
-        require_plain_controller()
-        _verify_workspace(client, root)
     profile = ProjectProfile.load(root)
+    _require_profile_selection(profile)
     with StateStore(profile.root) as store:
         run = store.get_run(run_id)
+        identity = (
+            require_plain_controller(
+                client,
+                profile.root,
+                expected_run_id=run.native_run_id,
+                allow_expected_unbound=True,
+            )
+            if require_context and run.native_run_id
+            else (require_plain_controller(client, profile.root) if require_context else None)
+        )
         with store.lock(run.local_id):
             run = reconcile_intentions(client, store, run)
-            if run.native_run_id:
-                _mutation(
-                    client,
-                    store,
-                    run,
-                    "run-use",
-                    ["orchestration", "run-use", "--id", run.native_run_id],
-                )
+            run = _bind_native_run(client, store, run, identity)
             row = store.connection.execute("SELECT * FROM questions WHERE message_id = ?", (question_id,)).fetchone()
             if row is None or row["run_local_id"] != run.local_id:
                 raise OrchestrateError("Question does not belong to the selected Run", code="question_not_found")
