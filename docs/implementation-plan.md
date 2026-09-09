@@ -73,3 +73,7 @@ Fresh Sol xhigh final audit on exact candidate, then required checks and public 
 ## README acceptance
 
 Match obra/superpowers README editorial style with original wording. Sections: title and direct introduction, contents, how it works, installation (Windows/skill/WSL), basic workflow with copyable CLI examples, what's inside, philosophy, contributing, updating, MIT license. Conversational and concrete; link detailed contracts/recovery elsewhere. No claims before behavior is implemented and verified. Source reference https://github.com/obra/superpowers/blob/main/README.md.
+
+## Final completion archival
+
+After final project completion, preserve this plan locally outside the repository in the owner's specified parent folder, remove the tracked implementation-plan.md from the public repository, and update references to it. Do not remove it at an intermediate milestone or on a blocked delivery. This is a normal Git deletion; no history rewrite is authorized.
