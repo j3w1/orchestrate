@@ -1,8 +1,10 @@
 # orchestrate
 
-orchestrate is an early Orca-native execution layer for governed software work. It is being built to help a small Python controller prepare work, supervise Orca-owned workers, and explain what remains without becoming a second scheduler or governance system.
+orchestrate gives governed software work a small, restartable controller without giving it a second scheduler.
 
-The first compatibility milestone is intentionally narrow. The package can inspect the public Orca contract and run explicit compatibility probes; the full `setup`, `implement`, `status`, `resume`, `explain`, `packet`, and `answer` workflow is not implemented yet.
+You describe one authorized objective. orchestrate reads the project entrypoints, binds the exact working candidate, prepares a compact packet, and asks Orca to run one implementation owner. Orca still owns the Run, Task, Dispatch, worker, terminal, and mailbox. Your project still owns its checks, review, acceptance, merge, and release.
+
+The first increment is deliberately single-worker. It is enough to execute real work and survive a controller interruption, while keeping every larger claim honest.
 
 ## Table of Contents
 
@@ -10,7 +12,7 @@ The first compatibility milestone is intentionally narrow. The package can inspe
 - [Installation](#installation)
   - [Windows](#windows)
   - [Agent skill](#agent-skill)
-  - [WSL](#wsl)
+  - [Linux and WSL](#linux-and-wsl)
 - [The Basic Workflow](#the-basic-workflow)
 - [What's Inside](#whats-inside)
 - [Philosophy](#philosophy)
@@ -20,19 +22,23 @@ The first compatibility milestone is intentionally narrow. The package can inspe
 
 ## How it works
 
-Right now, orchestrate starts with compatibility instead of pretending the controller already exists.
+The project keeps one small tracked file and one host-local database.
 
-`orchestrate doctor` resolves one Orca executable using the installed guide's platform rules, invokes it with argument arrays, keeps JSON stdout separate from stderr keepalives, and verifies the required public orchestration capabilities. It makes no Orca coordination mutations by default.
+`.orchestrate.json` points at instructions, task sources, command manifests, optional approved `candidateSources`, and checks. `orchestrate setup` discovers the conventional entrypoint names but runs nothing. Before dispatch, the reader identifies the exact non-secret bytes it consulted, including relevant staged bytes, while Git status remains an opaque candidate identity. Any dirty path outside that approved coverage produces a hold instead of being opened speculatively. The packet sent to the worker carries those bindings rather than a vague description of HEAD.
 
-Two explicit active modes exercise the first vertical slice. One creates a disposable Run and exits. A later process can rebind that Run and, when executed by a root Orca coordinator, launch a no-edit worker, receive `worker_done`, release the worker, and acknowledge the Delivery in the required order.
+Every Orca mutation starts as a durable intention. Every Delivery is journaled whole before its messages have effects. Completion is accepted only for the exact Task and Dispatch, release is settled before acknowledgment, and missing request history stays uncertain.
 
-The live evidence draws a sharp host boundary. Plain Python in an ordinary Orca shell can create and rebind a Run without a reasoning agent, while a caller with no Orca terminal association fails with `no_active_sender_terminal`. A thin bootstrap into that ordinary Orca terminal fits the approved architecture but is not implemented yet. A first real worker launch created a native Dispatch but stalled while delivering the prompt, so completion and acknowledgment are still unverified. The exact evidence and remaining gates are in [Orca public CLI compatibility](docs/orca-compatibility.md).
+Mutating commands need an ordinary Orca controller terminal. If you start from an outside PowerShell, orchestrate opens one in the exact workspace, keeps the command in the foreground, forwards Ctrl-C, reproduces the child result and exit code, and closes that dedicated tab. It refuses to use a reasoning-agent terminal as a dispatch-depth shortcut.
+
+Read [First-increment contracts and recovery](docs/contracts-and-recovery.md) for the detailed state machine.
 
 ## Installation
 
-orchestrate is not published to PyPI. Install this checkout in a Python 3.13 virtual environment while it is under development.
+orchestrate requires Python 3.13 or newer. It is not published to PyPI.
 
 ### Windows
+
+Install a reviewed checkout into a virtual environment:
 
 ```powershell
 py -3.13 -m venv .venv
@@ -40,82 +46,134 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\orchestrate doctor
 ```
 
-The active probes require a running Orca desktop runtime. Worker launch additionally requires a root coordinator terminal; a dispatched worker must not use it to route around Orca's nesting limit.
+`doctor` is read-only unless you explicitly select an active probe. The active compatibility probe has additional disposable-project requirements and is not needed for normal work.
 
 ### Agent skill
 
-An installable orchestrate agent skill is planned but is not included in this milestone. There are no hidden edits to `AGENTS.md` or another agent's instruction files.
+The short skill lives at [`skills/orchestrate/SKILL.md`](skills/orchestrate/SKILL.md). Install it explicitly after reviewing it:
 
-### WSL
+```powershell
+$skill = Join-Path $env:USERPROFILE ".codex\skills\orchestrate"
+New-Item -ItemType Directory -Force $skill | Out-Null
+Copy-Item -Recurse -Force .\skills\orchestrate\* $skill
+```
 
-The thin WSL launcher is not implemented or certified yet. Until it exists, this repository makes no claim that Windows coordinator state, Linux path forwarding, or WSL exit-code behavior works.
+On Linux, use the same explicit copy boundary:
+
+```bash
+skill_root="${CODEX_HOME:-$HOME/.codex}/skills/orchestrate"
+mkdir -p "$skill_root"
+cp -R skills/orchestrate/. "$skill_root/"
+```
+
+The package never edits `AGENTS.md`, user prompts, or another agent's configuration behind your back.
+
+### Linux and WSL
+
+Unit, incident, wheel-build, and isolated-install checks run on Linux CI. The Orca CLI resolver uses `ORCA_CLI_COMMAND` in a managed forwarded session, `orca-dev` in a dev checkout, `orca-ide` on Linux outside Orca, and `orca` on packaged Windows.
+
+The canonical Windows controller and a real WSL-native worker lifecycle are not certified by this first increment. Do not turn Linux CI into a WSL/provider claim. The planned WSL launcher remains a later increment.
 
 ## The Basic Workflow
 
-Run the read-only diagnostics first:
+Start in the project you want to configure:
 
 ```powershell
-orchestrate doctor
-orchestrate doctor --json
+orchestrate setup --json
 ```
 
-From a fresh, otherwise unused root Orca terminal, create the disposable compatibility Run. Do not replace the Run binding of a coordinator that is supervising other work:
+Review `.orchestrate.json`, especially its instruction and task entrypoints, required checks, and any exact dirty paths you deliberately add to `candidateSources`. Then give one concrete, already-authorized objective:
 
 ```powershell
-orchestrate doctor --active-run-probe --json
+orchestrate implement "Fix the parser regression and run the profile checks" --json
 ```
 
-Copy the returned Run ID into a fresh process to test resume and the real completion path:
+The command waits in the foreground. Ctrl-C stops controller waiting; it does not pretend the active worker stopped. Continue with the Run ID:
 
 ```powershell
-orchestrate doctor --active-worker-probe <run-id> --json
+orchestrate status --run <run-id> --json
+orchestrate explain --run <run-id>
+orchestrate resume --run <run-id> --json
 ```
 
-These active commands create Orca coordination records and may launch a real Codex worker. They are compatibility probes, not implementation commands. The first live worker-start exercise stalled at prompt delivery; do not rerun it unchanged without new evidence or an explicit recovery decision.
+When a worker asks a question, answer that exact message and resume:
+
+```powershell
+orchestrate answer --run <run-id> --question <message-id> --text "Use the existing public interface" --json
+orchestrate resume --run <run-id> --json
+```
+
+Inspect the immutable Task packet without consuming mail or calling a model:
+
+```powershell
+orchestrate packet --run <run-id> --task <task-id> --json
+```
+
+Omitting an objective resumes only when one local Run is unambiguous. Multiple Runs always require an explicit selection. A succeeded worker leaves verification pending by design.
+
+For a copyable disposable live exercise, use [Live first-increment exercise](docs/live-first-increment.md).
 
 ## What's Inside
 
-- A Python 3.13 package using the standard `src` layout.
-- A strict standard-library subprocess client for the public Orca CLI.
-- Read-only compatibility diagnostics with human and JSON output.
-- Explicit Run-create and coordinator-only worker completion probes.
-- Focused unit tests for executable resolution, JSON contract failures, resume ordering, release-before-ack, and unacknowledged intervention.
-- A sanitized compatibility record that keeps live runtime identities out of the repository.
+- A Python 3.13 standard-library CLI in a conventional `src` layout.
+- A small `orchestrate-profile/v1` project profile.
+- Repository and CE task-registry/context/manifest-first reader boundaries.
+- Exact Git/source identities and `orchestrate-worker-packet/v1` packets.
+- Host-local SQLite intentions, Deliveries, questions, evidence, and OS locks.
+- Deterministic Run creation, Task creation, one-worker launch, supervision, answer, release, acknowledgment, and resume.
+- Non-consuming `status`, model-free `explain`, and exact `packet` output.
+- A focused ordinary-terminal bootstrap with durable result and exit receipts.
+- Passive compatibility diagnostics and a separately contained no-edit active probe.
+- Windows/Linux unit, incident, build, and install-smoke CI.
 
-Everything after this foundation remains unimplemented while the first live completion path is unresolved. There is no project profile, SQLite bookkeeping, task preparation, reader, packet builder, WSL launcher, provider adapter, or dashboard in this milestone.
+There is no parallel task database, worktree manager, provider API, policy engine, automatic retry campaign, dashboard, PyPI release, or governance replacement.
 
 ## Philosophy
 
-- **Orca owns lifecycle** — Runs, Tasks, Dispatches, environments, workers, and UI stay native to Orca.
-- **Authority before action** — a process without authenticated terminal authority fails closed.
-- **Evidence over inference** — inherited agent authority is not standalone-host proof, and synthetic tests are not live completion evidence.
-- **One controller, no shadow scheduler** — orchestrate prepares and supervises; it does not recreate Orca's task system.
-- **Unknown stays unknown** — unavailable WSL, hosted, model, and provider gates remain `NOT_RUN`.
+- **Orca owns lifecycle.** Runs, Tasks, Dispatches, workers, environments, and UI remain native.
+- **Projects own authority.** A candidate policy edit cannot grant itself more power.
+- **One writer first.** Parallelism waits until work is independently useful and shared interfaces are settled.
+- **Effects are replayed, not guessed.** Unknown external effects stop repetition.
+- **Every message counts.** FIFO Deliveries are processed in full and acknowledged as a whole.
+- **Evidence keeps its label.** Worker success, local verification, hosted proof, independent review, acceptance, merge, and release are different things.
+- **WIP is a candidate, not clutter.** Dirty status is bound opaquely; only explicitly approved, consulted paths are read and hashed, and uncovered paths hold dispatch.
 
 ## Contributing
 
-Read [AGENTS.md](AGENTS.md) and the [approved implementation plan](docs/implementation-plan.md) before changing code. Preserve unrelated work and keep active probes disposable.
+Read [AGENTS.md](AGENTS.md) and the [approved implementation plan](docs/implementation-plan.md) before changing code. The tracked plan remains until final project completion.
 
-Run the focused checks with Python 3.13:
+Run the first-increment gates with Python 3.13:
 
 ```powershell
 $env:PYTHONPATH = (Resolve-Path .\src).Path
 py -3.13 -m unittest discover -s tests -v
 py -3.13 -m compileall -q src tests
+git diff --check
 ```
 
-Live Orca probes are separate from unit tests. Do not run the worker probe from a dispatched worker, do not pass another terminal through `--from`, and do not publish from this repository during the current milestone.
+Build and install into an isolated environment for the packaging smoke test:
+
+```powershell
+py -3.13 -m pip install build
+py -3.13 -m build
+py -3.13 -m venv $env:TEMP\orchestrate-smoke
+& $env:TEMP\orchestrate-smoke\Scripts\python -m pip install (Get-ChildItem .\dist\*.whl | Select-Object -First 1)
+& $env:TEMP\orchestrate-smoke\Scripts\orchestrate --help
+```
+
+Live Orca exercises are separate. Use only disposable projects for mutations, never run them from a dispatched worker, and keep CE/application trials read-only.
 
 ## Updating
 
-Pull the desired reviewed revision, then reinstall the editable package in the same virtual environment:
+Pull the reviewed revision and reinstall it in the same environment:
 
 ```powershell
 git pull --ff-only
 .\.venv\Scripts\python -m pip install --editable .
+orchestrate doctor
 ```
 
-Re-run `orchestrate doctor` after Orca upgrades because the public CLI contract and capabilities are live compatibility inputs.
+Re-run `doctor` after an Orca update. Public contracts and effective launch behavior are live compatibility inputs, not assumptions frozen into this repository.
 
 ## License
 

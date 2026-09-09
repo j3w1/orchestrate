@@ -39,6 +39,7 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(calls[0][0], ("orca", "status", "--json"))
         self.assertTrue(calls[0][1]["capture_output"])
+        self.assertFalse(calls[0][1]["text"])
 
     def test_structured_error_preserves_public_error_code(self) -> None:
         response = {
@@ -61,7 +62,23 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(OrcaCommandError, "not one JSON document"):
             OrcaClient(("orca",), runner=runner).run_json("status", "--json")
 
+    def test_invalid_utf8_stdout_fails_without_replacement(self) -> None:
+        def runner(argv: tuple[str, ...], **_: object) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.CompletedProcess(argv, 0, b'{"ok":true,"id":"\xff"}', b"")
+
+        with self.assertRaisesRegex(OrcaCommandError, "valid UTF-8") as caught:
+            OrcaClient(("orca",), runner=runner).run_json("status", "--json")
+        self.assertNotIn("\ufffd", caught.exception.result.stdout)
+
+    def test_missing_or_non_boolean_success_envelope_fails_closed(self) -> None:
+        for value in ({"result": {}}, {"ok": 1, "result": {}}, {"ok": "true", "result": {}}):
+            with self.subTest(value=value):
+                def runner(argv: tuple[str, ...], **_: object) -> subprocess.CompletedProcess[str]:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(value), "")
+
+                with self.assertRaisesRegex(OrcaCommandError, "ok=true"):
+                    OrcaClient(("orca",), runner=runner).run_json("status", "--json")
+
 
 if __name__ == "__main__":
     unittest.main()
-

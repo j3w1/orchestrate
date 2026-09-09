@@ -4,9 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
 from typing import Any
+import uuid
 
 from .orca import JsonObject, OrcaClient, OrcaCommandError
+from .state import state_home
 
 
 DOCTOR_SCHEMA = "orchestrate-doctor/v1"
@@ -15,6 +22,7 @@ REQUIRED_CAPABILITIES = (
     "orchestration.worker-launch-preferences.v1",
 )
 PROBE_OBJECTIVE = "Disposable orchestrate public CLI compatibility probe"
+PROBE_MARKER = "orchestrate-disposable/v1\n"
 PROBE_TASK_SPEC = (
     "Compatibility probe only. Do not inspect or edit files. Report worker_done with "
     "outcome succeeded, files-modified empty, and exactly three short sentences confirming "
@@ -121,12 +129,106 @@ def collect_doctor_report(client: OrcaClient) -> JsonObject:
     }
 
 
-def create_run_probe(client: OrcaClient) -> JsonObject:
-    payload = client.run_json(
+def _probe_git(project: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ("git", "-C", os.fspath(project), *arguments),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        check=False,
+    )
+    if completed.returncode:
+        raise ProbeContractError(completed.stderr.strip() or "Disposable project Git inspection failed")
+    return completed.stdout
+
+
+def _probe_baseline(project: Path) -> dict[str, str]:
+    root = Path(_probe_git(project, "rev-parse", "--show-toplevel").strip()).resolve()
+    if root != project.resolve():
+        raise ProbeContractError("The probe project must be the exact disposable Git root")
+    marker = project / ".orchestrate-disposable"
+    if not marker.is_file() or marker.read_text(encoding="utf-8") != PROBE_MARKER:
+        raise ProbeContractError(
+            "The active probe requires a committed .orchestrate-disposable marker"
+        )
+    status = _probe_git(project, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    if status:
+        raise ProbeContractError("The disposable probe project must start clean")
+    return {
+        "root": os.fspath(project.resolve()),
+        "head": _probe_git(project, "rev-parse", "HEAD").strip(),
+        "tree": _probe_git(project, "rev-parse", "HEAD^{tree}").strip(),
+        "statusSha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
+    }
+
+
+def _worktree_path(payload: Mapping[str, Any]) -> str:
+    worktree = _result_object(payload).get("worktree")
+    if not isinstance(worktree, Mapping) or not isinstance(worktree.get("path"), str):
+        raise ProbeContractError("worktree current omitted the exact path")
+    return os.fspath(Path(worktree["path"]).resolve())
+
+
+def _ordinary_probe_caller() -> None:
+    if any(os.environ.get(key) for key in ("ORCA_AGENT_HOOK_TOKEN", "ORCA_AGENT_LAUNCH_TOKEN")):
+        raise ProbeContractError("A dispatched or reasoning-agent terminal cannot run the active probe")
+    if not os.environ.get("ORCA_TERMINAL_HANDLE"):
+        raise ProbeContractError("The active probe requires its own ordinary Orca terminal")
+
+
+def _probe_path(token: str) -> Path:
+    return state_home() / "probes" / f"{token}.json"
+
+
+def _write_probe_receipt(token: str, receipt: Mapping[str, Any]) -> None:
+    path = _probe_path(token)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps(receipt, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
+    except OSError as exc:
+        raise ProbeContractError("The host-local probe receipt could not be persisted") from exc
+
+
+def _read_probe_receipt(token: str) -> dict[str, Any]:
+    if not token.startswith("probe_"):
+        raise ProbeContractError("The active worker probe requires a minted probe token")
+    try:
+        value = json.loads(_probe_path(token).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProbeContractError("The probe token has no readable host-local receipt") from exc
+    if not isinstance(value, dict) or value.get("schema") != "orchestrate-active-probe/v1":
+        raise ProbeContractError("The probe receipt is malformed")
+    return value
+
+
+def _preflight_project(client: OrcaClient, project: Path) -> tuple[dict[str, str], JsonObject]:
+    _ordinary_probe_caller()
+    baseline = _probe_baseline(project)
+    worktree = client.run_json("worktree", "current", "--json")
+    if _worktree_path(worktree) != baseline["root"]:
+        raise ProbeContractError("The caller is not in the exact disposable Orca worktree")
+    return baseline, worktree
+
+
+def create_run_probe(client: OrcaClient, *, project: Path) -> JsonObject:
+    baseline, worktree = _preflight_project(client, project)
+    current = client.run_json("orchestration", "run-current", "--json")
+    if _result_object(current).get("run") is not None:
+        raise ProbeContractError("The disposable controller terminal is already bound to a Run")
+    token = f"probe_{uuid.uuid4().hex}"
+    objective = f"{PROBE_OBJECTIVE} [nonce:{token}]"
+    receipts: dict[str, JsonObject] = {"worktreeCurrent": worktree, "runCurrent": current}
+    payload = _probe_call(
+        client,
+        receipts,
+        "runCreate",
         "orchestration",
         "run-create",
         "--objective",
-        PROBE_OBJECTIVE,
+        objective,
         "--json",
     )
     try:
@@ -134,14 +236,27 @@ def create_run_probe(client: OrcaClient) -> JsonObject:
     except ProbeContractError as exc:
         raise ProbeContractError(
             str(exc),
-            data={"stage": "runIdentity", "receipts": {"runCreate": payload}},
+            data={"stage": "runIdentity", "receipts": receipts},
         ) from exc
+    receipt = {
+        "schema": "orchestrate-active-probe/v1",
+        "token": token,
+        "state": "ready",
+        "runId": run_id,
+        "objective": objective,
+        "baseline": baseline,
+        "worktreeId": _result_object(worktree)["worktree"].get("id"),
+        "receipts": receipts,
+    }
+    _write_probe_receipt(token, receipt)
     return {
         "schema": DOCTOR_SCHEMA,
         "status": "created",
         "activeProbe": "run-created-and-controller-exited",
         "runId": run_id,
-        "next": "Run the active worker probe from a fresh process in the same root coordinator terminal.",
+        "probeToken": token,
+        "receipts": receipts,
+        "next": "Run the active worker probe with this one-use token from a fresh process in the same ordinary terminal.",
     }
 
 
@@ -149,9 +264,13 @@ def _delivery(payload: Mapping[str, Any]) -> tuple[str, list[Mapping[str, Any]]]
     result = _result_object(payload)
     delivery_id = result.get("deliveryId")
     messages = result.get("messages")
-    if not isinstance(delivery_id, str) or not isinstance(messages, list):
+    if (
+        not isinstance(delivery_id, str)
+        or not isinstance(messages, list)
+        or not all(isinstance(item, Mapping) for item in messages)
+    ):
         raise ProbeContractError("check response omitted the delivery id or messages")
-    return delivery_id, [item for item in messages if isinstance(item, Mapping)]
+    return delivery_id, list(messages)
 
 
 def _message_type(message: Mapping[str, Any]) -> str | None:
@@ -175,8 +294,10 @@ def _probe_call(
         }
         if exc.result is not None:
             failure["failedCommand"] = {
+                "argv": list(exc.result.argv),
                 "returncode": exc.result.returncode,
                 "payload": exc.result.payload,
+                "stdout": exc.result.stdout[:8192],
                 "stderr": exc.result.stderr,
             }
         raise ProbeContractError(str(exc), code=exc.code, data=failure) from exc
@@ -206,7 +327,7 @@ def _validate_delivery_messages(
     *,
     task_id: str,
     dispatch_id: str,
-) -> str:
+) -> tuple[str, str | None]:
     message_types = [_message_type(message) for message in messages]
     interventions = sorted({item for item in message_types if item in {"escalation", "question"}})
     if interventions:
@@ -246,7 +367,11 @@ def _validate_delivery_messages(
             "The worker_done omitted a recognized outcome; "
             "the Delivery remains unacknowledged for coordinator inspection"
         )
-    return worker_outcome
+    files_modified = done_payload.get("filesModified") if isinstance(done_payload, Mapping) else None
+    no_edit_problem = None
+    if files_modified != []:
+        no_edit_problem = "worker_done did not prove an empty filesModified list"
+    return worker_outcome, no_edit_problem
 
 
 def _validate_native_settlement(
@@ -295,10 +420,38 @@ def _validate_release(worker_payload: Mapping[str, Any], dispatch_id: str) -> No
         )
 
 
-def run_worker_probe(client: OrcaClient, run_id: str, *, wait_timeout_ms: int) -> JsonObject:
+def run_worker_probe(client: OrcaClient, probe_token: str, *, project: Path, wait_timeout_ms: int) -> JsonObject:
     """Resume a Run and exercise worker completion/release/ack as a root coordinator."""
 
-    receipts: dict[str, JsonObject] = {}
+    receipt = _read_probe_receipt(probe_token)
+    if receipt.get("state") != "ready" or receipt.get("token") != probe_token:
+        raise ProbeContractError("The probe token is not ready for one-use execution")
+    baseline, worktree = _preflight_project(client, project)
+    if baseline != receipt.get("baseline"):
+        raise ProbeContractError("The disposable project changed after Run creation")
+    run_id = receipt.get("runId")
+    if not isinstance(run_id, str):
+        raise ProbeContractError("The probe receipt omitted its Run")
+    inspected_run = client.run_json("orchestration", "run-show", "--id", run_id, "--json")
+    native_run = _result_object(inspected_run).get("run")
+    if not isinstance(native_run, Mapping) or native_run.get("objective") != receipt.get("objective"):
+        raise ProbeContractError("The native Run does not match the minted probe nonce")
+    inspected_tasks = client.run_json("orchestration", "task-list", "--run", run_id, "--json")
+    if _result_object(inspected_tasks).get("tasks") not in ([], None):
+        raise ProbeContractError("The probe Run already has Tasks")
+    current = client.run_json("orchestration", "run-current", "--json")
+    bound = _result_object(current).get("run")
+    if isinstance(bound, Mapping) and bound.get("id") != run_id:
+        raise ProbeContractError("The caller terminal is bound to a conflicting Run")
+    receipt["state"] = "consumed"
+    _write_probe_receipt(probe_token, receipt)
+
+    receipts: dict[str, JsonObject] = {
+        "worktreeCurrent": worktree,
+        "runShow": inspected_run,
+        "taskListBefore": inspected_tasks,
+        "runCurrent": current,
+    }
     _probe_call(client, receipts, "runUse", "orchestration", "run-use", "--id", run_id, "--json")
     task_payload = _probe_call(
         client,
@@ -326,7 +479,7 @@ def run_worker_probe(client: OrcaClient, run_id: str, *, wait_timeout_ms: int) -
         "--task",
         task_id,
         "--worktree",
-        "current",
+        f"path:{project.resolve()}",
         "--agent",
         "codex",
         "--timeout-ms",
@@ -360,7 +513,7 @@ def run_worker_probe(client: OrcaClient, run_id: str, *, wait_timeout_ms: int) -
         "deliveryContract",
         lambda: _delivery(delivery_payload),
     )
-    worker_outcome = _contract_step(
+    worker_outcome, no_edit_problem = _contract_step(
         receipts,
         "deliveryValidation",
         lambda: _validate_delivery_messages(
@@ -426,6 +579,9 @@ def run_worker_probe(client: OrcaClient, run_id: str, *, wait_timeout_ms: int) -
         "releaseDisposition",
         lambda: _validate_release(released_worker, dispatch_id),
     )
+    readback = _probe_baseline(project)
+    if readback != baseline:
+        no_edit_problem = "the disposable workspace changed from its exact baseline"
     _probe_call(
         client,
         receipts,
@@ -440,13 +596,14 @@ def run_worker_probe(client: OrcaClient, run_id: str, *, wait_timeout_ms: int) -
     )
     return {
         "schema": DOCTOR_SCHEMA,
-        "status": "pass" if worker_outcome == "succeeded" else "blocked",
+        "status": "pass" if worker_outcome == "succeeded" and no_edit_problem is None else "blocked",
         "activeProbe": "run-resume-worker-completion-release-ack",
         "runId": run_id,
         "taskId": task_id,
         "dispatchId": dispatch_id,
         "deliveryId": delivery_id,
         "workerOutcome": worker_outcome,
+        "noEditValidation": "pass" if no_edit_problem is None else no_edit_problem,
         "receipts": receipts,
     }
 

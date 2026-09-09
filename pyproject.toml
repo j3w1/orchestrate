@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "j3w1-orchestrate"
-version = "0.0.1"
+version = "0.1.0"
 description = "An Orca-native execution layer for governed software work"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -18,6 +18,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Repository = "https://github.com/j3w1/orchestrate"
+
 [project.scripts]
 orchestrate = "orchestrate.cli:main"
 
@@ -26,4 +29,3 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

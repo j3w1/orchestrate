@@ -13,14 +13,25 @@ from typing import Any
 
 
 JsonObject = dict[str, Any]
-Runner = Callable[..., subprocess.CompletedProcess[str]]
+Runner = Callable[..., subprocess.CompletedProcess[Any]]
+MAX_DIAGNOSTIC_CHARS = 8192
 
 
-def _exception_text(value: str | bytes | None) -> str:
+def _diagnostic_text(value: str | bytes | None) -> str:
     if value is None:
         return ""
     if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
+        decoded = value.decode("utf-8", errors="replace")
+    else:
+        decoded = value
+    return decoded[:MAX_DIAGNOSTIC_CHARS]
+
+
+def _strict_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="strict")
     return value
 
 
@@ -106,9 +117,7 @@ class OrcaClient:
             completed = self._runner(
                 argv,
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                text=False,
                 env=self.environment,
                 timeout=self.timeout_seconds if timeout_seconds is None else timeout_seconds,
                 check=False,
@@ -119,19 +128,20 @@ class OrcaClient:
             result = OrcaCommandResult(
                 argv=argv,
                 returncode=-1,
-                stdout=_exception_text(exc.stdout),
-                stderr=_exception_text(exc.stderr),
+                stdout=_diagnostic_text(exc.stdout),
+                stderr=_diagnostic_text(exc.stderr),
             )
             raise OrcaCommandError(f"Orca command timed out after {exc.timeout} seconds", result) from exc
 
-        result = OrcaCommandResult(
-            argv=argv,
-            returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-        )
+        try:
+            stdout = _strict_text(completed.stdout)
+        except UnicodeDecodeError as exc:
+            result = OrcaCommandResult(argv, completed.returncode, "<invalid UTF-8>", _diagnostic_text(completed.stderr))
+            raise OrcaCommandError("Orca stdout was not valid UTF-8", result) from exc
+        stderr = _diagnostic_text(completed.stderr)
+        result = OrcaCommandResult(argv, completed.returncode, stdout, stderr)
         if completed.returncode != 0:
-            detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic output"
+            detail = stderr.strip() or stdout.strip() or "no diagnostic output"
             raise OrcaCommandError(
                 f"Orca command exited with {completed.returncode}: {detail}",
                 result,
@@ -144,9 +154,7 @@ class OrcaClient:
             completed = self._runner(
                 argv,
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                text=False,
                 env=self.environment,
                 timeout=self.timeout_seconds if timeout_seconds is None else timeout_seconds,
                 check=False,
@@ -154,24 +162,38 @@ class OrcaClient:
         except FileNotFoundError as exc:
             raise OrcaCommandError(f"Orca executable was not found: {self.command[0]}") from exc
         except subprocess.TimeoutExpired as exc:
-            stdout = _exception_text(exc.stdout)
+            try:
+                stdout = _strict_text(exc.stdout)
+            except UnicodeDecodeError:
+                stdout = "<invalid UTF-8>"
             result = OrcaCommandResult(
                 argv=argv,
                 returncode=-1,
                 stdout=stdout,
-                stderr=_exception_text(exc.stderr),
+                stderr=_diagnostic_text(exc.stderr),
                 payload=_decode_object(stdout),
             )
             raise OrcaCommandError(f"Orca command timed out after {exc.timeout} seconds", result) from exc
 
         try:
-            decoded = json.loads(completed.stdout)
+            stdout = _strict_text(completed.stdout)
+        except UnicodeDecodeError as exc:
+            result = OrcaCommandResult(
+                argv=argv,
+                returncode=completed.returncode,
+                stdout="<invalid UTF-8>",
+                stderr=_diagnostic_text(completed.stderr),
+            )
+            raise OrcaCommandError("Orca stdout was not valid UTF-8", result) from exc
+        stderr = _diagnostic_text(completed.stderr)
+        try:
+            decoded = json.loads(stdout)
         except json.JSONDecodeError as exc:
             result = OrcaCommandResult(
                 argv=argv,
                 returncode=completed.returncode,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
+                stdout=stdout,
+                stderr=stderr,
             )
             raise OrcaCommandError("Orca stdout was not one JSON document", result) from exc
 
@@ -179,21 +201,21 @@ class OrcaClient:
             result = OrcaCommandResult(
                 argv=argv,
                 returncode=completed.returncode,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
+                stdout=stdout,
+                stderr=stderr,
             )
             raise OrcaCommandError("Orca JSON response was not an object", result)
 
         result = OrcaCommandResult(
             argv=argv,
             returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
+            stdout=stdout,
+            stderr=stderr,
             payload=decoded,
         )
-        if completed.returncode != 0 or decoded.get("ok") is False:
+        if completed.returncode != 0 or decoded.get("ok") is not True:
             error = decoded.get("error")
             message = error.get("message") if isinstance(error, dict) else None
-            detail = message or completed.stderr.strip() or "Orca rejected the command"
+            detail = message or stderr.strip() or "Orca response did not prove ok=true"
             raise OrcaCommandError(detail, result)
         return decoded

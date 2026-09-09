@@ -1,0 +1,28 @@
+{
+  "candidateSources": [],
+  "checks": [
+    "py -3.13 -m unittest discover -s tests -v",
+    "py -3.13 -m compileall -q src tests"
+  ],
+  "commandManifests": [
+    "pyproject.toml"
+  ],
+  "instructions": [
+    "AGENTS.md"
+  ],
+  "project": {
+    "kind": "git",
+    "root": "."
+  },
+  "reader": {
+    "kind": "repo"
+  },
+  "schema": "orchestrate-profile/v1",
+  "strategy": {
+    "kind": "single-owner-first",
+    "maxWorkers": 3
+  },
+  "taskEntrypoints": [
+    "docs/implementation-plan.md"
+  ]
+}

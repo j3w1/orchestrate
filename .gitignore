@@ -6,4 +6,3 @@ dist/
 *.egg-info/
 .coverage
 .pytest_cache/
-.orchestrate.json

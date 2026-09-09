@@ -1,69 +1,61 @@
 # Orca public CLI compatibility
 
-This document records the bounded first-milestone observations. It is not a general Orca certification and does not establish hosted, WSL, connected-server, model-provider, or release behavior.
+This is a bounded compatibility record, not general Orca, provider, WSL, hosted, or release certification.
 
-## Observed environment
+## Observed contract
 
-- Windows host
-- Python 3.13.15
-- Orca 1.4.198
-- Public capabilities `orchestration.contract.v1` and `orchestration.worker-launch-preferences.v1` advertised
-- Version-matched guides loaded with `orca skills get orca-cli` and `orca skills get orchestration`
+The planning and first-increment work used Windows, Python 3.13.15, and Orca 1.4.198. The runtime advertised `orchestration.contract.v1` and `orchestration.worker-launch-preferences.v1`. Version-matched `orca-cli` and `orchestration` guides and command help were read from the installed binary.
 
-The compact orchestration guide mentions a `--reference` discovery path, but this installed CLI rejects `--references` and its `skills get --help` exposes `--full` instead. The compact guide itself was available and read in full.
+The strict client resolves one executable for the process, invokes argument arrays, decodes contract stdout as strict UTF-8, keeps bounded stderr diagnostics separate, and requires the public envelope to say `ok: true`. Passive `orchestrate doctor` performs no orchestration mutation.
 
-## Caller identity results
+## Caller identity observations
 
-Three caller contexts produced materially different results.
+A caller with no Orca terminal association failed closed with `no_active_sender_terminal`. Scrubbing environment variables from a subprocess launched by an active terminal is not proof of an independent controller: installed source shows an implicit active-terminal fallback that may select another live identity.
 
-First, a plain Python 3.13 subprocess was launched through the dispatched worker's command-execution surface with every `ORCA_*` environment entry removed. It did not declare a terminal with `--from`. Its public `orca orchestration run-create` request reached the installed CLI and failed closed:
+A plain Python process in a fresh ordinary Orca shell successfully owned a Run. A fresh Python process in that same shell rebound the Run and created a Task. A source-backed architecture assessment confirmed that a dedicated ordinary-terminal bootstrap fits the approved plan and requires no established public API change. It must not pass another terminal through `--from`, transplant identity, or let a dispatched worker route around dispatch depth.
+
+## Historical failed launch
+
+The first composed `worker-start` attempt created a native Dispatch and then failed `agent_prompt_stalled` at `dispatch_input`, with no working-sequence advance. That attempt was inspected, preserved, and released without a blind retry. It remains historical failure evidence.
+
+## Later readiness-first evidence
+
+In a separate parent-owned disposable exercise, a fresh Codex terminal reached `tui-idle`; `worker-start --terminal --retry-of <settled-prior-failure>` accepted the Task. An exact succeeded `worker_done` settled the native Task and Dispatch, the whole Delivery was acknowledged, Orca correctly retained the external terminal, and the parent closed its dedicated controller terminal. This proves the public readiness-first composition that informed the implementation. It is not a test of this uncommitted Python candidate and does not rewrite the earlier failure.
+
+The live terminal-exit probe also established the exact receipt shape:
 
 ```text
-code: no_active_sender_terminal
-message: Could not determine the sender terminal for this orchestration command. Pass --from <terminal-handle> or run the command inside a live Orca terminal with ORCA_TERMINAL_HANDLE set.
+result.wait = {
+  handle,
+  condition: "exit",
+  satisfied: true,
+  status: "exited",
+  exitCode,
+  exitCause: { kind: "exited", exitCode }
+}
 ```
 
-No Run was created by that attempt. The executable probe reproduces the result with:
+Fast-exiting terminal output was not durably readable from the terminal stream. The bootstrap therefore requires both that native exit receipt and its own atomically written host-local result; missing or contradictory evidence cannot become exit code zero.
 
-```powershell
-py -3.13 -c "import os, pathlib, subprocess; env={k:v for k,v in os.environ.items() if not k.startswith('ORCA_')}; env['PYTHONPATH']=str(pathlib.Path('src').resolve()); p=subprocess.run(['py','-3.13','-m','orchestrate','doctor','--active-run-probe','--json'], env=env, capture_output=True, text=True); print(p.stdout, end=''); raise SystemExit(p.returncode)"
-```
+## Gate state
 
-Second, removing Orca variables from a subprocess launched directly by an existing coordinator agent did not remove its caller association: Orca bound the resulting Run to that existing agent terminal. That is inherited terminal evidence, not standalone-host support.
+| Gate | Result |
+| --- | --- |
+| Executable resolution and strict JSON client | Verified locally and by passive live doctor |
+| Required runtime capabilities | Verified on Orca 1.4.198 |
+| Ordinary-terminal Run ownership and fresh-process rebind | Verified in parent-owned live probes |
+| Historical composed worker launch | Failed at prompt input; preserved |
+| Readiness-first accepted Task/completion/release/ack composition | Verified in separate parent-owned disposable probe |
+| First-increment Python state machine | Synthetic subprocess/native fixtures pass; candidate live run NOT_RUN by implementation worker |
+| Windows terminal exit receipt | Verified by parent-owned disposable probe |
+| WSL CLI bridge status | Read-only verified after official bridge registration |
+| WSL worker lifecycle and forwarding shim | NOT_RUN; later increment |
+| Hosted CI, provider behavior, independent candidate acceptance, release | NOT_RUN |
 
-Third, a fresh ordinary Orca shell terminal, with no reasoning agent in it, ran plain Python and successfully created a Run under the shell's own terminal identity. A later plain-Python process in that shell successfully rebound the Run and created a native Task. This proves that a reasoning agent is not required for the Python coordinator, provided it runs in an Orca-owned terminal.
+## Contained no-edit probe
 
-The direct public command still has no demonstrated outside-Orca sender identity. A caller with neither an Orca terminal association nor an explicit `--from` fails with `no_active_sender_terminal`; passing another terminal's handle would impersonate it and is not a supported fallback. A source-backed architecture assessment found that a thin user-entry bootstrap into an ordinary Orca terminal fits the approved Orca-native plan and requires no established Orca API change. That bootstrap remains unimplemented and must eventually preserve foreground output, exit status, Ctrl-C behavior, exact workspace selection, and Windows/WSL argument boundaries.
+The active doctor probe is retained for narrow compatibility diagnosis. It requires an ordinary terminal in an exact clean disposable Git/Orca worktree with a committed `.orchestrate-disposable` marker. `--active-run-probe` mints a host-local one-use token; the worker probe accepts that token, not an arbitrary Run ID.
 
-The active implementation worker is already an Orca agent terminal at dispatch depth 1. Its inherited lifecycle authority is not evidence for a standalone controller, and it did not attempt a nested dispatch.
+Before mutation it read-only verifies the nonce-bearing Run, empty Task inventory, caller binding, worktree identity, and Git baseline. It explicitly places the worker in that disposable worktree. It rejects malformed FIFO entries without filtering, verifies an empty `filesModified` declaration plus independent Git readback, settles release, and acknowledges only a fully valid Delivery.
 
-## Current gate state
-
-| Gate | Result | Evidence |
-| --- | --- | --- |
-| Resolve and invoke one Orca executable | Verified | Read-only `doctor` client and focused tests |
-| Runtime ready and required capabilities advertised | Verified | Live `status --json` |
-| Plain Python in an ordinary Orca shell creates/binds a Run | Verified | Coordinator live probe; shell identity owned the Run |
-| Fresh-process Run rebind and Task creation in that shell | Verified | Coordinator live probe |
-| Direct caller without Orca terminal association creates/binds a Run | Unsupported in tested contract | `no_active_sender_terminal` |
-| Thin bootstrap into an ordinary Orca coordinator terminal | Architecture-compatible; implementation NOT_RUN | Must preserve foreground process and host/argv boundaries |
-| Real worker launch | Partial failure | Native Dispatch created, then `agent_prompt_stalled` at `dispatch_input` |
-| `worker_done`, release, and Delivery acknowledgment | NOT_RUN | Prompt never reached the worker; no blind retry |
-| Release-before-ack completion handling | Locally tested with synthetic responses; live NOT_RUN | Coordinator-only probe prepared |
-| WSL and connected-server behavior | NOT_RUN | Outside this milestone |
-
-The plain-shell evidence removes a blanket Python-controller blocker, but the first vertical slice is not complete because real prompt delivery, completion, release, and acknowledgment did not converge. Dependent controller, setup, packet, reader, bookkeeping, and execution features remain unimplemented. There is no fallback coordinator, hidden terminal impersonation, or parallel task store.
-
-## Coordinator-only live probe
-
-Run these commands only from a fresh, otherwise unused ordinary Orca shell terminal, not from a dispatched worker and not from a coordinator terminal that is supervising another Run. The first command creates a disposable Run and exits; the second starts in a fresh Python process, rebinds that Run, launches a no-edit worker, waits for `worker_done`, releases the worker, and only then acknowledges the Delivery.
-
-```powershell
-$env:PYTHONPATH = (Resolve-Path .\src).Path
-py -3.13 -m orchestrate doctor --active-run-probe --json
-py -3.13 -m orchestrate doctor --active-worker-probe <run-id-from-first-command> --json
-```
-
-The active probes mutate Orca coordination state and are never run by ordinary `doctor`. If a worker asks a question or escalates instead of completing, the probe fails and deliberately leaves that Delivery unacknowledged for coordinator inspection. The first coordinator exercise already reached `agent_prompt_stalled`; do not repeat it unchanged without new diagnostic evidence or an explicit recovery decision.
-
-Before acknowledgment, the prepared probe requires one exact Task- and Dispatch-bound `worker_done`, a recognized outcome, matching native Task and Dispatch settlement, and a confirmed released terminal resource. It holds intervention, malformed, stale, unknown, and release-pending cases without acknowledgment, and includes prior command receipts plus structured failure data in its JSON report for recovery.
+See [Live first-increment exercise](live-first-increment.md) for exact commands.
