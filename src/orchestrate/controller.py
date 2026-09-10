@@ -14,7 +14,7 @@ from .config import load_owner_model
 from .admission import joined_preflight_status, validate_packet_sources
 from .errors import OrchestrateError
 from .identity import ControllerIdentity, require_plain_controller
-from .orca import JsonObject, OrcaClient, OrcaCommandError
+from .orca import JsonObject, OrcaClient, OrcaCommandError, orca_task_title
 from .packets import canonical_packet_json, make_packet, packet_spec_from_json
 from .profile import ProjectProfile
 from .readers import read_project
@@ -507,7 +507,7 @@ def _create_task_and_packet(client: OrcaClient, store: StateStore, run: RunRecor
             "--run",
             str(run.native_run_id),
             "--task-title",
-            run.objective[:120],
+            orca_task_title(run.objective),
             "--spec",
             packet_spec_from_json(draft_json),
         ],
@@ -528,14 +528,25 @@ def _validate_task_binding(client: OrcaClient, run: RunRecord, packet_json: str)
         for item in task_rows if isinstance(item, Mapping) and item.get("id") == run.task_id
     ] if isinstance(task_rows, list) else []
     expected_spec = packet_spec_from_json(packet_json)
-    if (
-        len(matching) != 1
-        or matching[0].get("run_id") != run.native_run_id
-        or matching[0].get("task_title") != run.objective[:120]
-        or matching[0].get("spec") != expected_spec
-        or matching[0].get("status") not in {"ready", "pending"}
-    ):
-        raise OrchestrateError("task-create did not bind the exact immutable Task packet", code="orca_contract_error")
+    mismatches: list[str] = []
+    if len(matching) != 1:
+        mismatches.append("task_identity_count")
+    else:
+        task = matching[0]
+        if task.get("run_id") != run.native_run_id:
+            mismatches.append("run_id")
+        if task.get("task_title") != orca_task_title(run.objective):
+            mismatches.append("task_title")
+        if task.get("spec") != expected_spec:
+            mismatches.append("spec")
+        if task.get("status") not in {"ready", "pending"}:
+            mismatches.append("status")
+    if mismatches:
+        raise OrchestrateError(
+            "Native Task readback did not preserve the exact binding: " + ", ".join(mismatches),
+            code="orca_contract_error",
+            data={"mismatches": mismatches},
+        )
 
 
 def _ensure_packet(store: StateStore, run: RunRecord, profile: ProjectProfile) -> str:

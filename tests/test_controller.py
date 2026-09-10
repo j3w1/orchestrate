@@ -346,6 +346,91 @@ class ControllerTests(unittest.TestCase):
         ack_index = next(i for i, call in enumerate(client.calls) if "--ack" in call)
         self.assertLess(release_index, ack_index)
 
+    def test_long_objective_creates_the_exact_bounded_orca_title(self) -> None:
+        objective = (
+            "Make the failing counter test pass by changing only counter.py. Preserve the existing README.md "
+            "and owner-note.txt WIP. Run python -m unittest discover -s tests."
+        )
+        client = FakeClient(completion_responses(self.root, objective))
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=100,
+            require_context=False,
+        )
+
+        task_call = next(call for call in client.calls if call[:2] == ("orchestration", "task-create"))
+        requested_title = task_call[task_call.index("--task-title") + 1]
+        self.assertEqual(
+            requested_title,
+            "Make the failing counter test pass by changing only counter.py. Preserve the...",
+        )
+        self.assertEqual(len(requested_title), 79)
+        self.assertEqual(report["status"], "worker_succeeded")
+
+    def test_resume_accepts_existing_orca_normalized_title_without_creating_another_task(self) -> None:
+        objective = (
+            "Make the failing counter test pass by changing only counter.py. Preserve the existing README.md "
+            "and owner-note.txt WIP. Run python -m unittest discover -s tests."
+        )
+        profile = setup_project(self.root)
+        reader = read_project(profile, objective)
+        sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+        packet = make_packet(
+            objective=objective,
+            profile=profile,
+            sources=sources,
+            launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+            python_executable=str(Path(sys.executable).resolve()),
+            run_id="run_1",
+            reader=reader,
+        )
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective=objective, profile_digest=profile.digest, source_digest=sources.digest)
+            run = store.update_run(run.local_id, native_run_id="run_1", task_id="task_1", phase="task_created")
+            store.save_packet(run.local_id, "task_1", canonical_packet_json(packet))
+            local_id = run.local_id
+
+        client = FakeClient(
+            [
+                mutation("request_use", run={"id": "run_1"}),
+                {"result": {"run": {"id": "run_1"}}},
+                {"result": {"run": {"id": "run_1", "objective": objective}}},
+                {
+                    "result": {
+                        "tasks": [
+                            {
+                                "id": "task_1",
+                                "run_id": "run_1",
+                                "task_title": (
+                                    "Make the failing counter test pass by changing only counter.py. Preserve the..."
+                                ),
+                                "spec": packet_spec(packet),
+                                "status": "ready",
+                            }
+                        ]
+                    }
+                },
+                _worker_start(self.root),
+                _worker_start_readback(self.root),
+            ]
+        )
+
+        report = resume(
+            self.root,
+            local_id,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=1,
+            require_context=False,
+        )
+
+        self.assertEqual(report["taskId"], "task_1")
+        self.assertFalse(any(call[:2] == ("orchestration", "task-create") for call in client.calls))
+        worker_start = next(call for call in client.calls if call[:2] == ("orchestration", "worker-start"))
+        self.assertEqual(worker_start[worker_start.index("--task") + 1], "task_1")
+
     def test_hook_credentials_do_not_make_an_ordinary_terminal_an_agent(self) -> None:
         client = FakeClient(identity_responses(self.root))
         identity = require_plain_controller(client, self.root)  # type: ignore[arg-type]
@@ -991,6 +1076,7 @@ class ControllerTests(unittest.TestCase):
                 require_context=False,
             )
         self.assertEqual(initial.exception.code, "orca_contract_error")
+        self.assertEqual(initial.exception.data, {"mismatches": ["spec"]})
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
             run = store.select_run(None)
             local_id = run.local_id
@@ -1024,6 +1110,7 @@ class ControllerTests(unittest.TestCase):
                 require_context=False,
             )
         self.assertEqual(replay.exception.code, "orca_contract_error")
+        self.assertEqual(replay.exception.data, {"mismatches": ["spec"]})
         self.assertFalse(any("worker-start" in call for call in replay_client.calls))
 
     def test_resume_recovers_missing_packet_before_worker_start(self) -> None:

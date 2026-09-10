@@ -8,6 +8,8 @@ The planning and first-increment work used Windows, Python 3.13.15, and Orca 1.4
 
 The strict client resolves one executable for the process, invokes argument arrays, decodes contract stdout as strict UTF-8, keeps bounded stderr diagnostics separate, and requires the public envelope to say `ok: true`. Passive `orchestrate doctor` performs no orchestration mutation.
 
+Orca 1.4.198 normalizes `taskTitle` before storage through its shared task-display contract: trim and collapse ECMAScript whitespace, retain values through 80 UTF-16 code units, otherwise take 77 units, trim trailing whitespace, avoid a dangling high surrogate, and append `...`. The live disposable readback that exposed this boundary preserved the full 5,991-character Task spec but stored a 79-character title (76 objective characters plus `...`) after the controller supplied a 120-character objective slice. The controller now sends the deterministic normalized title and validates that same stored form during creation and resume; packet bytes, native identities, and Task status remain exact independent checks.
+
 ## Caller identity observations
 
 A caller with no Orca terminal association failed closed with `no_active_sender_terminal`. Scrubbing environment variables from a subprocess launched by an active terminal is not proof of an independent controller: installed source shows an implicit active-terminal fallback that may select another live identity.

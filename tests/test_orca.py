@@ -4,7 +4,7 @@ import json
 import subprocess
 import unittest
 
-from orchestrate.orca import OrcaClient, OrcaCommandError, resolve_orca_command
+from orchestrate.orca import OrcaClient, OrcaCommandError, orca_task_title, resolve_orca_command
 
 
 class ResolveCommandTests(unittest.TestCase):
@@ -23,6 +23,24 @@ class ResolveCommandTests(unittest.TestCase):
 
     def test_windows_uses_packaged_orca(self) -> None:
         self.assertEqual(resolve_orca_command({}, "win32"), ("orca",))
+
+
+class TaskTitleTests(unittest.TestCase):
+    def test_short_title_is_preserved_and_ecmascript_whitespace_is_collapsed(self) -> None:
+        self.assertEqual(orca_task_title("  short\t\n title  "), "short title")
+        self.assertEqual(orca_task_title("\ufeff\u2003bounded\u00a0title\ufeff"), "bounded title")
+
+    def test_title_at_the_80_utf16_unit_limit_is_not_truncated(self) -> None:
+        title = "a" * 78 + "\U0001f40b"
+        self.assertEqual(orca_task_title(title), title)
+
+    def test_long_title_uses_77_utf16_units_without_splitting_a_surrogate_pair(self) -> None:
+        self.assertEqual(orca_task_title("a" * 81), "a" * 77 + "...")
+        self.assertEqual(orca_task_title("a" * 76 + "\U0001f40b" + "tail"), "a" * 76 + "...")
+
+    def test_truncation_trims_boundary_whitespace_and_empty_input_has_a_stable_fallback(self) -> None:
+        self.assertEqual(orca_task_title("a" * 76 + " " + "tail"), "a" * 76 + "...")
+        self.assertEqual(orca_task_title(" \t\ufeff "), "orchestrate task")
 
 
 class ClientTests(unittest.TestCase):

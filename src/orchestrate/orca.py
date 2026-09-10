@@ -15,6 +15,70 @@ from typing import Any
 JsonObject = dict[str, Any]
 Runner = Callable[..., subprocess.CompletedProcess[Any]]
 MAX_DIAGNOSTIC_CHARS = 8192
+ORCA_TASK_TITLE_MAX_UTF16_UNITS = 80
+_ORCA_TASK_TITLE_ELLIPSIS = "..."
+_ECMASCRIPT_WHITESPACE_CODEPOINTS = frozenset(
+    {
+        *range(0x0009, 0x000E),
+        0x0020,
+        0x00A0,
+        0x1680,
+        *range(0x2000, 0x200B),
+        0x2028,
+        0x2029,
+        0x202F,
+        0x205F,
+        0x3000,
+        0xFEFF,
+    }
+)
+
+
+def _is_ecmascript_whitespace(character: str) -> bool:
+    return ord(character) in _ECMASCRIPT_WHITESPACE_CODEPOINTS
+
+
+def _collapse_ecmascript_whitespace(value: str) -> str:
+    output: list[str] = []
+    pending_space = False
+    for character in value:
+        if _is_ecmascript_whitespace(character):
+            pending_space = bool(output)
+            continue
+        if pending_space:
+            output.append(" ")
+            pending_space = False
+        output.append(character)
+    return "".join(output)
+
+
+def orca_task_title(value: str) -> str:
+    """Return the exact bounded title shape stored by Orca 1.4.198."""
+
+    normalized = _collapse_ecmascript_whitespace(value)
+    if not normalized:
+        return "orchestrate task"
+
+    def utf16_units(character: str) -> int:
+        return 2 if ord(character) > 0xFFFF else 1
+
+    if sum(utf16_units(character) for character in normalized) <= ORCA_TASK_TITLE_MAX_UTF16_UNITS:
+        return normalized
+
+    budget = ORCA_TASK_TITLE_MAX_UTF16_UNITS - len(_ORCA_TASK_TITLE_ELLIPSIS)
+    body_characters: list[str] = []
+    used = 0
+    for character in normalized:
+        width = utf16_units(character)
+        if used + width > budget:
+            break
+        body_characters.append(character)
+        used += width
+    if body_characters and 0xD800 <= ord(body_characters[-1]) <= 0xDBFF:
+        body_characters.pop()
+    while body_characters and _is_ecmascript_whitespace(body_characters[-1]):
+        body_characters.pop()
+    return "".join(body_characters) + _ORCA_TASK_TITLE_ELLIPSIS
 
 
 def _diagnostic_text(value: str | bytes | None) -> str:
