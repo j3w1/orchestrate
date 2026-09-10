@@ -386,7 +386,7 @@ def _reconcile_uncertain_close(
             or shown.get("incarnationId") != incarnation_id
             or shown.get("worktreeId") != worktree_id
             or shown.get("executionHostId") != host_id
-            or shown.get("hostPlatform") != host_platform
+            or ("hostPlatform" in shown and shown.get("hostPlatform") != host_platform)
             or not isinstance(shown.get("worktreePath"), str)
             or Path(shown["worktreePath"]).resolve() != root.resolve()
             or shown.get("connected") is not False

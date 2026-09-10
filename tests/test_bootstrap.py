@@ -181,7 +181,7 @@ class ReconciledCloseClient(FakeClient):
                     "handle": "term_controller", "tabId": "tab_controller",
                     "incarnationId": "incarnation_controller", "ptyId": "fixture@@pty-controller",
                     "worktreeId": "repo::fixture", "worktreePath": self.worktree_path,
-                    "executionHostId": "local", "hostPlatform": "win32",
+                    "executionHostId": "local",
                     "connected": False, "writable": False, "orphaned": False,
                 }},
                 "_meta": {"runtimeId": "runtime_test"},
@@ -217,6 +217,18 @@ class StaleRuntimeCloseClient(ReconciledCloseClient):
         response = super().run_json(*arguments, **keywords)
         if arguments[0:2] == ("terminal", "list"):
             response["_meta"] = {"runtimeId": "runtime_restarted"}
+        return response
+
+
+class HistoricalPlatformCloseClient(ReconciledCloseClient):
+    def __init__(self, host_platform: object) -> None:
+        super().__init__()
+        self.host_platform = host_platform
+
+    def run_json(self, *arguments: str, **keywords: object) -> dict[str, object]:
+        response = super().run_json(*arguments, **keywords)
+        if arguments[0:2] == ("terminal", "show"):
+            response["result"]["terminal"]["hostPlatform"] = self.host_platform  # type: ignore[index]
         return response
 
 
@@ -406,7 +418,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertFalse(any(call[:2] == ("terminal", "send") for call in recovery.calls))
             self.assertFalse(any(call[:2] == ("terminal", "create") for call in recovery.calls))
 
-    def test_uncertain_close_reconciles_exact_exited_and_absent_without_reissuing_close(self) -> None:
+    def test_uncertain_close_reconciles_live_historical_show_without_host_platform(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
             os.environ,
             {"ORCHESTRATE_HOME": state, "ORCA_TERMINAL_HANDLE": ""},
@@ -436,6 +448,23 @@ class BootstrapTests(unittest.TestCase):
             self.assertIsNotNone(journal["exit_response_json"])
             cleanup = json.loads(journal["cleanup_observation_json"])
             self.assertEqual(cleanup["outcome"], "observed-exited-and-absent")
+
+    def test_uncertain_close_rejects_contradictory_historical_host_platform(self) -> None:
+        for host_platform in ("linux", None, False):
+            with self.subTest(host_platform=host_platform), tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
+                os.environ,
+                {"ORCHESTRATE_HOME": state, "ORCA_TERMINAL_HANDLE": ""},
+            ):
+                first = UncertainCloseClient()
+                with self.assertRaises(OrchestrateError):
+                    launch_controller(Path(directory), ["status"], client=first)  # type: ignore[arg-type]
+                recovery = HistoricalPlatformCloseClient(host_platform)
+                recovery.command = first.command
+                recovery.worktree_path = first.worktree_path
+                with self.assertRaises(OrchestrateError) as held:
+                    launch_controller(Path(directory), ["status"], client=recovery)  # type: ignore[arg-type]
+                self.assertEqual(held.exception.code, "bootstrap_effect_uncertain")
+                self.assertFalse(any(call[:2] == ("terminal", "close") for call in recovery.calls))
 
     def test_uncertain_close_holds_when_durable_child_result_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
