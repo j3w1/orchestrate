@@ -40,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("implement", help="prepare and supervise one implementation owner")
     run.add_argument("objective", nargs="?", help="authorized objective; omit only to resume one unambiguous Run")
     _project_argument(run)
+    run.add_argument("--plan", help="tracked orchestrate-milestone-plan/v1 JSON for bounded follow-up Tasks")
     run.add_argument("--wait-timeout-ms", type=int, default=300_000)
     run.add_argument("--json", action="store_true")
 
@@ -53,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--run")
         if name == "resume":
             command.add_argument("--wait-timeout-ms", type=int, default=300_000)
+            command.add_argument("--plan", help="reassert the Run's exact tracked milestone plan path")
         command.add_argument("--json", action="store_true")
 
     packet_parser = subparsers.add_parser("packet", help="print one immutable Task packet")
@@ -170,9 +172,21 @@ def _execute(args: argparse.Namespace, raw_argv: list[str]) -> tuple[dict[str, A
             "checks": "NOT_RUN",
         }, args.json
     if args.command == "implement":
-        return implement(root, args.objective, client=client, wait_timeout_ms=args.wait_timeout_ms), args.json
+        return implement(
+            root,
+            args.objective,
+            client=client,
+            milestone_plan=args.plan,
+            wait_timeout_ms=args.wait_timeout_ms,
+        ), args.json
     if args.command == "resume":
-        return resume(root, args.run, client=client, wait_timeout_ms=args.wait_timeout_ms), args.json
+        return resume(
+            root,
+            args.run,
+            client=client,
+            milestone_plan=args.plan,
+            wait_timeout_ms=args.wait_timeout_ms,
+        ), args.json
     if args.command == "status":
         return status(root, args.run, client=client), args.json
     if args.command == "explain":
@@ -294,7 +308,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     exit_code = (
         0
         if report.get("status")
-        not in {"blocked", "preflight_held", "worker_failed", "worker_unadmitted"}
+        not in {
+            "blocked",
+            "milestone_blocked",
+            "milestone_cleanup_pending",
+            "preflight_held",
+            "worker_failed",
+            "worker_unadmitted",
+        }
         else 1
     )
     if report.get("status") == "interrupted":

@@ -33,7 +33,7 @@ from orchestrate.controller import (
 )
 from orchestrate.errors import OrchestrateError
 from orchestrate.identity import require_plain_controller
-from orchestrate.orca import OrcaJsonResponse
+from orchestrate.orca import OrcaCommandError, OrcaCommandResult, OrcaJsonResponse
 from orchestrate.packets import canonical_packet_json, make_packet, packet_spec
 from orchestrate.profile import setup_project
 from orchestrate.readers import read_project
@@ -757,6 +757,327 @@ def _worker_start_with_preflight(root: Path) -> Response:
     return respond
 
 
+class MilestoneClient:
+    """Stateful public-contract fixture for the production --plan path."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        verification_result: str = "accepted",
+        review_result: str = "accepted",
+        uncertain_task: str | None = None,
+    ) -> None:
+        self.root = root
+        self.verification_result = verification_result
+        self.review_result = review_result
+        self.uncertain_task = uncertain_task
+        self.calls: list[tuple[str, ...]] = []
+        self.tasks: dict[str, dict[str, object]] = {}
+        self.gates: dict[str, dict[str, object]] = {}
+        self.workers: dict[str, dict[str, object]] = {}
+        self.next_task = 1
+        self.next_gate = 1
+        self.next_delivery = 1
+        self.current_run = "run_1"
+
+    def _wrapped(self, value: dict[str, object], *, returncode: int = 0) -> OrcaJsonResponse:
+        value.setdefault("_meta", {"runtimeId": "runtime_test"})
+        return OrcaJsonResponse(value, returncode=returncode)
+
+    def _refresh_tasks(self) -> None:
+        for task_id, task in self.tasks.items():
+            if task["status"] in {"completed", "failed", "dispatched"}:
+                continue
+            dependencies = task["deps"]
+            deps_done = all(self.tasks[item]["status"] == "completed" for item in dependencies)  # type: ignore[union-attr]
+            gate = next((item for item in self.gates.values() if item["task_id"] == task_id), None)
+            gate_open = gate is None or (gate["status"] == "resolved" and gate["resolution"] == "accepted")
+            task["status"] = "ready" if deps_done and gate_open else "pending"
+
+    def _launch(self, task_id: str, arguments: tuple[str, ...]) -> OrcaJsonResponse:
+        if self.uncertain_task == task_id:
+            self.uncertain_task = None
+            raise OrcaCommandError(
+                "synthetic lost milestone launch receipt",
+                OrcaCommandResult(arguments, -1, "", "lost", None),
+            )
+        dispatch_id = f"dispatch_{task_id.removeprefix('task_')}"
+        terminal = "term_worker" if task_id == "task_1" else f"term_{task_id.removeprefix('task_')}"
+        resource = f"resource_{task_id.removeprefix('task_')}"
+        worktree = f"repo::{self.root.resolve()}"
+        requested = {"agent": arguments[arguments.index("--agent") + 1]}
+        if "--model" in arguments:
+            requested["model"] = arguments[arguments.index("--model") + 1]
+        if "--effort" in arguments:
+            requested["effort"] = arguments[arguments.index("--effort") + 1]
+        launch = {"requested": requested, "effective": dict(requested)}
+        self.tasks[task_id]["status"] = "dispatched"
+        self.workers[dispatch_id] = {
+            "task_id": task_id,
+            "terminal": terminal,
+            "resource": resource,
+            "worktree": worktree,
+            "launch": launch,
+            "state": "ready",
+            "released": False,
+        }
+        response = mutation(
+            f"request_start_{task_id}",
+            runId="run_1",
+            taskId=task_id,
+            dispatchId=dispatch_id,
+            state="ready",
+            stage="input_accepted",
+            setup={"state": "not_applicable"},
+            launch=launch,
+            effects=[
+                {"kind": "worktree", "action": "reused", "id": worktree},
+                {"kind": "setup", "action": "not_applicable", "state": "not_applicable"},
+                {"kind": "terminal", "role": "agent", "action": "created", "id": terminal},
+                {"kind": "dispatch_input", "role": "agent", "id": terminal, "state": "accepted"},
+            ],
+            residualResources=[{"kind": "terminal", "role": "agent", "action": "created", "id": terminal}],
+        )
+        response["_meta"] = {"runtimeId": "runtime_test"}
+        self._record_preflight(task_id, dispatch_id)
+        return self._wrapped(response)
+
+    def _record_preflight(self, task_id: str, dispatch_id: str) -> None:
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            packet = store.get_packet(run.local_id, task_id)
+            packet_id = packet["packetId"]
+        worker_preflight(
+            self.root,
+            run_id="run_1",
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+            packet_id=packet_id,
+            client=self,  # type: ignore[arg-type]
+            environment={"ORCA_TERMINAL_HANDLE": str(self.workers[dispatch_id]["terminal"])},
+            platform="win32",
+        )
+
+    def _worker_show(self, dispatch_id: str) -> dict[str, object]:
+        record = self.workers[dispatch_id]
+        task_id = record["task_id"]
+        settled = record["state"] == "succeeded"
+        released = bool(record["released"])
+        terminal = record["terminal"]
+        worktree = record["worktree"]
+        resource = record["resource"]
+        return {
+            "result": {
+                "dispatch": {
+                    "id": dispatch_id,
+                    "runId": "run_1",
+                    "taskId": task_id,
+                    "task_id": task_id,
+                    "status": "completed" if settled else "dispatched",
+                    "lastFailure": None,
+                },
+                "worker": {
+                    "dispatchId": dispatch_id,
+                    "worktreeId": worktree,
+                    "agentTerminalHandle": terminal,
+                    "lastError": None,
+                    "state": "succeeded" if settled else "ready",
+                    "stage": "settled" if settled else "input_accepted",
+                    "residualResources": [
+                        {"kind": "terminal", "role": "agent", "action": "created", "id": terminal}
+                    ],
+                    "startOptions": {
+                        "worktree": f"path:{self.root.resolve()}",
+                        "resolvedWorktreeId": worktree,
+                        "terminal": None,
+                        "agent": record["launch"]["requested"]["agent"],  # type: ignore[index]
+                        "launch": record["launch"],
+                        "setup": "not_applicable",
+                        "setupSource": "existing_worktree",
+                    },
+                },
+                "terminal": None if released else {"handle": terminal},
+                "terminalResource": {
+                    "id": resource,
+                    "ownershipState": "released" if released else "owned",
+                    "releaseState": "released" if released else "not_requested",
+                    "retainedReason": None,
+                    "originDispatchId": dispatch_id,
+                    "ownerDispatchId": dispatch_id,
+                    "terminalHandle": terminal,
+                    "worktreeId": worktree,
+                    "releaseRequestedAt": "2026-01-01T00:00:00Z" if released else None,
+                    "releaseCompletedAt": "2026-01-01T00:00:01Z" if released else None,
+                    "releaseError": None,
+                    "archive": {"source": "transcript", "status": "captured"} if released else None,
+                },
+            },
+            "_meta": {"runtimeId": "runtime_test"},
+        }
+
+    def _delivery(self) -> dict[str, object]:
+        active = next(record for record in self.workers.values() if record["state"] == "ready")
+        task_id = active["task_id"]
+        dispatch_id = next(key for key, value in self.workers.items() if value is active)
+        active["state"] = "succeeded"
+        self.tasks[task_id]["status"] = "completed"
+        payload: dict[str, object] = {"taskId": task_id, "dispatchId": dispatch_id, "outcome": "succeeded"}
+        if task_id != "task_1" and not (task_id == "task_2" and self.verification_result == "missing"):
+            with StateStore(self.root) as store:
+                run = store.select_run(None)
+                packet = store.get_packet(run.local_id, task_id)
+            result_path = Path(packet["outputs"]["milestoneResult"]["path"])
+            result_outcome = self.verification_result if task_id == "task_2" else self.review_result
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "orchestrate-milestone-result/v1",
+                        "taskKey": packet["scope"]["taskKey"],
+                        "taskId": task_id,
+                        "dispatchId": dispatch_id,
+                        "candidateDigest": packet["milestone"]["candidateDigest"],
+                        "contractDigest": packet["milestone"]["contractDigest"],
+                        "outcome": result_outcome,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload["reportPath"] = str(result_path)
+        delivery_id = f"delivery_{self.next_delivery}"
+        self.next_delivery += 1
+        return {
+            "result": {
+                "deliveryId": delivery_id,
+                "messages": [
+                    lifecycle_message(
+                        "worker_done",
+                        payload,
+                        message_id=f"message_{task_id}",
+                        dispatch_id=dispatch_id,
+                        from_handle=active["terminal"],  # type: ignore[arg-type]
+                        subject="done",
+                    )
+                ],
+            }
+        }
+
+    def run_json(self, *arguments: str, **_: object) -> dict[str, object]:
+        self.calls.append(arguments)
+        command = arguments[:2]
+        if command == ("terminal", "show"):
+            terminal = arguments[arguments.index("--terminal") + 1]
+            record = next(item for item in self.workers.values() if item["terminal"] == terminal)
+            return self._wrapped(
+                {
+                    "result": {
+                        "terminal": {
+                            "handle": terminal,
+                            "connected": True,
+                            "writable": True,
+                            "executionHostId": "local",
+                            "agentIdentity": record["launch"]["requested"]["agent"],  # type: ignore[index]
+                            "hostPlatform": "win32",
+                            "worktreeId": record["worktree"],
+                            "worktreePath": str(self.root.resolve()),
+                        }
+                    },
+                    "_meta": {"runtimeId": "runtime_test"},
+                }
+            )
+        if command == ("worktree", "current"):
+            record = next(item for item in self.workers.values() if item["state"] == "ready")
+            return self._wrapped(
+                {
+                    "result": {
+                        "worktree": {
+                            "id": record["worktree"],
+                            "path": str(self.root.resolve()),
+                        }
+                    },
+                    "_meta": {"runtimeId": "runtime_test"},
+                }
+            )
+        if command == ("orchestration", "run-create"):
+            return self._wrapped(mutation("request_run", run={"id": "run_1"}))
+        if command == ("orchestration", "run-show"):
+            return self._wrapped({"result": {"run": {"id": "run_1", "objective": self._objective()}}})
+        if command == ("orchestration", "run-use"):
+            return self._wrapped(mutation("request_run_use", run={"id": "run_1"}))
+        if command == ("orchestration", "run-current"):
+            return self._wrapped({"result": {"run": {"id": "run_1"}}})
+        if command == ("orchestration", "task-create"):
+            task_id = f"task_{self.next_task}"
+            self.next_task += 1
+            dependencies = json.loads(arguments[arguments.index("--deps") + 1]) if "--deps" in arguments else []
+            self.tasks[task_id] = {
+                "id": task_id,
+                "run_id": "run_1",
+                "task_title": arguments[arguments.index("--task-title") + 1],
+                "spec": arguments[arguments.index("--spec") + 1],
+                "deps": dependencies,
+                "status": "pending" if dependencies else "ready",
+            }
+            self._refresh_tasks()
+            return self._wrapped(mutation(f"request_{task_id}", task={"id": task_id}))
+        if command == ("orchestration", "task-list"):
+            self._refresh_tasks()
+            rows = list(self.tasks.values())
+            if "--ready" in arguments:
+                rows = [row for row in rows if row["status"] == "ready"]
+            return self._wrapped({"result": {"tasks": [dict(row) for row in rows]}})
+        if command == ("orchestration", "gate-create"):
+            gate_id = f"gate_{self.next_gate}"
+            self.next_gate += 1
+            task_id = arguments[arguments.index("--task") + 1]
+            gate = {
+                "id": gate_id,
+                "task_id": task_id,
+                "question": arguments[arguments.index("--question") + 1],
+                "status": "pending",
+                "resolution": None,
+            }
+            self.gates[gate_id] = gate
+            self._refresh_tasks()
+            return self._wrapped(mutation(f"request_{gate_id}", gate=dict(gate)))
+        if command == ("orchestration", "gate-list"):
+            task_id = arguments[arguments.index("--task") + 1]
+            return self._wrapped(
+                {"result": {"gates": [dict(gate) for gate in self.gates.values() if gate["task_id"] == task_id]}}
+            )
+        if command == ("orchestration", "gate-resolve"):
+            gate = self.gates[arguments[arguments.index("--id") + 1]]
+            gate["status"] = "resolved"
+            gate["resolution"] = arguments[arguments.index("--resolution") + 1]
+            self._refresh_tasks()
+            return self._wrapped(mutation(f"request_resolve_{gate['id']}", gate=dict(gate)))
+        if command == ("orchestration", "worker-start"):
+            return self._launch(arguments[arguments.index("--task") + 1], arguments)
+        if command == ("orchestration", "worker-show"):
+            return self._wrapped(self._worker_show(arguments[arguments.index("--dispatch") + 1]))
+        if command == ("orchestration", "worker-release"):
+            dispatch_id = arguments[arguments.index("--dispatch") + 1]
+            self.workers[dispatch_id]["released"] = True
+            return self._wrapped(
+                mutation(
+                    f"request_release_{dispatch_id}",
+                    dispatchId=dispatch_id,
+                    state="released",
+                    processAction="closed",
+                    archive={"source": "transcript", "status": "captured"},
+                )
+            )
+        if command == ("orchestration", "check") and "--ack" in arguments:
+            return self._wrapped(acknowledgement(arguments[arguments.index("--ack") + 1]))
+        if command == ("orchestration", "check"):
+            return self._wrapped(self._delivery())
+        raise AssertionError(arguments)
+
+    def _objective(self) -> str:
+        with StateStore(self.root) as store:
+            return store.select_run(None).objective
+
+
 def settlement_responses(
     outcome: str = "succeeded",
     *,
@@ -910,6 +1231,209 @@ class ControllerTests(unittest.TestCase):
         self.environment.stop()
         self.project_temp.cleanup()
         self.state_temp.cleanup()
+
+    def _write_milestone_plan(self, objective: str) -> str:
+        relative = "milestone-plan.json"
+        (self.root / relative).write_text(
+            json.dumps(
+                {
+                    "schema": "orchestrate-milestone-plan/v1",
+                    "contract": {"interface": "frozen-v1", "checks": ["focused"]},
+                    "maxWorkers": 2,
+                    "tasks": [
+                        {
+                            "key": "owner",
+                            "title": "Integrate the authorized objective",
+                            "spec": objective,
+                            "role": "owner",
+                            "dependencies": [],
+                            "gate": "integration",
+                        },
+                        {
+                            "key": "verify",
+                            "title": "Verify the integrated candidate",
+                            "spec": "Read only the exact candidate and report focused verification.",
+                            "role": "specialist",
+                            "dependencies": ["owner"],
+                            "gate": "verification",
+                        },
+                        {
+                            "key": "review",
+                            "title": "Review the verified candidate",
+                            "spec": "Independently review only the exact verified candidate.",
+                            "role": "reviewer",
+                            "dependencies": ["owner", "verify"],
+                            "gate": "review",
+                        },
+                    ],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        git(self.root, "add", relative)
+        git(self.root, "commit", "-qm", "add milestone plan")
+        return relative
+
+    def test_production_controller_executes_tracked_native_milestone_plan(self) -> None:
+        objective = "Integrate the exact bounded milestone"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root)
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "worker_succeeded")
+        self.assertEqual(report["verification"], "review_accepted")
+        self.assertEqual(report["admission"], "admitted")
+        self.assertEqual(len([call for call in client.calls if call[:2] == ("orchestration", "task-create")]), 3)
+        self.assertEqual(len([call for call in client.calls if call[:2] == ("orchestration", "gate-create")]), 2)
+        self.assertEqual(len([call for call in client.calls if call[:2] == ("orchestration", "gate-resolve")]), 2)
+        self.assertEqual(len([call for call in client.calls if call[:2] == ("orchestration", "worker-start")]), 3)
+        self.assertEqual(
+            [item["result_outcome"] for item in report["milestone"]["tasks"]],
+            ["accepted", "accepted"],
+        )
+        self.assertEqual(
+            [item["admission"] for item in report["milestone"]["tasks"]],
+            ["admitted", "admitted"],
+        )
+
+    def test_untracked_milestone_plan_has_zero_orca_effects(self) -> None:
+        objective = "Reject an untracked milestone authority packet"
+        tracked = self._write_milestone_plan(objective)
+        untracked = "untracked-milestone-plan.json"
+        (self.root / untracked).write_bytes((self.root / tracked).read_bytes())
+        client = MilestoneClient(self.root)
+
+        with self.assertRaises(OrchestrateError) as caught:
+            implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=untracked,
+                wait_timeout_ms=100,
+                require_context=False,
+            )
+
+        self.assertEqual(caught.exception.code, "milestone_plan_untracked")
+        self.assertEqual(client.calls, [])
+
+    def test_false_verification_success_keeps_review_gate_blocking(self) -> None:
+        objective = "Integrate then reject false verifier success"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, verification_result="missing")
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "milestone_blocked")
+        review_gate = next(item for item in report["milestone"]["gates"] if item["task_key"] == "review")
+        self.assertEqual(review_gate["status"], "pending")
+        self.assertFalse(
+            any(
+                call[:2] == ("orchestration", "worker-start")
+                and call[call.index("--task") + 1] == "task_3"
+                for call in client.calls
+            )
+        )
+        self.assertTrue(any("--ack" in call for call in client.calls))
+        mutating_before = [
+            call
+            for call in client.calls
+            if call[:2]
+            in {
+                ("orchestration", "gate-create"),
+                ("orchestration", "gate-resolve"),
+                ("orchestration", "task-create"),
+                ("orchestration", "worker-release"),
+                ("orchestration", "worker-start"),
+            }
+        ]
+        resumed = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=100,
+            require_context=False,
+        )
+        mutating_after = [
+            call
+            for call in client.calls
+            if call[:2]
+            in {
+                ("orchestration", "gate-create"),
+                ("orchestration", "gate-resolve"),
+                ("orchestration", "task-create"),
+                ("orchestration", "worker-release"),
+                ("orchestration", "worker-start"),
+            }
+        ]
+        self.assertEqual(resumed["status"], "milestone_blocked")
+        self.assertEqual(mutating_after, mutating_before)
+
+    def test_rejected_exact_review_never_completes_the_milestone(self) -> None:
+        objective = "Integrate then preserve rejected review evidence"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, review_result="rejected")
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "milestone_blocked")
+        review = next(item for item in report["milestone"]["tasks"] if item["task_key"] == "review")
+        self.assertEqual(review["outcome"], "succeeded")
+        self.assertEqual(review["result_outcome"], "rejected")
+        self.assertNotEqual(report["verification"], "review_accepted")
+
+    def test_uncertain_milestone_launch_is_not_duplicated_on_resume(self) -> None:
+        objective = "Integrate then preserve uncertain follow-up launch"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, uncertain_task="task_2")
+
+        with self.assertRaises(OrchestrateError) as first:
+            implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(first.exception.code, "mutation_outcome_uncertain")
+        starts_before = len([call for call in client.calls if call[:2] == ("orchestration", "worker-start")])
+
+        with self.assertRaises(OrchestrateError) as resumed:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=100,
+                require_context=False,
+            )
+        self.assertEqual(resumed.exception.code, "unknown_external_effect")
+        starts_after = len([call for call in client.calls if call[:2] == ("orchestration", "worker-start")])
+        self.assertEqual(starts_after, starts_before)
 
     def test_single_worker_happy_path_releases_before_ack_and_preserves_wip(self) -> None:
         objective = "Make the bounded change"

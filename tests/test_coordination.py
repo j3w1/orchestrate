@@ -20,6 +20,7 @@ from orchestrate.coordination import (
     validate_release_receipt,
 )
 from orchestrate.errors import OrchestrateError
+from orchestrate.orca import OrcaCommandError, OrcaCommandResult
 from orchestrate.state import StateStore
 
 
@@ -113,6 +114,63 @@ class FakeDagClient:
         raise AssertionError(arguments)
 
 
+class RecoveringGateClient(FakeDagClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gates: list[dict[str, object]] = []
+        self.lose_create = True
+        self.lose_resolve = True
+
+    def run_json(self, *arguments: str, **keywords: object) -> dict[str, object]:
+        if arguments[:2] == ("orchestration", "gate-create"):
+            self.calls.append(arguments)
+            gate = {
+                "id": f"gate_{len(self.gates) + 1}",
+                "task_id": arguments[arguments.index("--task") + 1],
+                "question": arguments[arguments.index("--question") + 1],
+                "status": "pending",
+                "resolution": None,
+            }
+            self.gates.append(gate)
+            response = {
+                "result": {
+                    "gate": gate,
+                    "mutation": {"requestId": f"request_{gate['id']}", "replayed": False},
+                }
+            }
+            if self.lose_create:
+                self.lose_create = False
+                raise OrcaCommandError(
+                    "lost create receipt",
+                    OrcaCommandResult(arguments, -1, "", "lost", response),
+                )
+            return response
+        if arguments[:2] == ("orchestration", "gate-list"):
+            self.calls.append(arguments)
+            task_id = arguments[arguments.index("--task") + 1]
+            return {"result": {"gates": [dict(gate) for gate in self.gates if gate["task_id"] == task_id]}}
+        if arguments[:2] == ("orchestration", "gate-resolve"):
+            self.calls.append(arguments)
+            gate_id = arguments[arguments.index("--id") + 1]
+            gate = next(item for item in self.gates if item["id"] == gate_id)
+            gate["status"] = "resolved"
+            gate["resolution"] = arguments[arguments.index("--resolution") + 1]
+            response = {
+                "result": {
+                    "gate": dict(gate),
+                    "mutation": {"requestId": f"request_resolve_{gate_id}", "replayed": False},
+                }
+            }
+            if self.lose_resolve:
+                self.lose_resolve = False
+                raise OrcaCommandError(
+                    "lost resolve receipt",
+                    OrcaCommandResult(arguments, -1, "", "lost", response),
+                )
+            return response
+        return super().run_json(*arguments, **keywords)
+
+
 class CoordinationTests(unittest.TestCase):
     def test_independent_parallel_tasks_wait_for_the_integration_owner(self) -> None:
         plan = milestone().validated()
@@ -167,6 +225,31 @@ class CoordinationTests(unittest.TestCase):
         self.assertNotIn("--deps", task_creates[0])
         self.assertEqual(json.loads(task_creates[1][task_creates[1].index("--deps") + 1]), ["task_1"])
 
+    def test_native_gate_intentions_recover_by_exact_readback_without_duplicate_mutation(self) -> None:
+        client = RecoveringGateClient()
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            with StateStore(Path(project_dir), home=Path(home_dir)) as store:
+                run = store.create_run(objective="milestone", profile_digest="p", source_digest="s")
+                scheduler = NativeDagScheduler(client, store, run.local_id)  # type: ignore[arg-type]
+                bindings = scheduler.create("run_1", milestone())
+                with self.assertRaises(OrchestrateError) as create_lost:
+                    scheduler.create_gates(milestone(), bindings)
+                self.assertEqual(create_lost.exception.code, "mutation_outcome_uncertain")
+
+                gates = scheduler.create_gates(milestone(), bindings)
+                with self.assertRaises(OrchestrateError) as resolve_lost:
+                    scheduler.resolve_gate(gates["unit"], resolution="accepted")
+                self.assertEqual(resolve_lost.exception.code, "mutation_outcome_uncertain")
+
+                recovered = scheduler.create_gates(milestone(), bindings)
+                self.assertEqual(recovered["unit"].status, "resolved")
+                self.assertEqual(recovered["unit"].resolution, "accepted")
+
+        creates = [call for call in client.calls if call[:2] == ("orchestration", "gate-create")]
+        resolves = [call for call in client.calls if call[:2] == ("orchestration", "gate-resolve")]
+        self.assertEqual(len(creates), 3)
+        self.assertEqual(len(resolves), 1)
+
     def test_review_is_invalidated_by_candidate_or_contract_change(self) -> None:
         plan = milestone()
         review = ReviewEvidence("task_review", plan.candidate_digest, plan.contract.digest, "accepted")
@@ -181,17 +264,63 @@ class CoordinationTests(unittest.TestCase):
                     require_current_review(review, candidate_digest=candidate, contract_digest=contract)
                 self.assertEqual(caught.exception.code, "stale_review")
 
+        rejected = ReviewEvidence("task_review", plan.candidate_digest, plan.contract.digest, "rejected")
+        with self.assertRaises(OrchestrateError) as rejected_error:
+            require_current_review(
+                rejected,
+                candidate_digest=plan.candidate_digest,
+                contract_digest=plan.contract.digest,
+                task_id="task_review",
+                settled=True,
+            )
+        self.assertEqual(rejected_error.exception.code, "review_rejected")
+
+        with self.assertRaises(OrchestrateError) as wrong_task:
+            require_current_review(
+                review,
+                candidate_digest=plan.candidate_digest,
+                contract_digest=plan.contract.digest,
+                task_id="task_other",
+                settled=True,
+            )
+        self.assertEqual(wrong_task.exception.code, "review_gate_invalid")
+
+    def test_shared_contract_is_deeply_immutable_and_digest_bound(self) -> None:
+        source = {"nested": {"version": 1}, "items": [{"name": "fixed"}]}
+        contract = SharedContract.draft(source).settle()
+        digest = contract.digest
+        source["nested"]["version"] = 2
+        source["items"][0]["name"] = "changed"
+
+        self.assertEqual(contract.value["nested"]["version"], 1)  # type: ignore[index]
+        self.assertEqual(contract.value["items"][0]["name"], "fixed")  # type: ignore[index]
+        self.assertEqual(contract.digest, digest)
+        with self.assertRaises(TypeError):
+            contract.value["added"] = True  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            contract.value["nested"]["version"] = 3  # type: ignore[index]
+        with self.assertRaises(OrchestrateError) as mismatch:
+            SharedContract(digest, "settled", {"nested": {"version": 9}})
+        self.assertEqual(mismatch.exception.code, "shared_contract_digest_mismatch")
+
     def test_exact_session_is_reused_only_for_immediate_same_agent_work(self) -> None:
-        session = WorkerSession("dispatch_1", "task_1", "term_exact", "resource_1", "worktree_1", "codex")
+        session = WorkerSession(
+            "dispatch_1", "task_1", "term_exact", "resource_1", "worktree_1", "codex", "run_1"
+        )
         reused = next_session_action(session, next_task_id="task_2", next_agent="codex")
         self.assertEqual(reused.kind, "reuse")
-        self.assertEqual(reused.argv[-2:], ("--terminal", "term_exact"))
+        self.assertEqual(
+            reused.argv[-4:],
+            ("--terminal", "term_exact", "--worktree", "id:worktree_1"),
+        )
         released = next_session_action(session, next_task_id="task_2", next_agent="claude")
         self.assertEqual(released.kind, "release")
         self.assertEqual(released.argv[-1], "dispatch_1")
 
     def test_wsl_release_unknown_is_contained_without_a_second_release(self) -> None:
-        session = WorkerSession("dispatch_wsl", "task_1", "term_wsl", "resource_wsl", "wt_wsl", "codex")
+        session = WorkerSession(
+            "dispatch_wsl", "task_1", "term_wsl", "resource_wsl", "wt_wsl", "codex", "run_1"
+        )
         decision = validate_release_receipt(
             session,
             {
@@ -209,12 +338,15 @@ class CoordinationTests(unittest.TestCase):
                         "runId": "run_1",
                         "taskId": "task_1",
                         "task_id": "task_1",
+                        "status": "completed",
                         "lastFailure": None,
                     },
                     "worker": {
                         "dispatchId": "dispatch_wsl",
                         "worktreeId": "wt_wsl",
                         "agentTerminalHandle": "term_wsl",
+                        "state": "succeeded",
+                        "stage": "settled",
                         "lastError": None,
                     },
                     "terminalResource": {
@@ -223,6 +355,9 @@ class CoordinationTests(unittest.TestCase):
                         "worktreeId": "wt_wsl",
                         "originDispatchId": "dispatch_wsl",
                         "ownerDispatchId": "dispatch_wsl",
+                        "ownershipState": "owned",
+                        "releaseState": "not_requested",
+                        "retainedReason": None,
                     },
                 }
             },
@@ -230,6 +365,109 @@ class CoordinationTests(unittest.TestCase):
         self.assertEqual(decision.state, "uncertain")
         self.assertFalse(decision.repeat_release)
         self.assertEqual(decision.recovery[0], "orca-ide")  # type: ignore[index]
+        self.assertEqual(decision.recovery_metadata["processAction"], "none")  # type: ignore[index]
+
+    def test_identity_only_release_readback_cannot_report_settlement(self) -> None:
+        session = WorkerSession(
+            "dispatch_1", "task_1", "term_1", "resource_1", "wt_1", "codex", "run_1"
+        )
+        readback = {
+            "result": {
+                "dispatch": {
+                    "id": "dispatch_1",
+                    "runId": "run_1",
+                    "taskId": "task_1",
+                    "task_id": "task_1",
+                    "status": "completed",
+                    "lastFailure": None,
+                },
+                "worker": {
+                    "dispatchId": "dispatch_1",
+                    "worktreeId": "wt_1",
+                    "agentTerminalHandle": "term_1",
+                    "state": "succeeded",
+                    "stage": "settled",
+                    "lastError": None,
+                },
+                "terminal": {"handle": "term_1"},
+                "terminalResource": {
+                    "id": "resource_1",
+                    "terminalHandle": "term_1",
+                    "worktreeId": "wt_1",
+                    "originDispatchId": "dispatch_1",
+                    "ownerDispatchId": "dispatch_1",
+                    "ownershipState": "owned",
+                    "releaseState": "not_requested",
+                    "retainedReason": None,
+                    "releaseError": None,
+                    "releaseRequestedAt": None,
+                    "releaseCompletedAt": None,
+                    "archive": {"source": None, "status": None},
+                },
+            }
+        }
+        with self.assertRaises(OrchestrateError) as caught:
+            validate_release_receipt(
+                session,
+                {"result": {"dispatchId": "dispatch_1", "state": "released"}},
+                worker_readback=readback,
+            )
+        self.assertEqual(caught.exception.code, "release_unconfirmed")
+
+    def test_stored_pending_release_converges_from_exact_released_readback(self) -> None:
+        session = WorkerSession(
+            "dispatch_1", "task_1", "term_1", "resource_1", "wt_1", "codex", "run_1"
+        )
+        decision = validate_release_receipt(
+            session,
+            {
+                "result": {
+                    "dispatchId": "dispatch_1",
+                    "state": "release_pending",
+                    "processAction": "none",
+                    "recovery": "wait for Orca's committed release recovery, then read worker-show",
+                }
+            },
+            worker_readback={
+                "result": {
+                    "dispatch": {
+                        "id": "dispatch_1",
+                        "runId": "run_1",
+                        "taskId": "task_1",
+                        "task_id": "task_1",
+                        "status": "completed",
+                        "lastFailure": None,
+                    },
+                    "worker": {
+                        "dispatchId": "dispatch_1",
+                        "worktreeId": "wt_1",
+                        "agentTerminalHandle": "term_1",
+                        "state": "succeeded",
+                        "stage": "settled",
+                        "lastError": None,
+                    },
+                    "terminal": None,
+                    "terminalResource": {
+                        "id": "resource_1",
+                        "terminalHandle": "term_1",
+                        "worktreeId": "wt_1",
+                        "originDispatchId": "dispatch_1",
+                        "ownerDispatchId": "dispatch_1",
+                        "ownershipState": "released",
+                        "releaseState": "released",
+                        "retainedReason": None,
+                        "releaseError": None,
+                        "releaseRequestedAt": "2026-01-01T00:00:00Z",
+                        "releaseCompletedAt": "2026-01-01T00:00:01Z",
+                        "archive": {"source": "transcript", "status": "captured"},
+                    },
+                }
+            },
+        )
+
+        self.assertEqual(decision.state, "released")
+        self.assertFalse(decision.repeat_release)
+        self.assertEqual(decision.recovery_metadata["processAction"], "none")  # type: ignore[index]
 
     def test_role_roster_accepts_explicit_claude_provider_ids_without_probing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -265,6 +503,17 @@ class CoordinationTests(unittest.TestCase):
                 {"requested": roster.specialist.requested(), "effective": {"agent": "claude", "model": "other"}},
             )
         self.assertEqual(substituted.exception.code, "worker_launch_mismatch")
+
+        inherited = replace(roster.specialist, agent="codex", model=None, effort=None)
+        with self.assertRaises(OrchestrateError) as hidden_effective:
+            validate_effective_launch(
+                inherited,
+                {
+                    "requested": {"agent": "codex"},
+                    "effective": {"agent": "codex", "model": "substituted", "effort": "low"},
+                },
+            )
+        self.assertEqual(hidden_effective.exception.code, "worker_launch_mismatch")
 
     def test_claude_role_without_provider_id_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

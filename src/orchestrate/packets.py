@@ -91,6 +91,63 @@ def make_packet(
         },
         "unresolvedDecisions": [],
     }
+    packet.pop("packetId", None)
+    packet["packetId"] = _packet_id(packet)
+    return packet
+
+
+def make_milestone_packet(
+    *,
+    objective: str,
+    task_key: str,
+    task_spec: str,
+    role: str,
+    candidate_digest: str,
+    contract_digest: str,
+    contract: Mapping[str, Any],
+    result_path: str,
+    max_workers: int,
+    profile: ProjectProfile,
+    sources: SourceIndex,
+    launch: Mapping[str, str],
+    python_executable: str,
+    run_id: str,
+    reader: ReaderResult,
+) -> dict[str, Any]:
+    """Extend v3 without changing its source/preflight contract."""
+
+    packet = make_packet(
+        objective=objective,
+        profile=profile,
+        sources=sources,
+        launch=launch,
+        python_executable=python_executable,
+        run_id=run_id,
+        reader=reader,
+    )
+    packet["scope"] = {
+        "projectRoot": ".",
+        "strategy": "bounded-native-dag",
+        "maxWorkers": max_workers,
+        "taskKey": task_key,
+        "role": role,
+        "taskSpec": task_spec,
+    }
+    packet["milestone"] = {
+        "candidateDigest": candidate_digest,
+        "contractDigest": contract_digest,
+        "contract": dict(contract),
+    }
+    packet["outputs"]["milestoneResult"] = {
+        "schema": "orchestrate-milestone-result/v1",
+        "path": result_path,
+        "required": True,
+        "outcomes": ["accepted", "rejected"],
+        "instruction": (
+            "Write the exact JSON result after the planned work and pass this same path as worker_done --report-path."
+        ),
+    }
+    packet.pop("packetId", None)
     packet["packetId"] = _packet_id(packet)
     return packet
 
@@ -102,11 +159,22 @@ def canonical_packet_json(packet: Mapping[str, Any]) -> str:
 
 
 def packet_spec_from_json(packet_json: str) -> str:
-    prefix = (
-        "Execute this exact orchestrate packet as the single implementation owner. "
-        "Preserve unrelated WIP, follow the indexed project authority, run required checks, "
-        "and report observed evidence without claiming independent acceptance.\n\n"
-    )
+    try:
+        packet = json.loads(packet_json)
+    except json.JSONDecodeError:
+        packet = None
+    if isinstance(packet, Mapping) and isinstance(packet.get("milestone"), Mapping):
+        prefix = (
+            "Execute this exact bounded milestone packet in its stated read-only or owner role. "
+            "Preserve unrelated WIP, follow the indexed project authority, write the exact required result, "
+            "and do not convert worker success into independent acceptance.\n\n"
+        )
+    else:
+        prefix = (
+            "Execute this exact orchestrate packet as the single implementation owner. "
+            "Preserve unrelated WIP, follow the indexed project authority, run required checks, "
+            "and report observed evidence without claiming independent acceptance.\n\n"
+        )
     return prefix + packet_json
 
 

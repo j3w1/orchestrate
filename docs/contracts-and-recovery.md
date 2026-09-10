@@ -31,6 +31,7 @@ State lives beneath the operating system's local state directory, or `ORCHESTRAT
 - immutable whole Delivery responses plus per-message effects;
 - exact worker packets;
 - immutable passed or rejected worker-preflight observations;
+- exact milestone-plan, native Task/dependency, gate, worker-session, and result bindings;
 - questions and answers; and
 - worker claims and other evidence with their stated status.
 
@@ -64,11 +65,26 @@ Source changes or incomplete selected candidate coverage before a genuinely new 
 
 ## Bounded native DAGs and review gates
 
-The second-increment coordination layer is a projection onto Orca-native Tasks, dependencies, ready views, Dispatches, and gates; it is not another task database. A `MilestonePlan` is bounded to twelve Tasks and a configured worker wave, requires one root Task that is both implementation and integration owner, and rejects additional Tasks unless each produces an independently useful output. Only that owner may write the shared contract. A specialist, verifier, or reviewer cannot be used as a second overlapping writer.
+The default `implement` and `resume` path remains the first-increment single owner. The second-increment production path is selected only by `implement <exact-objective> --plan <tracked-project-relative-json>`; `resume --plan` may reassert only the already-bound path. The file must be strict `orchestrate-milestone-plan/v1` JSON with exactly `schema`, `contract`, `maxWorkers`, and `tasks`. Each Task has exactly `key`, `title`, `spec`, `role`, `dependencies`, and `gate`. The owner spec must byte-for-byte equal the authorized CLI objective and own the sole `integration` gate. At least one specialist owns a `verification` gate, exactly one final reviewer owns the `review` gate and depends on every specialist, and the complete plan is bounded to twelve Tasks and at most eight concurrent workers. Unknown fields, an untracked plan, a changed bound plan, a second owner/reviewer, cycles, overlapping contract writers, or invented role/gate associations fail closed.
 
-The shared-contract value is canonical JSON with an immutable digest. While it is draft, only the serialized integration-owner Task can be created or selected; completing that Task without settling the contract yields no parallel ready wave. The snapshot must be explicitly settled before specialist/reviewer Task creation or parallel dispatch, and every Task spec is bound to the same contract and candidate digests. Task creation then proceeds in topological order. Dependency keys are serialized to exact native Task IDs with `task-create --deps`; one final `task-list` readback must retain Run, spec, dependency, and `ready`/`pending` gate state. `task-list --ready --brief` may select only bound Tasks and never more than the plan's worker limit. Integration, verification, and review remain separate gates; a worker success does not synthesize a verification result.
+```json
+{
+  "schema": "orchestrate-milestone-plan/v1",
+  "contract": {"interface": "frozen-v1", "checks": ["focused"]},
+  "maxWorkers": 2,
+  "tasks": [
+    {"key": "owner", "title": "Integrate", "spec": "Integrate the exact bounded milestone", "role": "owner", "dependencies": [], "gate": "integration"},
+    {"key": "verify", "title": "Verify", "spec": "Run focused read-only verification", "role": "specialist", "dependencies": ["owner"], "gate": "verification"},
+    {"key": "review", "title": "Review", "spec": "Independently review the exact candidate", "role": "reviewer", "dependencies": ["owner", "verify"], "gate": "review"}
+  ]
+}
+```
 
-Independent review evidence records both the candidate and shared-contract digest. Either changing invalidates the evidence categorically as `stale_review`; the caller must schedule a new review for the new candidate rather than relabel the old result. The default `implement` command remains single-owner-first. The coordination layer accepts an already-authorized bounded milestone plan; it does not invent decomposition from objective prose or add workers merely to occupy available slots.
+The owner still runs through the established first-increment packet, admission, supervision, settlement, release, and acknowledgment path. Only after that exact owner succeeds does the controller recapture the candidate, settle the plan's canonical shared-contract bytes, and create follow-up Orca Tasks in topological order. The contract retains no caller-owned mutable container: its digest is recomputed from the exact canonical nested JSON, and each access returns a deeply immutable tree. Every follow-up Task and packet is bound to that contract digest and the post-owner candidate digest.
+
+Dependency keys are serialized to exact native Task IDs with `task-create --deps`; `task-list` readback must retain Run, spec, dependency, and state, and `task-list --ready --brief` may select only bound Tasks within the configured wave. Verification and review labels also create real native gates. Gate creation and resolution are intention-journaled and checked through exact `gate-list` readback. If a response is lost, a single exact live gate plus the stored request identity may recover the projection; ambiguity, missing request identity, or a conflicting Task/question/status/resolution prohibits a duplicate mutation.
+
+Verification gates open only after the settled owner candidate has been frozen. The final review gate remains pending until every specialist has exact joined preflight admission, matching native Task/Dispatch settlement, and a strict host-local `orchestrate-milestone-result/v1` file whose Task, Dispatch, candidate, contract, and `accepted` outcome match its immutable packet. Result reads use the same no-follow, handle-based boundary as project sources. Prose, `worker_done` alone, missing/malformed files, wrong identity, failed native settlement, or a `rejected` outcome cannot open a later gate. The exact final reviewer must meet those same conditions; its accepted result is then checked against the exact planned review Task and current candidate/contract before local verification becomes `review_accepted`. A rejected or stale review is historical evidence and leaves a nonzero `milestone_blocked` result. External acceptance, merge, and release remain separate.
 
 ## Role roster and effective launches
 
@@ -85,17 +101,17 @@ The role roster lives only in the host-local `orchestrate-user-config/v1` file. 
 }
 ```
 
-Each worker start constructs arguments only from the selected role and then compares the complete requested selection with Orca's effective launch receipt. Missing effective capability is `worker_launch_unsupported`; substitution is `worker_launch_mismatch`. Neither configured nor requested values are execution evidence by themselves.
+Each worker start constructs arguments only from the selected role and then requires the complete `launch.requested` and complete `launch.effective` maps both to equal that exact selection. Missing effective capability, additional effective model/effort fields, aliases, or substitution cannot be projected away. Missing capability is `worker_launch_unsupported`; any difference is `worker_launch_mismatch`. Neither configured nor requested values are execution evidence by themselves.
 
 ## Session ownership and uncertain WSL release
 
-Every accepted settled worker gets exactly one next session action before acknowledgement. Immediate follow-up work may reuse the same proven agent terminal only by the exact captured handle and only for the same agent. Otherwise cleanup is `worker-release --dispatch <exact-id>`. Session readback binds Dispatch, Task, worktree, terminal handle, and immutable resource ID across the worker and terminal-resource shapes.
+Every accepted settled worker gets exactly one next session action before acknowledgement. Immediate follow-up work may reuse the same proven agent terminal only for the same agent and by both the exact captured handle and `--worktree id:<captured-worktree>`. Otherwise cleanup is `worker-release --dispatch <exact-id>`. Session readback composes the same installed-version execution validator used by the first-increment controller with exact Dispatch, Run, Task, worktree, original worker-terminal handle, and immutable resource identity.
 
-`released` and `already_released` settle cleanup; explicit user retention remains distinct. `release_pending` and `release_unknown` are uncertainty, including the observed WSL shape. They must say `processAction=none` and carry a literal non-empty recovery description or argument array. orchestrate preserves that recovery action and records `repeat_release=false`: no terminal close, locally reconstructed command, path re-resolution, or unchanged release retry is authorized.
+`released` and `already_released` settle cleanup only when readback also proves the outcome-specific worker execution, released ownership/release state, null reason/error, request/completion timestamps, captured transcript archive, and null attached terminal. Explicit `user_takeover` retention remains distinct and requires its exact null timestamp/archive fields. `release_pending` and `release_unknown` are uncertainty, including the observed WSL shape. They must say `processAction=none` and carry a literal non-empty recovery description or argument array. orchestrate preserves that immutable recovery metadata and records `repeat_release=false`: no terminal close, locally reconstructed command, path re-resolution, or unchanged release retry is authorized.
 
 ## Intervention record
 
-A repeated correction is keyed to its Task and proposed correction. Its durable record contains the current obligation, concrete failing example, hypothesis, last meaningful evidence, and next discriminating check; an incomplete record is rejected. A first correction or a correction supported by a different evidence digest may proceed. The same correction against the same evidence consumes exactly one bounded diagnosis. If that diagnosis produces genuinely new evidence, one correction may proceed; otherwise the state becomes an unresolved decision and further identical correction or diagnosis requests remain held.
+A repeated correction is keyed to its Task and proposed correction. Its durable record contains the current obligation, concrete failing example, hypothesis, last meaningful evidence, and next discriminating check; an incomplete record is rejected. A first correction or a correction supported by a different evidence digest may proceed. The same correction against the same evidence consumes exactly one bounded diagnosis. Completion runs in an immediate SQLite transaction and compare-and-swaps only a still-`required` row, so concurrent callers can receive at most one productive correction authorization. If that diagnosis produces genuinely new evidence, one correction may proceed; otherwise the state becomes an unresolved decision and further identical correction or diagnosis requests remain held.
 
 ## WSL forwarding boundary
 
@@ -113,4 +129,4 @@ The bootstrap refuses to run from a reasoning-agent terminal, so a dispatched wo
 
 ## Verification boundaries
 
-The unit and incident suite uses disposable Git repositories and synthetic public-command responses. Windows and Linux CI build a wheel, install it into an isolated environment, and run command smoke checks. Multi-worker native-DAG, release-uncertainty, role, intervention, and WSL transport contracts are synthetic/local until separately exercised. Live Orca multi-worker/WSL execution, model/provider behavior, hosted CI, independent review, external acceptance, merge, release, and publication remain separate evidence unless explicitly exercised.
+The unit and incident suite uses disposable Git repositories and synthetic public-command responses. Windows and Linux CI build a wheel, install it into an isolated environment, and run command smoke checks. The production CLI/controller milestone path, native-DAG/gate projection, release uncertainty, role, intervention, and WSL transport contracts have local synthetic coverage. Live Orca multi-worker/gate execution, real WSL worker lifecycle, model/provider behavior, hosted CI, independent candidate review, external acceptance, merge, release, and publication remain separate evidence unless explicitly exercised.

@@ -122,30 +122,40 @@ class InterventionLedger:
     ) -> InterventionDecision:
         """Consume the one diagnosis; only genuinely new evidence reopens correction."""
 
-        row = self.store.connection.execute(
-            "SELECT * FROM interventions WHERE run_local_id = ? AND task_key = ?",
-            (self.run_local_id, task_key),
-        ).fetchone()
-        if row is None or row["diagnosis_status"] != "required":
-            raise OrchestrateError(
-                "No bounded diagnosis is currently required for this Task",
-                code="diagnosis_not_authorized",
+        with self.store.transaction():
+            row = self.store.connection.execute(
+                "SELECT * FROM interventions WHERE run_local_id = ? AND task_key = ?",
+                (self.run_local_id, task_key),
+            ).fetchone()
+            if row is None or row["diagnosis_status"] != "required":
+                raise OrchestrateError(
+                    "No bounded diagnosis is currently required for this Task",
+                    code="diagnosis_not_authorized",
+                )
+            new_digest = (
+                _digest(diagnosis_evidence)
+                if isinstance(diagnosis_evidence, str) and diagnosis_evidence.strip()
+                else None
             )
-        new_digest = _digest(diagnosis_evidence) if isinstance(diagnosis_evidence, str) and diagnosis_evidence.strip() else None
-        productive = new_digest is not None and new_digest != row["evidence_digest"]
-        self.store.connection.execute(
-            """UPDATE interventions
-               SET evidence_digest = COALESCE(?, evidence_digest),
-                   diagnosis_status = ?, updated_at = ?
-               WHERE run_local_id = ? AND task_key = ?""",
-            (
-                new_digest,
-                "productive" if productive else "unproductive",
-                utc_now(),
-                self.run_local_id,
-                task_key,
-            ),
-        )
+            productive = new_digest is not None and new_digest != row["evidence_digest"]
+            changed = self.store.connection.execute(
+                """UPDATE interventions
+                   SET evidence_digest = COALESCE(?, evidence_digest),
+                       diagnosis_status = ?, updated_at = ?
+                   WHERE run_local_id = ? AND task_key = ? AND diagnosis_status = 'required'""",
+                (
+                    new_digest,
+                    "productive" if productive else "unproductive",
+                    utc_now(),
+                    self.run_local_id,
+                    task_key,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise OrchestrateError(
+                    "The bounded diagnosis was already consumed concurrently",
+                    code="diagnosis_not_authorized",
+                )
         return "correction_allowed" if productive else "unresolved"
 
     def read(self, task_key: str) -> dict[str, object] | None:

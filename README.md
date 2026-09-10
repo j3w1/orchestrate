@@ -28,7 +28,7 @@ The project keeps one small tracked file and one host-local database.
 
 Every Orca orchestration mutation starts as a durable intention. Exact native request receipts, Task/Run readback, requested-versus-effective launch values, worker placement, and structured release state are checked before the local state advances. A dedicated host-local admission/effect fence orders managed worker-preflight evidence against reply, Delivery, retry, release, and acknowledgement intervals without blocking the first preflight behind the controller's broader Run lock. Every Delivery is journaled whole before its messages have effects. Current Orca lifecycle rows retain their raw JSON-string payloads in that journal, then undergo strict Run, Task, Dispatch, sender, and alias validation before any effect. Completion is accepted only for the exact Task and Dispatch, release is settled before acknowledgment, and missing request history stays uncertain.
 
-Bounded multi-worker plans have exactly one implementation/integration owner. A draft shared contract admits only that serialized owner wave; the snapshot must be settled and bound before specialist Tasks or parallel dispatch. Only the owner may write the contract. Specialist Tasks must be independently useful, verification and review stay dependent gates, and an accepted review becomes stale as soon as either the candidate or contract digest changes. Settled terminals have one explicit next action: immediate same-agent reuse by exact handle, or Orca-native release by exact Dispatch. `release_pending` and the observed WSL `release_unknown` shape preserve Orca's literal recovery action and prohibit an unchanged second release.
+Bounded multi-worker plans have exactly one implementation/integration owner. A draft shared contract admits only that serialized owner wave; the snapshot must be settled and bound before specialist Tasks or parallel dispatch. Only the owner may write the contract. Specialist Tasks must be independently useful, verification and review use journaled Orca-native gates, and an accepted review becomes stale as soon as either the candidate or contract digest changes. A worker success without the exact accepted result artifact cannot open the review gate. Settled terminals have one explicit next action: immediate same-agent reuse by exact handle and captured worktree, or Orca-native release by exact Dispatch. `release_pending` and the observed WSL `release_unknown` shape preserve Orca's literal recovery action and prohibit an unchanged second release.
 
 The host-local role roster has owner, specialist, and independent-reviewer slots. Defaults remain Codex/Sol; an optional Claude slot must carry a user-supplied provider model ID. The tool never probes provider APIs or guesses that a configured model exists—each launch still has to prove that Orca's requested and effective values are identical.
 
@@ -107,6 +107,14 @@ Committing the file is ordinary candidate history, not a configuration acknowled
 orchestrate implement "Fix the parser regression and run the profile checks" --json
 ```
 
+That command keeps the one-owner default. For an already-authorized bounded milestone, pass a reviewed, tracked `orchestrate-milestone-plan/v1` file explicitly:
+
+```powershell
+orchestrate implement "Integrate the exact bounded milestone" --plan milestone-plan.json --json
+```
+
+The plan names the exact owner objective, specialist outputs, final reviewer, dependencies, gate kinds, settled shared-contract value, and worker limit. orchestrate does not infer that decomposition from objective prose. Follow-up packets bind each native Task to the post-owner candidate and contract digests and name a host-local result-file contract; only an exact admitted, natively settled worker plus an `accepted` result can satisfy verification or review. Resume may reassert the same path with `--plan`, but cannot select a different plan for the Run. The complete strict JSON shape and recovery rules are in [Execution contracts and recovery](docs/contracts-and-recovery.md).
+
 The command waits in the foreground. Ctrl-C stops controller waiting; it does not pretend the active worker stopped. Continue with the Run ID:
 
 ```powershell
@@ -128,7 +136,7 @@ Inspect the immutable Task packet without consuming mail or calling a model:
 orchestrate packet --run <run-id> --task <task-id> --json
 ```
 
-Omitting an objective resumes only when one local Run is unambiguous. Multiple Runs always require an explicit selection. A succeeded worker leaves verification pending by design.
+Omitting an objective resumes only when one local Run is unambiguous. Multiple Runs always require an explicit selection. A succeeded default owner leaves verification pending by design; a planned milestone reaches `review_accepted` only after every planned verification result and the exact final review are accepted.
 
 For a copyable disposable live exercise, use [Live first-increment exercise](docs/live-first-increment.md).
 
@@ -143,7 +151,7 @@ For a copyable disposable live exercise, use [Live first-increment exercise](doc
 - Host-local SQLite intentions, Deliveries, questions, evidence, controller locks, and a separate admission/effect fence.
 - A host-local operational-profile selection history that cannot live inside the project or a recognized synchronized root.
 - Deterministic Run creation, Task creation, one-worker launch, supervision, answer, release, acknowledgment, and resume.
-- A bounded native-DAG layer for one integration owner, settled shared contracts, independent specialists, dependent verification/review gates, and stale-review invalidation.
+- An explicitly selected bounded native-DAG path for one integration owner, settled shared contracts, independent specialists, journaled native verification/review gates, exact result artifacts, and stale-review invalidation.
 - Host-local owner/specialist/reviewer launch choices with explicit Claude provider IDs and requested/effective receipt validation.
 - Exact-terminal reuse or Dispatch release decisions, including fail-closed `release_unknown` containment.
 - Durable intervention records and one bounded diagnosis before an unchanged correction can repeat without new evidence.

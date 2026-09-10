@@ -161,6 +161,25 @@ def validate_packet_sources(
         or native_packet.get("runId") != run.native_run_id
     ):
         raise OrchestrateError("Worker packet does not bind the selected native Run", code="packet_identity_conflict")
+    milestone = packet.get("milestone")
+    scope = packet.get("scope")
+    if milestone is not None:
+        task_key = scope.get("taskKey") if isinstance(scope, Mapping) else None
+        task_spec = scope.get("taskSpec") if isinstance(scope, Mapping) else None
+        # The packet validator normally has no StateStore argument. The exact
+        # native Task binding is therefore joined by worker_preflight below,
+        # while this source-only pass rejects malformed milestone identity.
+        if (
+            not isinstance(milestone, Mapping)
+            or not isinstance(task_key, str)
+            or not task_key
+            or not isinstance(task_spec, str)
+            or not task_spec
+            or not isinstance(milestone.get("candidateDigest"), str)
+            or not isinstance(milestone.get("contractDigest"), str)
+            or not isinstance(milestone.get("contract"), Mapping)
+        ):
+            raise OrchestrateError("Milestone packet identity is malformed", code="packet_identity_conflict")
     identities = _verify_packet_source_bytes(profile, packet)
     pre_sources = build_source_index(profile, extra_sources=set(identities))
     _verify_source_index(profile, packet, pre_sources)
@@ -183,7 +202,7 @@ def validate_packet_sources(
         run.objective,
         expected_ce_query_sources=expected_query_sources,
     )
-    sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+    sources = build_source_index(profile, extra_sources=set(reader.consulted_paths) | set(identities))
     _verify_source_index(profile, packet, sources)
     actual_reader = {"kind": reader.kind, "routing": reader.routing}
     if (
@@ -390,7 +409,16 @@ def worker_preflight(
             native: dict[str, Any] | None = None
             validation: PacketValidation | None = None
             try:
-                if run.task_id != task_id or run.native_run_id != run_id or run.dispatch_id not in {None, dispatch_id}:
+                milestone_task = store.connection.execute(
+                    "SELECT task_key FROM milestone_task_bindings WHERE run_local_id = ? AND task_id = ?",
+                    (run.local_id, task_id),
+                ).fetchone()
+                owner_attempt = run.task_id == task_id
+                if (
+                    run.native_run_id != run_id
+                    or (not owner_attempt and milestone_task is None)
+                    or (owner_attempt and run.dispatch_id not in {None, dispatch_id})
+                ):
                     raise OrchestrateError("Preflight selectors do not match the local Run", code="preflight_identity_conflict")
                 foreign = other_dispatch_observations(store, run.local_id, task_id, dispatch_id)
                 if foreign:
@@ -415,12 +443,40 @@ def worker_preflight(
                     environment=env,
                     platform=selected_platform,
                 )
-                binding = store.get_worker_resource_binding(run.local_id)
-                if binding is not None and (
-                    binding.dispatch_id != dispatch_id
-                    or binding.resource_id != native.get("terminalResourceId")
-                    or binding.terminal_handle != native.get("terminalHandle")
-                    or binding.worktree_id != native.get("worktreeId")
+                if owner_attempt:
+                    binding = store.get_worker_resource_binding(run.local_id)
+                    bound_identity = (
+                        (
+                            binding.dispatch_id,
+                            binding.resource_id,
+                            binding.terminal_handle,
+                            binding.worktree_id,
+                        )
+                        if binding is not None
+                        else None
+                    )
+                else:
+                    binding = store.connection.execute(
+                        """SELECT dispatch_id, resource_id, terminal_handle, worktree_id
+                           FROM milestone_worker_bindings
+                           WHERE run_local_id = ? AND task_key = ?""",
+                        (run.local_id, milestone_task["task_key"]),
+                    ).fetchone()
+                    bound_identity = (
+                        (
+                            binding["dispatch_id"],
+                            binding["resource_id"],
+                            binding["terminal_handle"],
+                            binding["worktree_id"],
+                        )
+                        if binding is not None
+                        else None
+                    )
+                if bound_identity is not None and bound_identity != (
+                    dispatch_id,
+                    native.get("terminalResourceId"),
+                    native.get("terminalHandle"),
+                    native.get("worktreeId"),
                 ):
                     raise OrchestrateError(
                         "Worker preflight live resource identity conflicts with its immutable controller binding",
@@ -435,7 +491,7 @@ def worker_preflight(
                     "dispatchId": dispatch_id,
                     "packetId": packet_id,
                     "packetJsonSha256": validation.packet_json_sha256,
-                    "expectedSourceDigest": run.source_digest,
+                    "expectedSourceDigest": validation.packet.get("sourceDigest"),
                     "observedSourceDigest": validation.sources.digest,
                     "profileDigest": profile.digest,
                     "routingDigest": validation.routing_digest,
@@ -544,11 +600,20 @@ def joined_preflight_status(store: StateStore, run: RunRecord) -> str:
         return "rejected"
     if outcome != "passed":
         return "conflicting"
+    milestone_task = store.connection.execute(
+        "SELECT task_key FROM milestone_task_bindings WHERE run_local_id = ? AND task_id = ?",
+        (run.local_id, run.task_id),
+    ).fetchone()
+    operation = (
+        f"milestone-worker-start:{milestone_task['task_key']}"
+        if milestone_task is not None
+        else "worker-start"
+    )
     rows = store.connection.execute(
         """SELECT arguments_json, response_json FROM intentions
-           WHERE run_local_id = ? AND operation = 'worker-start' AND status = 'applied'
+           WHERE run_local_id = ? AND operation = ? AND status = 'applied'
            ORDER BY created_at""",
-        (run.local_id,),
+        (run.local_id, operation),
     ).fetchall()
     if len(rows) != 1 or not rows[0]["response_json"]:
         return "pending"
@@ -584,14 +649,30 @@ def joined_preflight_status(store: StateStore, run: RunRecord) -> str:
         "dispatchId": run.dispatch_id,
         "packetId": packet.get("packetId"),
         "packetJsonSha256": hashlib.sha256(packet_json.encode("utf-8")).hexdigest(),
-        "expectedSourceDigest": run.source_digest,
-        "observedSourceDigest": run.source_digest,
+        "expectedSourceDigest": packet.get("sourceDigest"),
+        "observedSourceDigest": packet.get("sourceDigest"),
         "profileDigest": packet.get("profileDigest"),
         "routingDigest": _digest(packet.get("reader")),
         "candidate": packet.get("candidate"),
     }
     native = observation.get("native")
-    resource_binding = store.get_worker_resource_binding(run.local_id)
+    if milestone_task is None:
+        resource_binding = store.get_worker_resource_binding(run.local_id)
+        resource_dispatch_id = resource_binding.dispatch_id if resource_binding is not None else None
+        resource_id = resource_binding.resource_id if resource_binding is not None else None
+        resource_terminal = resource_binding.terminal_handle if resource_binding is not None else None
+        resource_worktree = resource_binding.worktree_id if resource_binding is not None else None
+    else:
+        milestone_worker = store.connection.execute(
+            """SELECT dispatch_id, resource_id, terminal_handle, worktree_id
+               FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = ?""",
+            (run.local_id, milestone_task["task_key"]),
+        ).fetchone()
+        resource_binding = milestone_worker
+        resource_dispatch_id = milestone_worker["dispatch_id"] if milestone_worker is not None else None
+        resource_id = milestone_worker["resource_id"] if milestone_worker is not None else None
+        resource_terminal = milestone_worker["terminal_handle"] if milestone_worker is not None else None
+        resource_worktree = milestone_worker["worktree_id"] if milestone_worker is not None else None
     expected_arguments = [
         "orchestration",
         "worker-start",
@@ -603,13 +684,12 @@ def joined_preflight_status(store: StateStore, run: RunRecord) -> str:
         f"path:{native.get('worktreeRoot')}" if isinstance(native, Mapping) else None,
         "--agent",
         expected_launch.get("agent") if isinstance(expected_launch, Mapping) else None,
-        "--model",
-        expected_launch.get("model") if isinstance(expected_launch, Mapping) else None,
-        "--effort",
-        expected_launch.get("effort") if isinstance(expected_launch, Mapping) else None,
-        "--timeout-ms",
-        "60000",
     ]
+    if isinstance(expected_launch, Mapping) and expected_launch.get("model") is not None:
+        expected_arguments.extend(("--model", expected_launch.get("model")))
+    if isinstance(expected_launch, Mapping) and expected_launch.get("effort") is not None:
+        expected_arguments.extend(("--effort", expected_launch.get("effort")))
+    expected_arguments.extend(("--timeout-ms", "60000"))
     if (
         any(observation.get(key) != value for key, value in expected.items())
         or result.get("dispatchId") != run.dispatch_id
@@ -621,10 +701,10 @@ def joined_preflight_status(store: StateStore, run: RunRecord) -> str:
         or launch.get("effective") != expected_launch
         or not isinstance(native, Mapping)
         or resource_binding is None
-        or resource_binding.dispatch_id != run.dispatch_id
-        or native.get("terminalResourceId") != resource_binding.resource_id
-        or native.get("terminalHandle") != resource_binding.terminal_handle
-        or native.get("worktreeId") != resource_binding.worktree_id
+        or resource_dispatch_id != run.dispatch_id
+        or native.get("terminalResourceId") != resource_id
+        or native.get("terminalHandle") != resource_terminal
+        or native.get("worktreeId") != resource_worktree
         or native.get("runtimeId") != runtime_id
         or native.get("worktreeId") != worktrees[0].get("id")
         or native.get("terminalHandle") != terminals[0].get("id")

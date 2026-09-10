@@ -392,6 +392,49 @@ class StateStore(AbstractContextManager["StateStore"]):
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (run_local_id, task_key)
             );
+            CREATE TABLE IF NOT EXISTS milestone_plan_bindings (
+                run_local_id TEXT PRIMARY KEY REFERENCES runs(local_id),
+                relative_path TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                candidate_digest TEXT,
+                contract_digest TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS milestone_gate_bindings (
+                run_local_id TEXT NOT NULL REFERENCES runs(local_id),
+                task_key TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                gate_id TEXT NOT NULL UNIQUE,
+                gate_kind TEXT NOT NULL,
+                question TEXT NOT NULL,
+                status TEXT NOT NULL,
+                resolution TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_local_id, task_key)
+            );
+            CREATE TABLE IF NOT EXISTS milestone_worker_bindings (
+                run_local_id TEXT NOT NULL REFERENCES runs(local_id),
+                task_key TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                dispatch_id TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                terminal_handle TEXT NOT NULL,
+                worktree_id TEXT NOT NULL,
+                outcome TEXT,
+                result_outcome TEXT,
+                result_digest TEXT,
+                release_state TEXT NOT NULL,
+                readback_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_local_id, task_key)
+            );
             """
         )
         intention_columns = {
@@ -441,7 +484,15 @@ class StateStore(AbstractContextManager["StateStore"]):
         placeholders = ",".join("?" for _ in terminal)
         rows = self.connection.execute(
             f"""SELECT * FROM runs
-                  WHERE phase NOT IN ({placeholders}) OR delivery_id IS NOT NULL
+                  WHERE phase NOT IN ({placeholders})
+                     OR delivery_id IS NOT NULL
+                     OR (
+                         phase = 'worker_succeeded'
+                         AND EXISTS (
+                             SELECT 1 FROM milestone_plan_bindings p
+                             WHERE p.run_local_id = runs.local_id AND p.status != 'review_accepted'
+                         )
+                     )
                   ORDER BY created_at""",
             terminal,
         ).fetchall()

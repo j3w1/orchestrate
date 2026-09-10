@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from orchestrate.bootstrap import _exit_code, controller_command, decode_payload, encode_payload, launch_controller
-from orchestrate.cli import main
+from orchestrate.cli import build_parser, main
 from orchestrate.errors import OrchestrateError
 from orchestrate.orca import OrcaCommandError, OrcaCommandResult
 
@@ -264,6 +264,14 @@ class BooleanInventoryCloseClient(ReconciledCloseClient):
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_cli_routes_the_explicit_versioned_milestone_plan(self) -> None:
+        parsed = build_parser().parse_args(
+            ["implement", "authorized objective", "--plan", "plans/milestone.json", "--json"]
+        )
+        self.assertEqual(parsed.command, "implement")
+        self.assertEqual(parsed.objective, "authorized objective")
+        self.assertEqual(parsed.plan, "plans/milestone.json")
+
     def test_payload_round_trip_preserves_spaces_unicode_and_argument_boundaries(self) -> None:
         arguments = ["implement", "fix spaced path 雪", "--project", "C:/a b/雪"]
         self.assertEqual(decode_payload(encode_payload(arguments)), arguments)
@@ -614,7 +622,12 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())["status"], "blocked")
 
     def test_held_and_unadmitted_states_are_nonzero_directly_and_through_bootstrap(self) -> None:
-        for status in ("preflight_held", "worker_unadmitted"):
+        for status in (
+            "milestone_blocked",
+            "milestone_cleanup_pending",
+            "preflight_held",
+            "worker_unadmitted",
+        ):
             with self.subTest(status=status):
                 child = {
                     "schema": "orchestrate-report/v1",

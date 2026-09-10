@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 
 from orchestrate.errors import OrchestrateError
@@ -65,6 +66,49 @@ class InterventionTests(unittest.TestCase):
         with self.assertRaises(OrchestrateError) as caught:
             InterventionRecord("obligation", "", "hypothesis", "evidence", "check").validated()
         self.assertEqual(caught.exception.code, "intervention_record_incomplete")
+
+    def test_concurrent_diagnosis_can_authorize_exactly_one_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            project = Path(project_dir)
+            home = Path(home_dir)
+            with StateStore(project, home=home) as store:
+                run = store.create_run(objective="fix", profile_digest="p", source_digest="s")
+                ledger = InterventionLedger(store, run.local_id)
+                record = InterventionRecord("obligation", "failure", "hypothesis", "evidence", "check")
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=record),
+                    "correction_allowed",
+                )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=record),
+                    "diagnosis_required",
+                )
+
+            barrier = threading.Barrier(2)
+            outcomes: list[str] = []
+            outcome_lock = threading.Lock()
+
+            def finish() -> None:
+                with StateStore(project, home=home) as concurrent_store:
+                    concurrent = InterventionLedger(concurrent_store, run.local_id)
+                    barrier.wait()
+                    try:
+                        outcome = concurrent.finish_diagnosis(
+                            task_key="task",
+                            diagnosis_evidence="new exact evidence",
+                        )
+                    except OrchestrateError as exc:
+                        outcome = exc.code
+                    with outcome_lock:
+                        outcomes.append(outcome)
+
+            threads = [threading.Thread(target=finish) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+            self.assertCountEqual(outcomes, ["correction_allowed", "diagnosis_not_authorized"])
 
 
 if __name__ == "__main__":

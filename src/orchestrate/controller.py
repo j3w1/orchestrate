@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,7 +12,21 @@ import sys
 import time
 from typing import Any, Literal
 
-from .config import load_owner_model
+from .config import RoleChoice, load_owner_model, load_role_roster
+from .coordination import (
+    LoadedMilestonePlan,
+    MilestonePlan,
+    MilestoneTask,
+    NativeDagScheduler,
+    NativeGateBinding,
+    NativeTaskBinding,
+    ReviewEvidence,
+    WorkerSession,
+    load_milestone_plan,
+    milestone_plan_relative_path,
+    require_current_review,
+    validate_release_receipt,
+)
 from .admission import joined_preflight_status, other_dispatch_observations, validate_packet_sources
 from .errors import OrchestrateError
 from .identity import ControllerIdentity, require_plain_controller
@@ -28,11 +44,17 @@ from .orca_compat import (
     worker_show_identity,
     worker_terminal_resource_identity,
 )
-from .packets import canonical_packet_json, make_packet, packet_spec_from_json
+from .packets import (
+    canonical_packet_json,
+    make_milestone_packet,
+    make_packet,
+    packet_spec_from_json,
+)
 from .profile import ProjectProfile
-from .readers import read_project
+from .readers import ReaderResult, read_project
+from .safeio import read_project_bytes
 from .sources import SourceIndex, build_source_index
-from .state import RunRecord, StateStore, WorkerResourceBinding
+from .state import RunRecord, StateStore, WorkerResourceBinding, utc_now
 
 
 REPORT_SCHEMA = "orchestrate-report/v1"
@@ -811,9 +833,33 @@ def _require_candidate_coverage(sources: SourceIndex) -> None:
         )
 
 
+def _milestone_plan_path(store: StateStore, run: RunRecord) -> str | None:
+    row = store.connection.execute(
+        "SELECT relative_path FROM milestone_plan_bindings WHERE run_local_id = ?",
+        (run.local_id,),
+    ).fetchone()
+    return str(row["relative_path"]) if row is not None else None
+
+
+def _run_source_index(
+    profile: ProjectProfile,
+    reader: ReaderResult,
+    *,
+    milestone_path: str | None,
+) -> SourceIndex:
+    consulted = set(getattr(reader, "consulted_paths"))
+    if milestone_path is not None:
+        consulted.add(milestone_path)
+    return build_source_index(profile, extra_sources=consulted)
+
+
 def _create_task_and_packet(client: OrcaClient, store: StateStore, run: RunRecord, profile: ProjectProfile) -> RunRecord:
     reader = read_project(profile, run.objective)
-    sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+    sources = _run_source_index(
+        profile,
+        reader,
+        milestone_path=_milestone_plan_path(store, run),
+    )
     _require_candidate_coverage(sources)
     if sources.digest != run.source_digest:
         raise OrchestrateError(
@@ -900,7 +946,11 @@ def _ensure_packet(store: StateStore, run: RunRecord, profile: ProjectProfile) -
         if exc.code != "packet_not_found":
             raise
     reader = read_project(profile, run.objective)
-    sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+    sources = _run_source_index(
+        profile,
+        reader,
+        milestone_path=_milestone_plan_path(store, run),
+    )
     _require_candidate_coverage(sources)
     if sources.digest != run.source_digest:
         raise OrchestrateError(
@@ -968,8 +1018,8 @@ def _validate_worker_start(
     run: RunRecord,
     worktree_id: str | None,
     agent: str,
-    model: str,
-    effort: str,
+    model: str | None,
+    effort: str | None,
 ) -> tuple[str, str]:
     result = _result(payload)
     if (
@@ -983,7 +1033,11 @@ def _validate_worker_start(
     ):
         raise OrchestrateError("worker-start did not accept the exact Run and Task", code="orca_contract_error")
     launch = result.get("launch")
-    expected_launch = {"agent": agent, "model": model, "effort": effort}
+    expected_launch = {"agent": agent}
+    if model is not None:
+        expected_launch["model"] = model
+    if effort is not None:
+        expected_launch["effort"] = effort
     if (
         not isinstance(launch, Mapping)
         or launch.get("requested") != expected_launch
@@ -1095,8 +1149,8 @@ def _validate_worker_start_readback(
     worktree_selector: str,
     terminal_id: str,
     agent: str,
-    model: str,
-    effort: str,
+    model: str | None,
+    effort: str | None,
 ) -> TerminalResourceIdentity:
     result = _result(payload)
     dispatch = result.get("dispatch")
@@ -1122,7 +1176,11 @@ def _validate_worker_start_readback(
     except WorkerShowShapeError as exc:
         raise OrchestrateError(str(exc), code="orca_contract_error") from exc
     options = worker.get("startOptions")
-    expected_launch = {"agent": agent, "model": model, "effort": effort}
+    expected_launch = {"agent": agent}
+    if model is not None:
+        expected_launch["model"] = model
+    if effort is not None:
+        expected_launch["effort"] = effort
     if (
         not isinstance(options, Mapping)
         or options.get("worktree") != worktree_selector
@@ -1958,11 +2016,775 @@ def _supervise(client: OrcaClient, store: StateStore, run: RunRecord, *, wait_ti
     return _run_summary(store, store.get_run(current.local_id))
 
 
+def _record_milestone_plan(store: StateStore, run: RunRecord, loaded: LoadedMilestonePlan) -> None:
+    existing = store.connection.execute(
+        "SELECT * FROM milestone_plan_bindings WHERE run_local_id = ?",
+        (run.local_id,),
+    ).fetchone()
+    identity = (loaded.relative_path, loaded.digest, loaded.canonical_json, loaded.plan.contract.digest)
+    if existing is not None:
+        observed = (
+            existing["relative_path"],
+            existing["plan_digest"],
+            existing["plan_json"],
+            existing["contract_digest"],
+        )
+        if observed != identity:
+            raise OrchestrateError("The selected milestone plan changed identity", code="milestone_plan_changed")
+        return
+    now = utc_now()
+    store.connection.execute(
+        """INSERT INTO milestone_plan_bindings
+           VALUES (?, ?, ?, ?, NULL, ?, 'owner_pending', ?, ?)""",
+        (run.local_id, *identity, now, now),
+    )
+
+
+def _milestone_result_path(store: StateStore, run_local_id: str, task_key: str) -> Path:
+    digest = hashlib.sha256(f"{run_local_id}\0{task_key}".encode("utf-8")).hexdigest()
+    directory = store.directory / "milestone-results"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{digest}.json"
+
+
+def _reload_milestone_plan(
+    profile: ProjectProfile,
+    store: StateStore,
+    run: RunRecord,
+) -> tuple[LoadedMilestonePlan, SourceIndex, ReaderResult]:
+    row = store.connection.execute(
+        "SELECT * FROM milestone_plan_bindings WHERE run_local_id = ?",
+        (run.local_id,),
+    ).fetchone()
+    if row is None:
+        raise OrchestrateError("The Run has no bound milestone plan", code="milestone_plan_missing")
+    reader = read_project(profile, run.objective)
+    sources = _run_source_index(profile, reader, milestone_path=row["relative_path"])
+    _require_candidate_coverage(sources)
+    loaded = load_milestone_plan(
+        profile.root,
+        row["relative_path"],
+        objective=run.objective,
+        candidate_digest=sources.digest,
+        sources=sources,
+    )
+    expected = (row["relative_path"], row["plan_digest"], row["plan_json"], row["contract_digest"])
+    actual = (loaded.relative_path, loaded.digest, loaded.canonical_json, loaded.plan.contract.digest)
+    if actual != expected:
+        raise OrchestrateError("The tracked milestone plan changed after owner launch", code="milestone_plan_changed")
+    selected_candidate = row["candidate_digest"]
+    if selected_candidate is not None and selected_candidate != sources.digest:
+        raise OrchestrateError(
+            "The candidate changed after the milestone verification snapshot",
+            code="stale_review",
+            data={"expected": selected_candidate, "actual": sources.digest},
+        )
+    return loaded, sources, reader
+
+
+def _runtime_milestone_plan(
+    profile: ProjectProfile,
+    store: StateStore,
+    run: RunRecord,
+    loaded: LoadedMilestonePlan,
+    sources: SourceIndex,
+    reader: ReaderResult,
+) -> tuple[MilestonePlan, dict[str, str]]:
+    roster = load_role_roster()
+    runtime_tasks: list[MilestoneTask] = []
+    packets: dict[str, str] = {}
+    for task in loaded.plan.tasks:
+        if task.integration_owner:
+            runtime_tasks.append(task)
+            continue
+        choice = roster.choice(task.role)
+        result_path = _milestone_result_path(store, run.local_id, task.key)
+        packet_value = make_milestone_packet(
+            objective=run.objective,
+            task_key=task.key,
+            task_spec=task.spec,
+            role=task.role,
+            candidate_digest=loaded.plan.candidate_digest,
+            contract_digest=loaded.plan.contract.digest,
+            contract=json.loads(loaded.plan.contract.canonical_json),
+            result_path=os.fspath(result_path),
+            max_workers=loaded.plan.max_workers,
+            profile=profile,
+            sources=sources,
+            launch=choice.requested(),
+            python_executable=os.fspath(Path(sys.executable).resolve()),
+            run_id=str(run.native_run_id),
+            reader=reader,
+        )
+        packet_json = canonical_packet_json(packet_value)
+        packets[task.key] = packet_json
+        runtime_tasks.append(replace(task, spec=packet_spec_from_json(packet_json)))
+    return replace(loaded.plan, tasks=tuple(runtime_tasks)).validated(), packets
+
+
+def _milestone_gate_rows(store: StateStore, run: RunRecord) -> dict[str, NativeGateBinding]:
+    rows = store.connection.execute(
+        "SELECT * FROM milestone_gate_bindings WHERE run_local_id = ? ORDER BY created_at",
+        (run.local_id,),
+    ).fetchall()
+    return {
+        row["task_key"]: NativeGateBinding(
+            row["task_key"],
+            row["task_id"],
+            row["gate_id"],
+            row["gate_kind"],
+            row["question"],
+            row["status"],
+            row["resolution"],
+        )
+        for row in rows
+    }
+
+
+def _start_milestone_worker(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    profile: ProjectProfile,
+    task: MilestoneTask,
+    binding: NativeTaskBinding,
+    packet_json: str,
+    choice: RoleChoice,
+    *,
+    worktree_id: str | None,
+) -> None:
+    existing = store.connection.execute(
+        "SELECT * FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = ?",
+        (run.local_id, task.key),
+    ).fetchone()
+    if existing is not None:
+        if existing["task_id"] != binding.task_id or existing["role"] != task.role or existing["agent"] != choice.agent:
+            raise OrchestrateError("Stored milestone worker conflicts with its planned Task", code="native_worker_binding_mismatch")
+        return
+    operation = f"milestone-worker-start:{task.key}"
+    unresolved = store.connection.execute(
+        "SELECT id, request_id, status FROM intentions WHERE run_local_id = ? AND operation = ? AND status != 'applied'",
+        (run.local_id, operation),
+    ).fetchone()
+    if unresolved is not None:
+        raise OrchestrateError(
+            "A prior milestone worker launch is unresolved; no duplicate was issued",
+            code="unknown_external_effect",
+            data={"taskKey": task.key, "requestId": unresolved["request_id"], "status": unresolved["status"]},
+        )
+    task_run = replace(run, task_id=binding.task_id, dispatch_id=None)
+    validate_packet_sources(profile, task_run, packet_json)
+    selector = f"path:{profile.root.resolve()}"
+    arguments = [
+        "orchestration",
+        "worker-start",
+        "--run",
+        str(run.native_run_id),
+        "--task",
+        binding.task_id,
+        "--worktree",
+        selector,
+        "--agent",
+        choice.agent,
+    ]
+    if choice.model is not None:
+        arguments.extend(("--model", choice.model))
+    if choice.effort is not None:
+        arguments.extend(("--effort", choice.effort))
+    arguments.extend(("--timeout-ms", "60000"))
+    intention_id = store.prepare_intention(run.local_id, operation, arguments)
+    store.mark_intention(intention_id, "invoking")
+    try:
+        response = client.run_json(
+            *arguments,
+            "--json",
+            timeout_seconds=90,
+            allow_worker_start_nonzero=True,
+        )
+    except OrcaCommandError as exc:
+        payload = exc.result.payload if exc.result is not None else None
+        store.mark_intention(
+            intention_id,
+            "uncertain",
+            request_id=_request_id(payload),
+            returncode=exc.result.returncode if exc.result is not None else None,
+            error=payload or {"message": str(exc), "code": exc.code},
+        )
+        raise OrchestrateError(
+            "Milestone worker launch is uncertain; no duplicate will be issued",
+            code="mutation_outcome_uncertain",
+            data={"taskKey": task.key, "requestId": _request_id(payload)},
+        ) from exc
+    returncode = _response_returncode(response)
+    request_id = _mutation_request_id(response)
+    try:
+        _validate_worker_start_returncode(response, returncode)
+        if _result(response).get("state") != "ready":
+            raise OrchestrateError(
+                "Milestone worker did not reach the exact ready state; its resources require explicit recovery",
+                code="milestone_worker_start_failed",
+            )
+        actual_worktree, terminal = _validate_worker_start(
+            response,
+            run=task_run,
+            worktree_id=worktree_id,
+            agent=choice.agent,
+            model=choice.model,
+            effort=choice.effort,
+        )
+        dispatch_id = _result(response).get("dispatchId")
+        if not isinstance(dispatch_id, str):
+            raise OrchestrateError("worker-start omitted Dispatch identity", code="orca_contract_error")
+        readback = client.run_json("orchestration", "worker-show", "--dispatch", dispatch_id, "--json")
+        resource = _validate_worker_start_readback(
+            readback,
+            run=task_run,
+            dispatch_id=dispatch_id,
+            worktree_id=actual_worktree,
+            worktree_selector=selector,
+            terminal_id=terminal,
+            agent=choice.agent,
+            model=choice.model,
+            effort=choice.effort,
+        )
+    except OrchestrateError as exc:
+        store.mark_intention(
+            intention_id,
+            "uncertain",
+            request_id=request_id,
+            returncode=returncode,
+            error={"code": exc.code, "message": str(exc), "response": response},
+        )
+        raise
+    store.mark_intention(
+        intention_id,
+        "applied",
+        request_id=request_id,
+        returncode=returncode,
+        response=response,
+    )
+    now = utc_now()
+    store.connection.execute(
+        """INSERT INTO milestone_worker_bindings
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'owned', ?, ?, ?)""",
+        (
+            run.local_id,
+            task.key,
+            binding.task_id,
+            dispatch_id,
+            task.role,
+            choice.agent,
+            resource.resource_id,
+            resource.terminal_handle,
+            resource.worktree_id,
+            json.dumps(readback, sort_keys=True),
+            now,
+            now,
+        ),
+    )
+
+
+def _read_milestone_result(
+    store: StateStore,
+    run: RunRecord,
+    plan: MilestonePlan,
+    task: MilestoneTask,
+    worker: object,
+    payload: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    expected_path = _milestone_result_path(store, run.local_id, task.key)
+    if payload.get("reportPath") != os.fspath(expected_path):
+        return None, None
+    try:
+        raw = read_project_bytes(
+            store.directory,
+            expected_path.relative_to(store.directory).as_posix(),
+        )
+        if len(raw) > 64 * 1024:
+            raise ValueError("result exceeds limit")
+        result = json.loads(raw.decode("utf-8"))
+    except (OSError, OrchestrateError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None, None
+    expected_fields = {
+        "schema",
+        "taskKey",
+        "taskId",
+        "dispatchId",
+        "candidateDigest",
+        "contractDigest",
+        "outcome",
+    }
+    if not isinstance(result, Mapping) or set(result) != expected_fields:
+        return None, None
+    outcome = result.get("outcome")
+    if (
+        result.get("schema") != "orchestrate-milestone-result/v1"
+        or result.get("taskKey") != task.key
+        or result.get("taskId") != worker["task_id"]  # type: ignore[index]
+        or result.get("dispatchId") != worker["dispatch_id"]  # type: ignore[index]
+        or result.get("candidateDigest") != plan.candidate_digest
+        or result.get("contractDigest") != plan.contract.digest
+        or outcome not in {"accepted", "rejected"}
+    ):
+        return None, None
+    digest = "result_sha256_" + hashlib.sha256(raw).hexdigest()
+    return str(outcome), digest
+
+
+def _release_milestone_worker(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    worker: object,
+    *,
+    outcome: Literal["succeeded", "failed"],
+) -> str:
+    operation = f"milestone-worker-release:{worker['task_key']}"  # type: ignore[index]
+    rows = store.connection.execute(
+        "SELECT * FROM intentions WHERE run_local_id = ? AND operation = ? ORDER BY created_at",
+        (run.local_id, operation),
+    ).fetchall()
+    if len(rows) > 1:
+        raise OrchestrateError("Milestone worker has conflicting release intentions", code="release_unconfirmed")
+    if rows:
+        row = rows[0]
+        if row["status"] != "applied" or not row["response_json"]:
+            raise OrchestrateError(
+                "Milestone worker release remains uncertain; no duplicate was issued",
+                code="unknown_external_effect",
+                data={"taskKey": worker["task_key"], "requestId": row["request_id"], "status": row["status"]},
+            )
+        release = json.loads(row["response_json"])
+    else:
+        release = _mutation(
+            client,
+            store,
+            run,
+            operation,
+            ["orchestration", "worker-release", "--dispatch", worker["dispatch_id"]],  # type: ignore[index]
+        )
+    readback = client.run_json(
+        "orchestration",
+        "worker-show",
+        "--dispatch",
+        worker["dispatch_id"],  # type: ignore[index]
+        "--json",
+    )
+    session = WorkerSession(
+        worker["dispatch_id"],  # type: ignore[index]
+        worker["task_id"],  # type: ignore[index]
+        worker["terminal_handle"],  # type: ignore[index]
+        worker["resource_id"],  # type: ignore[index]
+        worker["worktree_id"],  # type: ignore[index]
+        worker["agent"],  # type: ignore[index]
+        str(run.native_run_id),
+        outcome,
+    )
+    decision = validate_release_receipt(session, release, worker_readback=readback)
+    if decision.state == "uncertain":
+        store.connection.execute(
+            "UPDATE milestone_worker_bindings SET release_state = 'uncertain', updated_at = ? WHERE run_local_id = ? AND task_key = ?",
+            (utc_now(), run.local_id, worker["task_key"]),  # type: ignore[index]
+        )
+        raise OrchestrateError(
+            "Milestone worker release remains uncertain; follow only its recorded recovery action",
+            code="release_pending",
+            data={"taskKey": worker["task_key"], "recovery": dict(decision.recovery_metadata or {})},  # type: ignore[index]
+        )
+    return decision.state
+
+
+def _finalize_milestone_worker(
+    store: StateStore,
+    run: RunRecord,
+    worker: object,
+    *,
+    delivery_id: str,
+    message_id: str,
+    message: Mapping[str, Any],
+    outcome: str,
+    result_outcome: str | None,
+    result_digest: str | None,
+    release_state: str,
+) -> None:
+    now = utc_now()
+    evidence_id = "evidence_" + hashlib.sha256(
+        f"{run.local_id}\0{delivery_id}\0{message_id}\0milestone-result".encode("utf-8")
+    ).hexdigest()
+    with store.transaction():
+        store.connection.execute(
+            """UPDATE milestone_worker_bindings
+               SET outcome = ?, result_outcome = ?, result_digest = ?, release_state = ?, updated_at = ?
+               WHERE run_local_id = ? AND task_key = ? AND dispatch_id = ? AND outcome IS NULL""",
+            (
+                outcome,
+                result_outcome,
+                result_digest,
+                release_state,
+                now,
+                run.local_id,
+                worker["task_key"],  # type: ignore[index]
+                worker["dispatch_id"],  # type: ignore[index]
+            ),
+        )
+        store.connection.execute(
+            "INSERT OR IGNORE INTO evidence VALUES (?, ?, 'milestone-result', ?, ?, ?, ?)",
+            (
+                evidence_id,
+                run.local_id,
+                result_outcome or "missing",
+                f"planned Task {worker['task_key']}",  # type: ignore[index]
+                json.dumps(dict(message), sort_keys=True),
+                now,
+            ),
+        )
+        store.connection.execute(
+            """UPDATE delivery_messages SET effect_status = 'processed'
+               WHERE run_local_id = ? AND delivery_id = ? AND message_id = ?""",
+            (run.local_id, delivery_id, message_id),
+        )
+
+
+def _process_milestone_delivery(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    plan: MilestonePlan,
+    delivery_id: str,
+    messages: list[dict[str, Any]],
+) -> RunRecord:
+    _require_delivery_journal(store, run, delivery_id, messages)
+    task_map = {task.key: task for task in plan.tasks}
+    existing = {row["message_id"]: row["effect_status"] for row in store.messages(run.local_id, delivery_id)}
+    for ordinal, message in enumerate(messages):
+        message_id = _message_identity(message, ordinal)
+        if existing.get(message_id) in {"processed", "answered", "pending-answer", "unresolved"}:
+            continue
+        message_type = message.get("type")
+        sender = message.get("from_handle")
+        if message_type == "question" and isinstance(sender, str) and sender.startswith("dispatch:"):
+            worker = store.connection.execute(
+                "SELECT * FROM milestone_worker_bindings WHERE run_local_id = ? AND dispatch_id = ?",
+                (run.local_id, sender.removeprefix("dispatch:")),
+            ).fetchone()
+        else:
+            worker = store.connection.execute(
+                "SELECT * FROM milestone_worker_bindings WHERE run_local_id = ? AND terminal_handle = ?",
+                (run.local_id, sender),
+            ).fetchone()
+        if worker is None:
+            raise OrchestrateError("Milestone lifecycle mail has no exact planned worker", code="delivery_sender_untrusted")
+        payload = current_lifecycle_message_payload(
+            message,
+            run_id=str(run.native_run_id),
+            task_id=worker["task_id"],
+            dispatch_id=worker["dispatch_id"],
+            terminal_handle=worker["terminal_handle"],
+        )
+        admitted = joined_preflight_status(
+            store,
+            replace(run, task_id=worker["task_id"], dispatch_id=worker["dispatch_id"]),
+        ) == "admitted"
+        if message_type == "heartbeat":
+            store.add_evidence(run.local_id, kind="worker-signal", status="observed", subject="heartbeat", payload=message)
+            store.mark_message(run.local_id, delivery_id, message_id, "processed")
+            continue
+        if message_type == "question":
+            if not admitted:
+                raise OrchestrateError(
+                    "Milestone worker question has no exact joined preflight admission",
+                    code="worker_unadmitted",
+                )
+            body = message.get("body") if isinstance(message.get("body"), str) else ""
+            store.save_question(message_id=message_id, run_local_id=run.local_id, delivery_id=delivery_id, body=body)
+            store.mark_message(run.local_id, delivery_id, message_id, "pending-answer")
+            continue
+        if message_type == "escalation":
+            if not admitted:
+                raise OrchestrateError(
+                    "Milestone worker escalation has no exact joined preflight admission",
+                    code="worker_unadmitted",
+                )
+            store.add_evidence(run.local_id, kind="worker-escalation", status="unresolved", subject=str(message.get("subject", "escalation")), payload=message)
+            store.mark_message(run.local_id, delivery_id, message_id, "unresolved")
+            return store.update_run(run.local_id, phase="milestone_blocked", verification_status="not_run")
+        if message_type != "worker_done" or payload.get("outcome") not in {"succeeded", "failed"}:
+            raise OrchestrateError("Milestone Delivery contains unsupported mail", code="delivery_unsupported")
+        outcome = str(payload["outcome"])
+        task = task_map[worker["task_key"]]
+        _validate_native_settlement(
+            client,
+            replace(run, task_id=worker["task_id"], dispatch_id=worker["dispatch_id"]),
+            outcome,
+        )
+        result_outcome, result_digest = _read_milestone_result(store, run, plan, task, worker, payload)
+        release_state = _release_milestone_worker(
+            client,
+            store,
+            run,
+            worker,
+            outcome=outcome,  # type: ignore[arg-type]
+        )
+        if not admitted:
+            result_outcome = None
+            result_digest = None
+        _finalize_milestone_worker(
+            store,
+            run,
+            worker,
+            delivery_id=delivery_id,
+            message_id=message_id,
+            message=message,
+            outcome=outcome,
+            result_outcome=result_outcome,
+            result_digest=result_digest,
+            release_state=release_state,
+        )
+        if outcome != "succeeded" or result_outcome != "accepted":
+            run = store.update_run(run.local_id, phase="milestone_blocked", verification_status="not_run")
+    return store.get_run(run.local_id)
+
+
+def _milestone_summary(store: StateStore, run: RunRecord, *, live: object = None) -> JsonObject:
+    report = _run_summary(store, run, live=live)
+    plan = store.connection.execute(
+        "SELECT relative_path, plan_digest, candidate_digest, contract_digest, status FROM milestone_plan_bindings WHERE run_local_id = ?",
+        (run.local_id,),
+    ).fetchone()
+    tasks = store.connection.execute(
+        """SELECT b.task_key, b.task_id, w.dispatch_id, w.outcome, w.result_outcome, w.release_state
+           FROM milestone_task_bindings b
+           LEFT JOIN milestone_worker_bindings w
+             ON w.run_local_id = b.run_local_id AND w.task_key = b.task_key
+           WHERE b.run_local_id = ? ORDER BY b.created_at""",
+        (run.local_id,),
+    ).fetchall()
+    gates = store.connection.execute(
+        "SELECT task_key, task_id, gate_id, gate_kind, status, resolution FROM milestone_gate_bindings WHERE run_local_id = ? ORDER BY created_at",
+        (run.local_id,),
+    ).fetchall()
+    task_reports: list[dict[str, Any]] = []
+    for row in tasks:
+        task_report = dict(row)
+        task_report["admission"] = (
+            joined_preflight_status(
+                store,
+                replace(run, task_id=row["task_id"], dispatch_id=row["dispatch_id"]),
+            )
+            if row["dispatch_id"] is not None
+            else "pending"
+        )
+        task_reports.append(task_report)
+    report["milestone"] = {
+        "plan": dict(plan) if plan is not None else None,
+        "tasks": task_reports,
+        "gates": [dict(row) for row in gates],
+    }
+    if run.phase == "worker_succeeded" and run.verification_status == "review_accepted":
+        report["nextObligation"] = "independent review is accepted; external project acceptance remains unresolved"
+    elif run.phase == "milestone_blocked":
+        report["nextObligation"] = "planned verification or review did not produce accepted current evidence"
+    else:
+        report["nextObligation"] = "continue the bounded native milestone and its unresolved gates"
+    return report
+
+
+def _advance_milestone(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    profile: ProjectProfile,
+    *,
+    worktree_id: str | None,
+) -> tuple[RunRecord, MilestonePlan]:
+    loaded, sources, reader = _reload_milestone_plan(profile, store, run)
+    plan_row = store.connection.execute(
+        "SELECT * FROM milestone_plan_bindings WHERE run_local_id = ?",
+        (run.local_id,),
+    ).fetchone()
+    if plan_row["candidate_digest"] is None:
+        if run.phase != "worker_succeeded" or run.worker_outcome != "succeeded":
+            raise OrchestrateError("The integration owner has not settled successfully", code="integration_owner_unsettled")
+        now = utc_now()
+        store.connection.execute(
+            """UPDATE milestone_plan_bindings
+               SET candidate_digest = ?, status = 'active', updated_at = ?
+               WHERE run_local_id = ? AND candidate_digest IS NULL""",
+            (sources.digest, now, run.local_id),
+        )
+        run = store.update_run(
+            run.local_id,
+            phase="milestone_preparing",
+            verification_status="pending",
+        )
+    runtime_plan, packets = _runtime_milestone_plan(profile, store, run, loaded, sources, reader)
+    if run.phase == "milestone_blocked":
+        return run, runtime_plan
+    owner = next(task for task in runtime_plan.tasks if task.integration_owner)
+    if not run.task_id:
+        raise OrchestrateError("Integration owner lost its native Task identity", code="integration_owner_invalid")
+    scheduler = NativeDagScheduler(client, store, run.local_id)
+    bindings = scheduler.create_followups(
+        str(run.native_run_id),
+        runtime_plan,
+        integration_owner=NativeTaskBinding(owner.key, run.task_id, (), "first-increment-owner"),
+    )
+    for key, packet_json in packets.items():
+        store.save_packet(run.local_id, bindings[key].task_id, packet_json)
+    gates = scheduler.create_gates(runtime_plan, bindings)
+    for task in runtime_plan.tasks:
+        gate = gates.get(task.key)
+        if gate is None or gate.status == "resolved":
+            continue
+        if task.gate == "verification":
+            gates[task.key] = scheduler.resolve_gate(gate, resolution="accepted")
+            continue
+        verification_dependencies = [
+            dependency
+            for dependency in task.dependencies
+            if next(item for item in runtime_plan.tasks if item.key == dependency).gate == "verification"
+        ]
+        accepted = all(
+            (
+                row := store.connection.execute(
+                    "SELECT outcome, result_outcome FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = ?",
+                    (run.local_id, dependency),
+                ).fetchone()
+            ) is not None
+            and row["outcome"] == "succeeded"
+            and row["result_outcome"] == "accepted"
+            for dependency in verification_dependencies
+        )
+        if accepted:
+            gates[task.key] = scheduler.resolve_gate(gate, resolution="accepted")
+
+    workers = store.connection.execute(
+        "SELECT * FROM milestone_worker_bindings WHERE run_local_id = ?",
+        (run.local_id,),
+    ).fetchall()
+    reviewer = next(task for task in runtime_plan.tasks if task.role == "reviewer")
+    review_worker = next((row for row in workers if row["task_key"] == reviewer.key), None)
+    if review_worker is not None and review_worker["outcome"] is not None:
+        evidence = ReviewEvidence(
+            review_worker["task_id"],
+            runtime_plan.candidate_digest,
+            runtime_plan.contract.digest,
+            review_worker["result_outcome"] if review_worker["result_outcome"] in {"accepted", "rejected"} else "rejected",
+        )
+        if evidence.task_id != bindings[reviewer.key].task_id or review_worker["outcome"] != "succeeded":
+            raise OrchestrateError("Review result does not bind the exact settled planned Task", code="review_gate_invalid")
+        require_current_review(
+            evidence,
+            candidate_digest=runtime_plan.candidate_digest,
+            contract_digest=runtime_plan.contract.digest,
+            task_id=bindings[reviewer.key].task_id,
+            settled=True,
+        )
+        run = store.update_run(run.local_id, phase="worker_succeeded", verification_status="review_accepted")
+        store.connection.execute(
+            "UPDATE milestone_plan_bindings SET status = 'review_accepted', updated_at = ? WHERE run_local_id = ?",
+            (utc_now(), run.local_id),
+        )
+        return run, runtime_plan
+
+    active = {row["task_key"] for row in workers if row["outcome"] is None}
+    finished = {owner.key, *(row["task_key"] for row in workers if row["outcome"] is not None)}
+    gate_rows = _milestone_gate_rows(store, run)
+    roster = load_role_roster()
+    for binding in scheduler.ready_wave(str(run.native_run_id), runtime_plan, bindings):
+        task = next(item for item in runtime_plan.tasks if item.key == binding.key)
+        if task.key in active or task.key in finished:
+            continue
+        gate = gate_rows.get(task.key)
+        if task.gate in {"verification", "review"} and (
+            gate is None or gate.status != "resolved" or gate.resolution != "accepted"
+        ):
+            raise OrchestrateError("Native ready view bypassed an unresolved planned gate", code="native_ready_gate_mismatch")
+        if len(active) >= runtime_plan.max_workers:
+            break
+        _start_milestone_worker(
+            client,
+            store,
+            run,
+            profile,
+            task,
+            binding,
+            packets[task.key],
+            roster.choice(task.role),
+            worktree_id=worktree_id,
+        )
+        active.add(task.key)
+    run = store.update_run(run.local_id, phase="milestone_waiting", verification_status="pending")
+    return run, runtime_plan
+
+
+def _supervise_milestone(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    profile: ProjectProfile,
+    *,
+    worktree_id: str | None,
+    wait_timeout_ms: int,
+) -> JsonObject:
+    if run.delivery_id:
+        loaded, sources, reader = _reload_milestone_plan(profile, store, run)
+        plan, _ = _runtime_milestone_plan(profile, store, run, loaded, sources, reader)
+        messages = store.delivery_messages(run.local_id, run.delivery_id)
+        if not messages:
+            raise OrchestrateError(
+                "The bound milestone Delivery is missing its immutable journal",
+                code="delivery_journal_missing",
+            )
+        run = _process_milestone_delivery(client, store, run, plan, run.delivery_id, messages)
+        if not store.pending_questions(run.local_id):
+            _ack_if_resolved(client, store, run)
+            run = store.get_run(run.local_id)
+        if store.pending_questions(run.local_id) or run.phase == "milestone_blocked":
+            return _milestone_summary(store, run)
+    current, plan = _advance_milestone(client, store, run, profile, worktree_id=worktree_id)
+    deadline = time.monotonic() + (wait_timeout_ms / 1000)
+    while current.phase == "milestone_waiting":
+        remaining = max(1, int((deadline - time.monotonic()) * 1000))
+        if remaining <= 1:
+            break
+        window = min(remaining, 60_000)
+        payload = client.run_json(
+            "orchestration",
+            "check",
+            "--run",
+            str(current.native_run_id),
+            "--wait",
+            "--types",
+            "worker_done,escalation,question",
+            "--timeout-ms",
+            str(window),
+            "--json",
+            timeout_seconds=(window / 1000) + 30,
+        )
+        with store.admission_effect_fence(current.local_id):
+            delivery_id, messages = _delivery(payload)
+            if not delivery_id:
+                continue
+            store.journal_delivery(current.local_id, delivery_id, payload, messages)
+            current = store.update_run(current.local_id, delivery_id=delivery_id)
+            current = _process_milestone_delivery(client, store, current, plan, delivery_id, messages)
+            if store.pending_questions(current.local_id):
+                break
+            _ack_if_resolved(client, store, current)
+            current = store.get_run(current.local_id)
+            if current.phase == "milestone_blocked":
+                break
+        current, plan = _advance_milestone(client, store, current, profile, worktree_id=worktree_id)
+    return _milestone_summary(store, store.get_run(current.local_id))
+
+
 def implement(
     root: Path,
     objective: str | None,
     *,
     client: OrcaClient,
+    milestone_plan: str | None = None,
     wait_timeout_ms: int = 300_000,
     require_context: bool = True,
 ) -> JsonObject:
@@ -1972,6 +2794,7 @@ def implement(
             profile.root,
             None,
             client=client,
+            milestone_plan=milestone_plan,
             wait_timeout_ms=wait_timeout_ms,
             require_context=require_context,
         )
@@ -1995,9 +2818,27 @@ def implement(
             _require_profile_selection(profile)
             identity = require_plain_controller(client, profile.root) if require_context else None
             reader = read_project(profile, normalized)
-            sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+            selected_plan_path = (
+                milestone_plan_relative_path(profile.root, milestone_plan)
+                if milestone_plan is not None
+                else None
+            )
+            sources = _run_source_index(profile, reader, milestone_path=selected_plan_path)
             _require_candidate_coverage(sources)
+            loaded_plan = (
+                load_milestone_plan(
+                    profile.root,
+                    selected_plan_path,
+                    objective=normalized,
+                    candidate_digest=sources.digest,
+                    sources=sources,
+                )
+                if selected_plan_path is not None
+                else None
+            )
             run = store.create_run(objective=normalized, profile_digest=profile.digest, source_digest=sources.digest)
+            if loaded_plan is not None:
+                _record_milestone_plan(store, run, loaded_plan)
             with store.lock(run.local_id):
                 run = _create_native_run(client, store, run)
                 run = _create_task_and_packet(client, store, run, profile)
@@ -2010,7 +2851,18 @@ def implement(
                     packet_json,
                     worktree_id=identity.worktree_id if identity else None,
                 )
-                return _supervise(client, store, run, wait_timeout_ms=wait_timeout_ms)
+                report = _supervise(client, store, run, wait_timeout_ms=wait_timeout_ms)
+                current = store.get_run(run.local_id)
+                if loaded_plan is not None and current.phase == "worker_succeeded" and current.delivery_id is None:
+                    return _supervise_milestone(
+                        client,
+                        store,
+                        current,
+                        profile,
+                        worktree_id=identity.worktree_id if identity else None,
+                        wait_timeout_ms=wait_timeout_ms,
+                    )
+                return _milestone_summary(store, current) if loaded_plan is not None else report
 
 
 def resume(
@@ -2018,6 +2870,7 @@ def resume(
     run_id: str | None,
     *,
     client: OrcaClient,
+    milestone_plan: str | None = None,
     wait_timeout_ms: int = 300_000,
     require_context: bool = True,
 ) -> JsonObject:
@@ -2025,6 +2878,37 @@ def resume(
     with StateStore(profile.root) as store:
         run = store.select_run(run_id)
         with store.lock(run.local_id):
+            bound_plan_path = _milestone_plan_path(store, run)
+            if milestone_plan is not None:
+                requested_plan_path = milestone_plan_relative_path(profile.root, milestone_plan)
+                if bound_plan_path is None or requested_plan_path != bound_plan_path:
+                    raise OrchestrateError(
+                        "Resume plan does not match the Run's immutable selected plan",
+                        code="milestone_plan_changed",
+                    )
+            if bound_plan_path is not None and (
+                run.phase.startswith("milestone_")
+                or (run.phase == "worker_succeeded" and run.delivery_id is None)
+            ):
+                identity = (
+                    require_plain_controller(
+                        client,
+                        profile.root,
+                        expected_run_id=run.native_run_id,
+                        allow_expected_unbound=True,
+                    )
+                    if require_context and run.native_run_id
+                    else (require_plain_controller(client, profile.root) if require_context else None)
+                )
+                run = _bind_native_run(client, store, run, identity)
+                return _supervise_milestone(
+                    client,
+                    store,
+                    run,
+                    profile,
+                    worktree_id=identity.worktree_id if identity else None,
+                    wait_timeout_ms=wait_timeout_ms,
+                )
             run, _ = _join_admission(store, run)
             if run.phase == PREFLIGHT_HELD_PHASE:
                 return _run_summary(store, run)
@@ -2069,7 +2953,11 @@ def resume(
             if run.phase in {"preparing", "run_created", "task_created"}:
                 _require_profile_selection(profile)
                 reader = read_project(profile, run.objective)
-                current_sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+                current_sources = _run_source_index(
+                    profile,
+                    reader,
+                    milestone_path=bound_plan_path,
+                )
                 _require_candidate_coverage(current_sources)
                 if current_sources.digest != run.source_digest:
                     raise OrchestrateError(
@@ -2094,7 +2982,21 @@ def resume(
                         _ack_if_resolved(client, store, run)
                         run = store.get_run(run.local_id)
                     if store.pending_questions(run.local_id) or run.phase in TERMINAL_PHASES:
-                        return _run_summary(store, run)
+                        if (
+                            bound_plan_path is not None
+                            and run.phase == "worker_succeeded"
+                            and run.delivery_id is None
+                            and not store.pending_questions(run.local_id)
+                        ):
+                            return _supervise_milestone(
+                                client,
+                                store,
+                                run,
+                                profile,
+                                worktree_id=identity.worktree_id if identity else None,
+                                wait_timeout_ms=wait_timeout_ms,
+                            )
+                        return _milestone_summary(store, run) if bound_plan_path is not None else _run_summary(store, run)
             else:
                 run = _bind_native_run(client, store, run, identity)
                 run = _finish_prompt_stall_cleanup(client, store, run)
@@ -2120,7 +3022,18 @@ def resume(
                     packet_json,
                     worktree_id=identity.worktree_id if identity else None,
                 )
-            return _supervise(client, store, run, wait_timeout_ms=wait_timeout_ms)
+            report = _supervise(client, store, run, wait_timeout_ms=wait_timeout_ms)
+            current = store.get_run(run.local_id)
+            if bound_plan_path is not None and current.phase == "worker_succeeded" and current.delivery_id is None:
+                return _supervise_milestone(
+                    client,
+                    store,
+                    current,
+                    profile,
+                    worktree_id=identity.worktree_id if identity else None,
+                    wait_timeout_ms=wait_timeout_ms,
+                )
+            return _milestone_summary(store, current) if bound_plan_path is not None else report
 
 
 def status(root: Path, run_id: str | None, *, client: OrcaClient) -> JsonObject:
@@ -2132,13 +3045,26 @@ def status(root: Path, run_id: str | None, *, client: OrcaClient) -> JsonObject:
             live = {"status": "not-created"}
         else:
             try:
+                milestone_dispatches = [
+                    row["dispatch_id"]
+                    for row in store.connection.execute(
+                        "SELECT dispatch_id FROM milestone_worker_bindings WHERE run_local_id = ? ORDER BY created_at",
+                        (run.local_id,),
+                    ).fetchall()
+                ]
                 live = {
                     "run": client.run_json("orchestration", "run-show", "--id", run.native_run_id, "--json"),
                     "tasks": client.run_json("orchestration", "task-list", "--run", run.native_run_id, "--json"),
                     "worker": client.run_json("orchestration", "worker-show", "--dispatch", run.dispatch_id, "--json") if run.dispatch_id else None,
+                    "milestoneWorkers": [
+                        client.run_json("orchestration", "worker-show", "--dispatch", dispatch_id, "--json")
+                        for dispatch_id in milestone_dispatches
+                    ],
                 }
             except OrcaCommandError as exc:
                 live = {"status": "unavailable", "code": exc.code, "detail": str(exc)}
+        if _milestone_plan_path(store, run) is not None:
+            return _milestone_summary(store, run, live=live)
         return _run_summary(store, run, live=live)
 
 
@@ -2147,13 +3073,30 @@ def explain(root: Path, run_id: str | None) -> JsonObject:
     with StateStore(profile.root) as store:
         run = store.select_for_read(run_id)
         reader = read_project(profile, run.objective)
-        current = build_source_index(profile, extra_sources=set(reader.consulted_paths))
-        report = _run_summary(store, run)
+        current = _run_source_index(
+            profile,
+            reader,
+            milestone_path=_milestone_plan_path(store, run),
+        )
+        milestone = store.connection.execute(
+            "SELECT candidate_digest FROM milestone_plan_bindings WHERE run_local_id = ?",
+            (run.local_id,),
+        ).fetchone()
+        expected_source_digest = (
+            milestone["candidate_digest"]
+            if milestone is not None and milestone["candidate_digest"] is not None
+            else run.source_digest
+        )
+        report = (
+            _milestone_summary(store, run)
+            if _milestone_plan_path(store, run) is not None
+            else _run_summary(store, run)
+        )
         report["sourceBinding"] = {
-            "expected": run.source_digest,
+            "expected": expected_source_digest,
             "current": current.digest,
             "unchanged": (
-                run.source_digest == current.digest
+                expected_source_digest == current.digest
                 if current.value["candidate"].get("coverageComplete") is True
                 else None
             ),
