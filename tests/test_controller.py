@@ -24,6 +24,7 @@ from orchestrate.controller import (
     _run_summary,
     _validate_worker_start_readback,
     answer,
+    explain,
     implement,
     reconcile_intentions,
     resume,
@@ -168,6 +169,7 @@ def _worker_start(
     *,
     terminal_handle: str = "term_worker",
     worktree_id: str | None = None,
+    dispatch_id: str = "dispatch_1",
 ) -> OrcaJsonResponse:
     worktree_id = f"repo::{root.resolve()}" if worktree_id is None else worktree_id
     terminal_id = terminal_handle
@@ -180,7 +182,7 @@ def _worker_start(
         "request_worker",
         runId="run_1",
         taskId="task_1",
-        dispatchId="dispatch_1",
+        dispatchId=dispatch_id,
         state="ready",
         stage="input_accepted",
         setup={"state": "not_applicable"},
@@ -206,6 +208,7 @@ def _worker_start_readback(
     resource_id: str = "terminal-resource-1",
     terminal_handle: str = "term_worker",
     worktree_id: str | None = None,
+    dispatch_id: str = "dispatch_1",
 ) -> dict[str, object]:
     worktree_id = f"repo::{root.resolve()}" if worktree_id is None else worktree_id
     launch = {
@@ -214,7 +217,7 @@ def _worker_start_readback(
     }
     terminal_effect = {"kind": "terminal", "role": "agent", "action": "created", "id": terminal_handle}
     dispatch: dict[str, object] = {
-        "id": "dispatch_1",
+        "id": dispatch_id,
         "status": "dispatched",
     }
     worker: dict[str, object] = {
@@ -240,7 +243,7 @@ def _worker_start_readback(
             lastFailure=dispatch_last_failure,
         )
         worker.update(
-            dispatchId="dispatch_1",
+            dispatchId=dispatch_id,
             worktreeId=worktree_id,
             agentTerminalHandle=terminal_handle,
             lastError=worker_last_error,
@@ -265,8 +268,8 @@ def _worker_start_readback(
                 "ownershipState": "owned",
                 "releaseState": "not_requested",
                 "retainedReason": None,
-                "originDispatchId": "dispatch_1",
-                "ownerDispatchId": "dispatch_1",
+                "originDispatchId": dispatch_id,
+                "ownerDispatchId": dispatch_id,
                 "terminalHandle": terminal_handle,
                 "worktreeId": worktree_id,
             },
@@ -327,6 +330,8 @@ def _worker_start_with_real_preflight(
     later_resource_id: str = "terminal-resource-1",
     later_terminal_handle: str = "term_worker",
     later_worktree_id: str | None = None,
+    later_dispatch_id: str = "dispatch_1",
+    second_preflight_dispatch_id: str | None = None,
 ) -> Response:
     def respond(_: FakeClient, __: tuple[str, ...]) -> dict[str, object]:
         with StateStore(root) as store:
@@ -353,10 +358,36 @@ def _worker_start_with_real_preflight(
                 raise AssertionError("preflight wrote the controller resource binding")
             if joined_preflight_status(store, run) != "pending":
                 raise AssertionError("pre-receipt preflight was not a pending join")
+        if second_preflight_dispatch_id is not None:
+            # A second worker attempt preflights the same Run/Task under another
+            # Dispatch before any controller receipt exists.
+            second_client = RealPreflightClient(root, packet, current_shape=current_shape)
+            try:
+                worker_preflight(
+                    root,
+                    run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id=second_preflight_dispatch_id,
+                    packet_id=str(packet["packetId"]),
+                    client=second_client,  # type: ignore[arg-type]
+                    environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                    platform="win32",
+                )
+            except OrchestrateError as exc:
+                cause = exc.data["cause"] if isinstance(exc.data, dict) else None
+                if exc.code != "preflight_rejected" or cause != "preflight_dispatch_conflict":
+                    raise AssertionError(
+                        f"second-Dispatch preflight was not rejected as a Dispatch conflict: {exc.code}/{cause}"
+                    )
+            else:
+                raise AssertionError("second-Dispatch preflight issued a fresh editing grant")
+            if second_client.calls:
+                raise AssertionError("second-Dispatch preflight performed native readbacks")
         return _worker_start(
             root,
             terminal_handle=later_terminal_handle,
             worktree_id=later_worktree_id,
+            dispatch_id=later_dispatch_id,
         )
 
     return respond
@@ -3036,12 +3067,20 @@ class ControllerTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "waiting")
         self.assertEqual(report["admission"], "admitted")
+        self.assertEqual(report["dispatchId"], "dispatch_1")
+        self.assertEqual(report["admissionDetail"]["outcome"], "passed")
+        self.assertNotIn("otherDispatchObservations", report["admissionDetail"])
+        self.assertNotIn("status", report["admissionDetail"])
         self.assertFalse(any(call[:2] == ("orchestration", "check") for call in client.calls))
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
             run = store.get_run(str(report["localRunId"]))
             observation = store.get_preflight(run.local_id, "task_1", "dispatch_1")
             binding = store.get_worker_resource_binding(run.local_id)
             self.assertEqual(joined_preflight_status(store, run), "admitted")
+            self.assertEqual(
+                [item["dispatchId"] for item in store.list_preflights(run.local_id, "task_1")],
+                ["dispatch_1"],
+            )
             self.assertEqual(observation["outcome"], "passed")  # type: ignore[index]
             self.assertEqual(observation["native"]["terminalResourceId"], binding.resource_id)  # type: ignore[index,union-attr]
             self.assertEqual(observation["native"]["terminalHandle"], binding.terminal_handle)  # type: ignore[index,union-attr]
@@ -3113,6 +3152,168 @@ class ControllerTests(unittest.TestCase):
 
     def test_later_controller_worktree_id_mismatch_holds(self) -> None:
         self._assert_later_controller_binding_mismatch_holds("worktree_id")
+
+    def _ordinary_effect_calls(self, client: FakeClient) -> list[tuple[str, ...]]:
+        """Every Orca call after the worker-start receipt other than its own binding readback."""
+
+        start_index = next(
+            index for index, call in enumerate(client.calls) if call[:2] == ("orchestration", "worker-start")
+        )
+        later = client.calls[start_index + 1 :]
+        self.assertEqual(later[:1], [("orchestration", "worker-show", "--dispatch", "dispatch_2", "--json")])
+        return later[1:]
+
+    def _preflight_rows(self, local_id: str) -> list[tuple[str, str, str]]:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            rows = store.connection.execute(
+                """SELECT dispatch_id, outcome, observation_json FROM preflight_observations
+                   WHERE run_local_id = ? ORDER BY dispatch_id""",
+                (local_id,),
+            ).fetchall()
+        return [(row["dispatch_id"], row["outcome"], row["observation_json"]) for row in rows]
+
+    def _assert_split_dispatch_detail(self, report: dict[str, object], *, other: list[tuple[str, str]]) -> None:
+        self.assertEqual(report["status"], "preflight_held")
+        self.assertEqual(report["admission"], "conflicting")
+        self.assertIn("separately authorized cleanup", str(report["nextObligation"]))
+        detail = report["admissionDetail"]
+        self.assertIsInstance(detail, dict)
+        self.assertEqual(detail["status"], "conflicting")  # type: ignore[index]
+        self.assertEqual(detail["code"], "preflight_dispatch_conflict")  # type: ignore[index]
+        self.assertIn("different Dispatch", detail["message"])  # type: ignore[index]
+        self.assertEqual(detail["boundDispatchId"], report["dispatchId"])  # type: ignore[index]
+        observed = [
+            (item["dispatchId"], item["outcome"])
+            for item in detail["otherDispatchObservations"]  # type: ignore[index]
+        ]
+        self.assertEqual(observed, other)
+        for item in detail["otherDispatchObservations"]:  # type: ignore[index]
+            self.assertIsInstance(item["observedAt"], str)
+
+    def _assert_later_controller_dispatch_mismatch_holds(self, *, current_shape: bool) -> None:
+        objective = "Hold a later Dispatch identity split"
+        responses = completion_responses(self.root, objective)[:4]
+        responses.extend([
+            _worker_start_with_real_preflight(
+                self.root,
+                current_shape=current_shape,
+                later_dispatch_id="dispatch_2",
+            ),
+            _worker_start_readback(self.root, current_shape=current_shape, dispatch_id="dispatch_2"),
+        ])
+        client = FakeClient(responses)
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=1,
+            require_context=False,
+        )
+
+        self.assertEqual(report["dispatchId"], "dispatch_2")
+        self._assert_split_dispatch_detail(report, other=[("dispatch_1", "passed")])
+        self.assertIsNone(report["admissionDetail"]["outcome"])  # type: ignore[index]
+        self.assertEqual(self._ordinary_effect_calls(client), [])
+        self.assertFalse(any(call[:2] == ("orchestration", "check") for call in client.calls))
+        self.assertFalse(any(call[:2] == ("terminal", "send") for call in client.calls))
+        local_id = str(report["localRunId"])
+        rows = self._preflight_rows(local_id)
+        self.assertEqual([(row[0], row[1]) for row in rows], [("dispatch_1", "passed")])
+        passed_bytes = rows[0][2]
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.get_run(local_id)
+            binding = store.get_worker_resource_binding(run.local_id)
+            self.assertEqual(run.phase, "preflight_held")
+            self.assertEqual(run.dispatch_id, "dispatch_2")
+            self.assertEqual(binding.dispatch_id, "dispatch_2")  # type: ignore[union-attr]
+            self.assertEqual(joined_preflight_status(store, run), "conflicting")
+            self.assertIsNone(store.get_preflight(run.local_id, "task_1", "dispatch_2"))
+            self.assertEqual(
+                store.get_preflight(run.local_id, "task_1", "dispatch_1")["dispatchId"],  # type: ignore[index]
+                "dispatch_1",
+            )
+            self.assertEqual(
+                [row["status"] for row in store.connection.execute(
+                    "SELECT status FROM intentions WHERE run_local_id = ? AND operation = 'worker-start'",
+                    (run.local_id,),
+                ).fetchall()],
+                ["applied"],
+            )
+
+        # Restart-shaped entry points keep the hold visible with zero Orca effects.
+        idle = FakeClient([])
+        resumed = resume(self.root, local_id, client=idle, require_context=False)  # type: ignore[arg-type]
+        self.assertEqual(idle.calls, [])
+        self.assertEqual(resumed["dispatchId"], "dispatch_2")
+        self._assert_split_dispatch_detail(resumed, other=[("dispatch_1", "passed")])
+        repeated = implement(
+            self.root,
+            "A new objective must not start while the split attempt is held",
+            client=idle,  # type: ignore[arg-type]
+            require_context=False,
+        )
+        self.assertEqual(idle.calls, [])
+        self.assertEqual(repeated["localRunId"], local_id)
+        self._assert_split_dispatch_detail(repeated, other=[("dispatch_1", "passed")])
+        explained = explain(self.root, local_id)
+        self._assert_split_dispatch_detail(explained, other=[("dispatch_1", "passed")])
+        self.assertEqual(self._preflight_rows(local_id), [("dispatch_1", "passed", passed_bytes)])
+
+    def test_orca_1_4_198_later_controller_dispatch_id_mismatch_holds(self) -> None:
+        self._assert_later_controller_dispatch_mismatch_holds(current_shape=False)
+
+    def test_orca_1_4_199_later_controller_dispatch_id_mismatch_holds(self) -> None:
+        self._assert_later_controller_dispatch_mismatch_holds(current_shape=True)
+
+    def test_second_dispatch_preflight_is_rejected_and_exact_later_binding_still_holds(self) -> None:
+        objective = "Hold an ambiguous pre-receipt double preflight"
+        responses = completion_responses(self.root, objective)[:4]
+        responses.extend([
+            _worker_start_with_real_preflight(
+                self.root,
+                current_shape=True,
+                second_preflight_dispatch_id="dispatch_2",
+            ),
+            _worker_start_readback(self.root, current_shape=True),
+        ])
+        client = FakeClient(responses)
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=1,
+            require_context=False,
+        )
+
+        # The controller bound the very Dispatch that passed, yet a second immutable
+        # observation exists for the same Run/Task: ambiguity fails closed.
+        self.assertEqual(report["dispatchId"], "dispatch_1")
+        self._assert_split_dispatch_detail(report, other=[("dispatch_2", "rejected")])
+        self.assertEqual(report["admissionDetail"]["outcome"], "passed")  # type: ignore[index]
+        self.assertFalse(any(call[:2] == ("orchestration", "check") for call in client.calls))
+        self.assertFalse(any(call[:2] == ("terminal", "send") for call in client.calls))
+        self.assertEqual(client.responses, [])
+        local_id = str(report["localRunId"])
+        rows = self._preflight_rows(local_id)
+        self.assertEqual([(row[0], row[1]) for row in rows], [("dispatch_1", "passed"), ("dispatch_2", "rejected")])
+        rejected = json.loads(rows[1][2])
+        self.assertEqual(rejected["mismatches"][0]["code"], "preflight_dispatch_conflict")
+        self.assertEqual(
+            rejected["mismatches"][0]["details"]["otherObservations"][0]["dispatchId"],
+            "dispatch_1",
+        )
+        self.assertIsNone(rejected["native"])
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.get_run(local_id)
+            self.assertEqual(run.phase, "preflight_held")
+            self.assertEqual(joined_preflight_status(store, run), "conflicting")
+        idle = FakeClient([])
+        resumed = resume(self.root, local_id, client=idle, require_context=False)  # type: ignore[arg-type]
+        self.assertEqual(idle.calls, [])
+        self._assert_split_dispatch_detail(resumed, other=[("dispatch_2", "rejected")])
+        self.assertEqual(self._preflight_rows(local_id), rows)
 
     def test_admitted_output_before_launch_receipt_is_preserved_through_resume(self) -> None:
         objective = "Preserve post-admission output"

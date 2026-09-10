@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from orchestrate.admission import worker_preflight
+from orchestrate.admission import joined_preflight_status, other_dispatch_observations, worker_preflight
 from orchestrate.errors import OrchestrateError
 from orchestrate.packets import canonical_packet_json, make_packet, packet_spec
 from orchestrate.profile import setup_project
@@ -180,6 +180,74 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(OrchestrateError) as replay:
             self._run()
         self.assertEqual(replay.exception.code, "preflight_already_passed")
+
+    def _preflight(self, dispatch_id: str, client: PreflightClient) -> dict[str, object]:
+        return worker_preflight(
+            self.root,
+            run_id="run_1", task_id="task_1", dispatch_id=dispatch_id,
+            packet_id=str(self.packet["packetId"]), client=client,  # type: ignore[arg-type]
+            environment={"ORCA_TERMINAL_HANDLE": "term_worker"}, platform="win32",
+        )
+
+    def _stored_rows(self) -> list[tuple[str, str, str]]:
+        with StateStore(self.root) as store:
+            rows = store.connection.execute(
+                """SELECT dispatch_id, outcome, observation_json FROM preflight_observations
+                   WHERE run_local_id = ? ORDER BY dispatch_id""",
+                (self.local_id,),
+            ).fetchall()
+        return [(row["dispatch_id"], row["outcome"], row["observation_json"]) for row in rows]
+
+    def test_second_dispatch_preflight_for_same_task_is_rejected_without_native_calls(self) -> None:
+        self.assertEqual(self._run()["status"], "admitted")
+        before = self._stored_rows()
+        client = PreflightClient(self.root, self.packet)
+        with self.assertRaises(OrchestrateError) as rejected:
+            self._preflight("dispatch_2", client)
+        self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(rejected.exception.data["cause"], "preflight_dispatch_conflict")  # type: ignore[index]
+        self.assertEqual(client.calls, [])
+        after = self._stored_rows()
+        self.assertEqual(after[0], before[0])
+        self.assertEqual([(row[0], row[1]) for row in after], [("dispatch_1", "passed"), ("dispatch_2", "rejected")])
+        rejected_row = json.loads(after[1][2])
+        self.assertEqual(rejected_row["mismatches"][0]["details"]["otherObservations"], [
+            {"dispatchId": "dispatch_1", "outcome": "passed", "observedAt": json.loads(before[0][2])["observedAt"]},
+        ])
+        with self.assertRaises(OrchestrateError) as replay:
+            self._preflight("dispatch_2", PreflightClient(self.root, self.packet))
+        self.assertEqual(replay.exception.code, "preflight_already_rejected")
+        self.assertEqual(self._stored_rows(), after)
+
+    def test_join_treats_other_dispatch_observation_as_conflicting_not_absent(self) -> None:
+        self.assertEqual(self._run()["status"], "admitted")
+        with StateStore(self.root) as store:
+            unbound = store.get_run(self.local_id)
+            self.assertIsNone(unbound.dispatch_id)
+            self.assertEqual(joined_preflight_status(store, unbound), "pending")
+            self.assertEqual(
+                other_dispatch_observations(store, self.local_id, "task_1", "dispatch_2"),
+                [{"dispatchId": "dispatch_1", "outcome": "passed",
+                  "observedAt": store.get_preflight(self.local_id, "task_1", "dispatch_1")["observedAt"]}],  # type: ignore[index]
+            )
+            self.assertEqual(other_dispatch_observations(store, self.local_id, "task_1", "dispatch_1"), [])
+            split = store.update_run(self.local_id, dispatch_id="dispatch_2")
+            self.assertEqual(joined_preflight_status(store, split), "conflicting")
+            self.assertIsNone(store.get_preflight(self.local_id, "task_1", "dispatch_2"))
+            # Absent observation for the bound Dispatch with no other rows stays pending.
+            self.assertEqual(joined_preflight_status(store, store.update_run(self.local_id, task_id="task_2")), "pending")
+
+    def test_join_with_multiple_observations_is_conflicting_even_for_the_passed_dispatch(self) -> None:
+        self.assertEqual(self._run()["status"], "admitted")
+        with self.assertRaises(OrchestrateError):
+            self._preflight("dispatch_2", PreflightClient(self.root, self.packet))
+        with StateStore(self.root) as store:
+            bound = store.update_run(self.local_id, dispatch_id="dispatch_1")
+            self.assertEqual(joined_preflight_status(store, bound), "conflicting")
+            self.assertEqual(
+                [(item["dispatchId"], item["outcome"]) for item in store.list_preflights(self.local_id, "task_1")],
+                [("dispatch_1", "passed"), ("dispatch_2", "rejected")],
+            )
 
     def test_orca_1_4_199_worker_show_identity_is_admitted_explicitly(self) -> None:
         report = worker_preflight(

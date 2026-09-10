@@ -385,6 +385,13 @@ def worker_preflight(
         try:
             if run.task_id != task_id or run.native_run_id != run_id or run.dispatch_id not in {None, dispatch_id}:
                 raise OrchestrateError("Preflight selectors do not match the local Run", code="preflight_identity_conflict")
+            foreign = other_dispatch_observations(store, run.local_id, task_id, dispatch_id)
+            if foreign:
+                raise OrchestrateError(
+                    "Another immutable preflight observation already binds this Run/Task to a different Dispatch",
+                    code="preflight_dispatch_conflict",
+                    data={"boundDispatchId": run.dispatch_id, "otherObservations": foreign},
+                )
             packet_json = store.get_packet_json(run.local_id, task_id)
             packet = store.get_packet(run.local_id, task_id)
             if packet.get("packetId") != packet_id:
@@ -479,17 +486,50 @@ def worker_preflight(
             ) from exc
 
 
+def other_dispatch_observations(
+    store: StateStore,
+    run_local_id: str,
+    task_id: str,
+    dispatch_id: str | None,
+) -> list[dict[str, Any]]:
+    """Immutable observations for this Run/Task recorded under any other Dispatch.
+
+    Raises the store's malformed-observation error unchanged so callers fail closed.
+    """
+
+    return [
+        {
+            "dispatchId": item["dispatchId"],
+            "outcome": item["outcome"],
+            "observedAt": item["observation"].get("observedAt"),
+        }
+        for item in store.list_preflights(run_local_id, task_id)
+        if item["dispatchId"] != dispatch_id
+    ]
+
+
 def joined_preflight_status(store: StateStore, run: RunRecord) -> str:
-    """Join immutable preflight evidence to the validated applied launch receipt."""
+    """Join immutable preflight evidence to the validated applied launch receipt.
+
+    Once the controller has bound a Dispatch, every observation for the same
+    local Run/Task is enumerated: none is ``pending``; exactly one for the bound
+    Dispatch continues into the exact launch join; an observation under any
+    other Dispatch, or more than one observation, is ``conflicting`` so the
+    controller holds before ordinary effects instead of treating the split
+    attempt identity as absent preflight.
+    """
 
     if not run.task_id or not run.dispatch_id:
         return "pending"
     try:
-        observation = store.get_preflight(run.local_id, run.task_id, run.dispatch_id)
+        recorded = store.list_preflights(run.local_id, run.task_id)
     except OrchestrateError:
         return "conflicting"
-    if observation is None:
+    if not recorded:
         return "pending"
+    if len(recorded) != 1 or recorded[0]["dispatchId"] != run.dispatch_id:
+        return "conflicting"
+    observation = recorded[0]["observation"]
     if observation.get("schema") != PREFLIGHT_SCHEMA:
         return "conflicting"
     outcome = observation.get("outcome")

@@ -604,6 +604,19 @@ class StateStore(AbstractContextManager["StateStore"]):
             )
         return observation, True
 
+    @staticmethod
+    def _decode_preflight(encoded: object) -> dict[str, Any]:
+        try:
+            decoded = json.loads(encoded)  # type: ignore[arg-type]
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise OrchestrateError(
+                "Stored preflight observation is malformed",
+                code="preflight_identity_conflict",
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise OrchestrateError("Stored preflight observation is malformed", code="preflight_identity_conflict")
+        return decoded
+
     def get_preflight(self, run_local_id: str, task_id: str, dispatch_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             """SELECT observation_json FROM preflight_observations
@@ -612,16 +625,31 @@ class StateStore(AbstractContextManager["StateStore"]):
         ).fetchone()
         if row is None:
             return None
-        try:
-            decoded = json.loads(row["observation_json"])
-        except json.JSONDecodeError as exc:
-            raise OrchestrateError(
-                "Stored preflight observation is malformed",
-                code="preflight_identity_conflict",
-            ) from exc
-        if not isinstance(decoded, dict):
-            raise OrchestrateError("Stored preflight observation is malformed", code="preflight_identity_conflict")
-        return decoded
+        return self._decode_preflight(row["observation_json"])
+
+    def list_preflights(self, run_local_id: str, task_id: str) -> list[dict[str, Any]]:
+        """Every immutable preflight observation for one local Run/Task, any Dispatch.
+
+        Rows are read-only evidence: a later controller Dispatch binding never
+        hides, overwrites or clears an observation recorded under another
+        Dispatch. Malformed rows fail closed instead of being skipped.
+        """
+
+        rows = self.connection.execute(
+            """SELECT dispatch_id, outcome, observation_json, created_at FROM preflight_observations
+               WHERE run_local_id = ? AND task_id = ?
+               ORDER BY created_at, dispatch_id""",
+            (run_local_id, task_id),
+        ).fetchall()
+        return [
+            {
+                "dispatchId": row["dispatch_id"],
+                "outcome": row["outcome"],
+                "createdAt": row["created_at"],
+                "observation": self._decode_preflight(row["observation_json"]),
+            }
+            for row in rows
+        ]
 
     def journal_delivery(self, run_local_id: str, delivery_id: str, response: dict[str, Any], messages: list[dict[str, Any]]) -> None:
         now = utc_now()

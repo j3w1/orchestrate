@@ -11,7 +11,7 @@ import time
 from typing import Any, Literal
 
 from .config import load_owner_model
-from .admission import joined_preflight_status, validate_packet_sources
+from .admission import joined_preflight_status, other_dispatch_observations, validate_packet_sources
 from .errors import OrchestrateError
 from .identity import ControllerIdentity, require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError, orca_task_title
@@ -674,6 +674,7 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
     if run.task_id and run.dispatch_id:
         try:
             observation = store.get_preflight(run.local_id, run.task_id, run.dispatch_id)
+            other_observations = other_dispatch_observations(store, run.local_id, run.task_id, run.dispatch_id)
         except OrchestrateError as exc:
             admission_detail = {"status": "conflicting", "code": exc.code, "message": str(exc)}
         else:
@@ -684,7 +685,31 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
                     "limitations": observation.get("limitations", []),
                     "observedAt": observation.get("observedAt"),
                 }
-                if admission == "conflicting":
+            elif other_observations:
+                admission_detail = {
+                    "outcome": None,
+                    "mismatches": [],
+                    "limitations": ["No immutable preflight observation exists for the bound Dispatch."],
+                    "observedAt": None,
+                }
+            if admission_detail is not None and other_observations:
+                # Immutable evidence recorded under another Dispatch stays visible;
+                # a later controller binding never hides or clears it.
+                admission_detail.update(
+                    boundDispatchId=run.dispatch_id,
+                    otherDispatchObservations=other_observations,
+                )
+            if admission == "conflicting" and admission_detail is not None:
+                if other_observations:
+                    admission_detail.update(
+                        status="conflicting",
+                        code="preflight_dispatch_conflict",
+                        message=(
+                            "An immutable preflight observation exists for a different Dispatch "
+                            "of this Run/Task than the controller bound"
+                        ),
+                    )
+                else:
                     admission_detail.update(
                         status="conflicting",
                         code="preflight_identity_conflict",
