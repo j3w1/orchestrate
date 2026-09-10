@@ -370,9 +370,13 @@ def _read_ce(profile: ProjectProfile, objective: str | None, instructions: dict[
 
 
 def read_project(profile: ProjectProfile, objective: str | None = None) -> ReaderResult:
+    instruction_paths = sorted({
+        *profile.value["instructions"],
+        *instruction_inventory(profile.root),
+    })
     instructions = {
         relative: read_project_text(profile, relative)
-        for relative in instruction_inventory(profile.root)
+        for relative in instruction_paths
     }
     manifests = _configured_text(profile, "commandManifests")
     kind = profile.value["reader"]["kind"]

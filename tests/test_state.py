@@ -85,6 +85,20 @@ class StateTests(unittest.TestCase):
                 self.assertEqual(selected.local_id, run.local_id)
                 self.assertEqual(selected.delivery_id, "delivery_1")
 
+    def test_blocked_managed_attempt_still_reserves_single_writer_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            with StateStore(Path(project_dir), home=Path(home_dir)) as store:
+                run = store.create_run(objective="one", profile_digest="p", source_digest="s")
+                run = store.update_run(
+                    run.local_id,
+                    native_run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id="dispatch_1",
+                    phase="blocked",
+                )
+
+                self.assertEqual(store.select_run(None).local_id, run.local_id)
+
     def test_worker_evidence_phase_and_message_effect_roll_back_as_one_transaction(self) -> None:
         with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
             with StateStore(Path(project_dir), home=Path(home_dir)) as store:

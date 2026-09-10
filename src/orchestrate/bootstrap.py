@@ -55,13 +55,13 @@ def controller_command(
     if selected == "win32":
         return (
             "$env:ORCHESTRATE_CONTROLLER_BOOTSTRAP='1'; "
-            f"& {_powershell_quote(executable)} -m orchestrate _controller --payload {_powershell_quote(payload)} "
+            f"& {_powershell_quote(executable)} -I -m orchestrate _controller --payload {_powershell_quote(payload)} "
             f"--result-path {_powershell_quote(os.fspath(result_path))}; "
             "exit $LASTEXITCODE"
         )
     return (
         "ORCHESTRATE_CONTROLLER_BOOTSTRAP=1 exec "
-        f"{shlex.quote(executable)} -m orchestrate _controller --payload {shlex.quote(payload)} "
+        f"{shlex.quote(executable)} -I -m orchestrate _controller --payload {shlex.quote(payload)} "
         f"--result-path {shlex.quote(os.fspath(result_path))}"
     )
 
@@ -152,14 +152,20 @@ class BootstrapJournal:
                 phase TEXT NOT NULL,
                 handle TEXT,
                 exit_code INTEGER,
+                exit_response_json TEXT,
                 create_response_json TEXT,
                 interrupt_response_json TEXT,
                 close_response_json TEXT,
+                cleanup_observation_json TEXT,
                 error_json TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )"""
         )
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(invocations)").fetchall()}
+        for name in ("exit_response_json", "cleanup_observation_json"):
+            if name not in columns:
+                self.connection.execute(f"ALTER TABLE invocations ADD COLUMN {name} TEXT")
 
     def close(self) -> None:
         self.connection.close()
@@ -198,8 +204,10 @@ class BootstrapJournal:
         ]
         now = utc_now()
         self.connection.execute(
-            """INSERT INTO invocations VALUES (?, ?, ?, ?, ?, ?, 'create_prepared',
-               NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)""",
+            """INSERT INTO invocations(
+                   id, project_key, root, arguments_json, result_path, create_arguments_json,
+                   phase, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, 'create_prepared', ?, ?)""",
             (
                 invocation_id,
                 key,
@@ -224,9 +232,11 @@ class BootstrapJournal:
             "phase",
             "handle",
             "exit_code",
+            "exit_response_json",
             "create_response_json",
             "interrupt_response_json",
             "close_response_json",
+            "cleanup_observation_json",
             "error_json",
         }
         if set(fields) - allowed:
@@ -321,6 +331,147 @@ def _wait_for_exit(client: OrcaClient, handle: str) -> Mapping[str, Any] | None:
         raise
 
 
+def _runtime_id(payload: Mapping[str, Any]) -> str:
+    metadata = payload.get("_meta")
+    runtime_id = metadata.get("runtimeId") if isinstance(metadata, Mapping) else None
+    if not isinstance(runtime_id, str) or not runtime_id:
+        raise OrchestrateError("Bootstrap readback omitted runtime identity", code="bootstrap_effect_uncertain")
+    return runtime_id
+
+
+def _reconcile_uncertain_close(
+    client: OrcaClient,
+    journal: BootstrapJournal,
+    row: sqlite3.Row,
+    root: Path,
+) -> sqlite3.Row:
+    """Confirm one observed exited-and-absent disposition without repeating close."""
+
+    try:
+        created_payload = json.loads(row["create_response_json"])
+        created = _terminal(created_payload)
+        handle = created["handle"]
+        tab_id = created.get("tabId")
+        incarnation_id = created.get("incarnationId")
+        worktree_id = created.get("worktreeId")
+        host_id = created.get("executionHostId")
+        host_platform = created.get("hostPlatform")
+        runtime_id = _runtime_id(created_payload)
+        if (
+            not all(isinstance(item, str) and item for item in (tab_id, incarnation_id, worktree_id, host_id))
+            or host_id != "local"
+            or host_platform != "win32"
+        ):
+            raise OrchestrateError("Bootstrap create receipt omitted cleanup identity", code="bootstrap_effect_uncertain")
+        expected_exit = row["exit_code"]
+        if not isinstance(expected_exit, int):
+            raise OrchestrateError("Bootstrap journal omitted exact exit evidence", code="bootstrap_effect_uncertain")
+        _read_result(Path(row["result_path"]), expected_exit)
+        waited = _wait_for_exit(client, handle)
+        if waited is None or _runtime_id(waited) != runtime_id or _exit_code(waited, expected_handle=handle) != expected_exit:
+            raise OrchestrateError("Bootstrap exit could not be re-proven", code="bootstrap_effect_uncertain")
+        shown_payload = client.run_json("terminal", "show", "--terminal", handle, "--json")
+        shown = _result(shown_payload).get("terminal")
+        if (
+            _runtime_id(shown_payload) != runtime_id
+            or not isinstance(shown, Mapping)
+            or shown.get("handle") != handle
+            or shown.get("tabId") != tab_id
+            or shown.get("incarnationId") != incarnation_id
+            or shown.get("worktreeId") != worktree_id
+            or shown.get("executionHostId") != host_id
+            or shown.get("hostPlatform") != host_platform
+            or not isinstance(shown.get("worktreePath"), str)
+            or Path(shown["worktreePath"]).resolve() != root.resolve()
+            or shown.get("connected") is not False
+            or shown.get("writable") is not False
+            or shown.get("orphaned") is not False
+        ):
+            raise OrchestrateError("Historical terminal identity did not prove exited state", code="bootstrap_effect_uncertain")
+        inventory_payload = client.run_json(
+            "terminal", "list", "--worktree", f"path:{root.resolve()}", "--include-visual-layouts", "--json"
+        )
+        inventory = _result(inventory_payload)
+        terminals = inventory.get("terminals")
+        layouts = inventory.get("visualLayouts")
+        host_scope = inventory.get("hostScope")
+        topology_revisions = inventory.get("topologyRevisions")
+        if (
+            _runtime_id(inventory_payload) != runtime_id
+            or inventory.get("truncated") is not False
+            or not isinstance(terminals, list)
+            or not all(isinstance(item, Mapping) for item in terminals)
+            or inventory.get("totalCount") != len(terminals)
+            or not isinstance(layouts, list)
+            or not isinstance(host_scope, Mapping)
+            or host_scope.get("hostIds") != [host_id]
+            or host_scope.get("omittedHostIds") != []
+            or not isinstance(topology_revisions, Mapping)
+            or not isinstance(topology_revisions.get(worktree_id), int)
+        ):
+            raise OrchestrateError("Terminal inventory was not complete for exact cleanup", code="bootstrap_effect_uncertain")
+        if any(
+            item.get("worktreeId") != worktree_id
+            or item.get("executionHostId") != host_id
+            or not isinstance(item.get("worktreePath"), str)
+            or Path(item["worktreePath"]).resolve() != root.resolve()
+            for item in terminals
+        ):
+            raise OrchestrateError("Terminal inventory crossed the expected workspace", code="bootstrap_effect_uncertain")
+        if any(
+            item.get("handle") == handle or item.get("incarnationId") == incarnation_id
+            for item in terminals
+        ):
+            raise OrchestrateError("Created terminal remains in the complete inventory", code="bootstrap_effect_uncertain")
+        seen_tabs: set[str] = set()
+        seen_handles: set[str] = set()
+        for layout in layouts:
+            if (
+                layout.get("worktreeId") != worktree_id
+                or not isinstance(layout.get("worktreePath"), str)
+                or Path(layout["worktreePath"]).resolve() != root.resolve()
+            ):
+                raise OrchestrateError("Terminal layout belongs to another workspace", code="bootstrap_effect_uncertain")
+            layout_root = layout.get("root")
+            tabs = layout_root.get("tabs") if isinstance(layout_root, Mapping) and layout_root.get("type") == "group" else None
+            if not isinstance(tabs, list) or not all(isinstance(item, Mapping) for item in tabs):
+                raise OrchestrateError("Unsupported terminal layout shape", code="bootstrap_effect_uncertain")
+            for tab in tabs:
+                current_tab = tab.get("tabId")
+                panes = tab.get("panes")
+                if not isinstance(current_tab, str) or not isinstance(panes, Mapping) or panes.get("type") != "terminal":
+                    raise OrchestrateError("Unsupported terminal pane shape", code="bootstrap_effect_uncertain")
+                pane_handle = panes.get("handle")
+                pane_tab = panes.get("tabId")
+                if not isinstance(pane_handle, str) or pane_tab != current_tab:
+                    raise OrchestrateError("Terminal layout identity is malformed", code="bootstrap_effect_uncertain")
+                seen_tabs.add(current_tab)
+                seen_handles.add(pane_handle)
+        if tab_id in seen_tabs or handle in seen_handles:
+            raise OrchestrateError("Created tab remains in the complete layout", code="bootstrap_effect_uncertain")
+        observation = {
+            "schema": "orchestrate-bootstrap-cleanup/v1",
+            "outcome": "observed-exited-and-absent",
+            "runtimeId": runtime_id,
+            "expected": {
+                "handle": handle, "tabId": tab_id, "incarnationId": incarnation_id,
+                "worktreeId": worktree_id, "executionHostId": host_id, "hostPlatform": host_platform,
+            },
+            "exit": waited,
+            "historicalTerminal": shown_payload,
+            "completeInventory": inventory_payload,
+            "observedAt": utc_now(),
+        }
+        return journal.update(
+            row["id"],
+            phase="closed",
+            exit_response_json=json.dumps(waited, sort_keys=True),
+            cleanup_observation_json=json.dumps(observation, sort_keys=True),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, OrchestrateError, OrcaCommandError) as exc:
+        raise _unknown_effect(journal.get(row["id"]), "terminal close") from exc
+
+
 def launch_controller(root: Path, arguments: list[str], *, client: OrcaClient) -> int:
     """Create or resume one journaled terminal and reproduce its exact result."""
 
@@ -369,7 +520,10 @@ def launch_controller(root: Path, arguments: list[str], *, client: OrcaClient) -
                         continue
                     exit_code = _exit_code(waited, expected_handle=handle)
                     _read_result(Path(row["result_path"]), exit_code)
-                    row = journal.update(row["id"], phase="exited", exit_code=exit_code)
+                    row = journal.update(
+                        row["id"], phase="exited", exit_code=exit_code,
+                        exit_response_json=json.dumps(waited, sort_keys=True),
+                    )
                     continue
                 if phase == "interrupt_prepared":
                     handle = row["handle"]
@@ -428,7 +582,8 @@ def launch_controller(root: Path, arguments: list[str], *, client: OrcaClient) -
                     )
                     continue
                 if phase in {"close_invoking", "close_uncertain"}:
-                    raise _unknown_effect(row, "terminal close")
+                    row = _reconcile_uncertain_close(client, journal, row, root)
+                    continue
                 if phase == "closed":
                     output = _read_result(Path(row["result_path"]), int(row["exit_code"]))
                     print(output, end="", flush=True)

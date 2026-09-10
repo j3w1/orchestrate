@@ -243,6 +243,35 @@ class ProfileAndSourceTests(DisposableRepo):
         self.assertIsInstance(record["sha256"], str)
         self.assertTrue(indexed.value["candidate"]["coverageComplete"])
 
+    def test_selected_non_conventional_instruction_is_read_and_routed_as_authority(self) -> None:
+        (self.root / "POLICY.md").write_text("Selected policy.\n", encoding="utf-8")
+        git(self.root, "add", "POLICY.md")
+        git(self.root, "commit", "-qm", "add selected policy")
+        profile = setup_project(self.root)
+        profile.value["instructions"].append("POLICY.md")
+        (self.root / PROFILE_NAME).write_text(json.dumps(profile.value), encoding="utf-8")
+        selected = setup_project(self.root, acknowledge_profile=True)
+
+        result = read_project(selected, "Apply the selected policy")
+        indexed = build_source_index(selected, extra_sources=set(result.consulted_paths))
+
+        self.assertEqual(result.instructions["POLICY.md"].splitlines(), ["Selected policy."])
+        self.assertIn("POLICY.md", result.consulted_paths)
+        self.assertIn("POLICY.md", result.routing["authority"])
+        record = next(item for item in indexed.value["sources"] if item["path"] == "POLICY.md")
+        self.assertEqual(record["authority"], "consulted")
+
+        (self.root / "POLICY.md").write_text("Candidate restriction.\n", encoding="utf-8")
+        restricted_result = read_project(selected, "Apply the selected policy")
+        restricted = build_source_index(selected, extra_sources=set(restricted_result.consulted_paths))
+        restricted_record = next(item for item in restricted.value["sources"] if item["path"] == "POLICY.md")
+        self.assertEqual(restricted_result.instructions["POLICY.md"].splitlines(), ["Candidate restriction."])
+        self.assertEqual(restricted_record["authority"], "candidate-restrict-only")
+        self.assertIn(
+            "Candidate instruction changes can restrict but cannot grant execution authority.",
+            restricted.value["limitations"],
+        )
+
     def test_conventional_credential_store_is_excluded_before_hashing(self) -> None:
         (self.root / ".aws").mkdir()
         (self.root / ".aws" / "credentials").write_text("synthetic-placeholder\n", encoding="utf-8")

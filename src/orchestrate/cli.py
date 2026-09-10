@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from typing import Any, Sequence
 
+from .admission import worker_preflight
 from .bootstrap import decode_payload, launch_controller
 from .controller import answer, explain, implement, packet, resume, status
 from .doctor import ProbeContractError, collect_doctor_report, create_run_probe, error_report, run_worker_probe
@@ -65,6 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
     answer_parser.add_argument("--question", required=True)
     answer_parser.add_argument("--text", required=True)
     answer_parser.add_argument("--json", action="store_true")
+
+    preflight = subparsers.add_parser("worker-preflight", help="record the exact managed worker admission observation")
+    _project_argument(preflight)
+    preflight.add_argument("--run", required=True)
+    preflight.add_argument("--task", required=True)
+    preflight.add_argument("--dispatch", required=True)
+    preflight.add_argument("--packet-id", required=True)
+    preflight.add_argument("--json", action="store_true")
 
     bootstrap = subparsers.add_parser("bootstrap", help="run controller arguments in a dedicated ordinary Orca terminal")
     _project_argument(bootstrap)
@@ -168,6 +177,15 @@ def _execute(args: argparse.Namespace, raw_argv: list[str]) -> tuple[dict[str, A
         return packet(root, args.run, args.task), args.json
     if args.command == "answer":
         return answer(root, args.run, args.question, args.text, client=client), args.json
+    if args.command == "worker-preflight":
+        return worker_preflight(
+            root,
+            run_id=args.run,
+            task_id=args.task,
+            dispatch_id=args.dispatch,
+            packet_id=args.packet_id,
+            client=client,
+        ), args.json
     if args.command == "bootstrap":
         inner_args = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
         if not inner_args:

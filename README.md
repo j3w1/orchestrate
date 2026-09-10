@@ -124,12 +124,13 @@ For a copyable disposable live exercise, use [Live first-increment exercise](doc
 - A Python 3.13 standard-library CLI in a conventional `src` layout.
 - A small `orchestrate-profile/v1` project profile.
 - Repository and CE task-registry/context/manifest-first reader boundaries.
-- Exact Git/source identities and one immutable `orchestrate-worker-packet/v2` packet per Task.
+- Exact Git/source identities and one immutable `orchestrate-worker-packet/v3` packet per Task.
+- One immutable managed worker-preflight observation, joined to the native launch before worker claims can count.
 - Host-local SQLite intentions, Deliveries, questions, evidence, and OS locks.
 - A host-local operational-profile selection history that cannot live inside the project or a recognized synchronized root.
 - Deterministic Run creation, Task creation, one-worker launch, supervision, answer, release, acknowledgment, and resume.
 - Non-consuming `status`, model-free `explain`, and exact `packet` output.
-- A focused ordinary-terminal bootstrap with durable result and exit receipts.
+- A focused ordinary-terminal bootstrap with durable result, exit, and exact uncertain-close reconciliation receipts.
 - Passive compatibility diagnostics and a separately contained no-edit active probe.
 - Windows/Linux unit, incident, build, and install-smoke CI.
 
@@ -140,6 +141,7 @@ There is no parallel task database, worktree manager, provider API, policy engin
 - **Orca owns lifecycle.** Runs, Tasks, Dispatches, workers, environments, and UI remain native.
 - **Projects own authority.** A candidate policy edit cannot grant itself more power.
 - **One writer first.** Parallelism waits until work is independently useful and shared interfaces are settled.
+- **Admission is provenance, not a sandbox.** Managed workers prove exact preflight identity; hostile shell bypass and unrelated external writers remain outside this guarantee.
 - **Effects are replayed, not guessed.** Unknown external effects stop repetition.
 - **Every message counts.** FIFO Deliveries are processed in full and acknowledged as a whole.
 - **Evidence keeps its label.** Worker success, local verification, hosted proof, independent review, acceptance, merge, and release are different things.

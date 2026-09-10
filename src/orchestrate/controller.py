@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
+import os
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
 from .config import load_owner_model
+from .admission import joined_preflight_status, validate_packet_sources
 from .errors import OrchestrateError
 from .identity import ControllerIdentity, require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError
-from .packets import make_packet, packet_spec
+from .packets import canonical_packet_json, make_packet, packet_spec_from_json
 from .profile import ProjectProfile
 from .readers import read_project
 from .sources import SourceIndex, build_source_index
@@ -20,7 +23,7 @@ from .state import RunRecord, StateStore
 
 
 REPORT_SCHEMA = "orchestrate-report/v1"
-TERMINAL_PHASES = {"worker_succeeded", "worker_failed", "blocked", "completed"}
+TERMINAL_PHASES = {"worker_succeeded", "worker_failed", "worker_unadmitted", "blocked", "completed"}
 
 
 def _result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -145,7 +148,7 @@ def _apply_intention(store: StateStore, run: RunRecord, operation: str, response
             raise OrchestrateError("Dispatch receipt conflicts with the local binding", code="intention_binding_mismatch")
         fields = {"dispatch_id": identity}
         if run.phase == "task_created":
-            fields["phase"] = "waiting"
+            fields["phase"] = "awaiting_preflight"
         return store.update_run(run.local_id, **fields)
     return store.get_run(run.local_id)
 
@@ -406,8 +409,12 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
         next_obligation = f"answer question {pending[0]['message_id']}"
     elif run.phase == "worker_succeeded" and run.verification_status == "pending":
         next_obligation = "independent verification and project acceptance remain unresolved"
+    elif run.phase == "awaiting_preflight":
+        next_obligation = "worker must complete the exact managed preflight before edits or checks"
     elif run.phase == "waiting":
         next_obligation = "resume foreground supervision"
+    elif run.phase == "worker_unadmitted":
+        next_obligation = "worker claim is preserved but cannot satisfy verification without joined admission"
     elif run.phase == "worker_failed":
         next_obligation = "inspect the failed attempt before an explicit retry decision"
     else:
@@ -421,6 +428,7 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
         "dispatchId": run.dispatch_id,
         "workerOutcome": run.worker_outcome,
         "verification": run.verification_status,
+        "admission": joined_preflight_status(store, run),
         "pendingQuestions": [row["message_id"] for row in pending],
         "nextObligation": next_obligation,
         "live": live,
@@ -477,13 +485,17 @@ def _create_task_and_packet(client: OrcaClient, store: StateStore, run: RunRecor
             "Project sources changed after Run preparation; no worker was launched",
             code="source_binding_changed",
         )
+    choice = load_owner_model()
     draft = make_packet(
         objective=run.objective,
         profile=profile,
         sources=sources,
+        launch={"agent": choice.agent, "model": choice.model, "effort": choice.effort},
+        python_executable=os.fspath(Path(sys.executable).resolve()),
         run_id=run.native_run_id,
         reader=reader,
     )
+    draft_json = canonical_packet_json(draft)
     response = _mutation(
         client,
         store,
@@ -497,16 +509,16 @@ def _create_task_and_packet(client: OrcaClient, store: StateStore, run: RunRecor
             "--task-title",
             run.objective[:120],
             "--spec",
-            packet_spec(draft),
+            packet_spec_from_json(draft_json),
         ],
     )
     current = _apply_intention(store, run, "task-create", response)
-    store.save_packet(current.local_id, str(current.task_id), draft)
-    _validate_task_binding(client, current, draft)
+    store.save_packet(current.local_id, str(current.task_id), draft_json)
+    _validate_task_binding(client, current, draft_json)
     return current
 
 
-def _validate_task_binding(client: OrcaClient, run: RunRecord, packet: Mapping[str, Any]) -> None:
+def _validate_task_binding(client: OrcaClient, run: RunRecord, packet_json: str) -> None:
     if not run.native_run_id or not run.task_id:
         raise OrchestrateError("Local Task binding is incomplete", code="orca_contract_error")
     tasks = client.run_json("orchestration", "task-list", "--run", str(run.native_run_id), "--json")
@@ -515,7 +527,7 @@ def _validate_task_binding(client: OrcaClient, run: RunRecord, packet: Mapping[s
         item
         for item in task_rows if isinstance(item, Mapping) and item.get("id") == run.task_id
     ] if isinstance(task_rows, list) else []
-    expected_spec = packet_spec(packet)
+    expected_spec = packet_spec_from_json(packet_json)
     if (
         len(matching) != 1
         or matching[0].get("run_id") != run.native_run_id
@@ -526,10 +538,18 @@ def _validate_task_binding(client: OrcaClient, run: RunRecord, packet: Mapping[s
         raise OrchestrateError("task-create did not bind the exact immutable Task packet", code="orca_contract_error")
 
 
-def _ensure_packet(store: StateStore, run: RunRecord, profile: ProjectProfile) -> None:
+def _ensure_packet(store: StateStore, run: RunRecord, profile: ProjectProfile) -> str:
     try:
-        store.get_packet(run.local_id, str(run.task_id))
-        return
+        stored_json = store.get_packet_json(run.local_id, str(run.task_id))
+        packet = store.get_packet(run.local_id, str(run.task_id))
+        canonical_json = canonical_packet_json(packet)
+        legacy_json = json.dumps(packet, sort_keys=True)
+        if stored_json not in {canonical_json, legacy_json}:
+            raise OrchestrateError(
+                "The stored immutable Task packet uses an unrecognized byte representation",
+                code="packet_identity_conflict",
+            )
+        return canonical_json
     except OrchestrateError as exc:
         if exc.code != "packet_not_found":
             raise
@@ -541,14 +561,18 @@ def _ensure_packet(store: StateStore, run: RunRecord, profile: ProjectProfile) -
             "Project sources changed before the durable Task packet was recovered",
             code="source_binding_changed",
         )
+    choice = load_owner_model()
     recovered = make_packet(
         objective=run.objective,
         profile=profile,
         sources=sources,
+        launch={"agent": choice.agent, "model": choice.model, "effort": choice.effort},
+        python_executable=os.fspath(Path(sys.executable).resolve()),
         run_id=run.native_run_id,
         reader=reader,
     )
-    store.save_packet(run.local_id, str(run.task_id), recovered)
+    recovered_json = canonical_packet_json(recovered)
+    return recovered_json
 
 
 def _effect(
@@ -695,10 +719,12 @@ def _start_worker(
     store: StateStore,
     run: RunRecord,
     profile: ProjectProfile,
+    packet_json: str,
     *,
     worktree_id: str | None,
 ) -> RunRecord:
-    choice = load_owner_model()
+    validation = validate_packet_sources(profile, run, packet_json)
+    launch = validation.packet["admission"]["launch"]
     arguments = [
         "orchestration",
         "worker-start",
@@ -709,11 +735,11 @@ def _start_worker(
         "--worktree",
         f"path:{profile.root.resolve()}",
         "--agent",
-        choice.agent,
+        launch["agent"],
         "--model",
-        choice.model,
+        launch["model"],
         "--effort",
-        choice.effort,
+        launch["effort"],
         "--timeout-ms",
         "60000",
     ]
@@ -758,9 +784,9 @@ def _start_worker(
         response,
         run=run,
         worktree_id=worktree_id,
-        agent=choice.agent,
-        model=choice.model,
-        effort=choice.effort,
+        agent=launch["agent"],
+        model=launch["model"],
+        effort=launch["effort"],
     )
     dispatch_id = _result(response)["dispatchId"]
     readback = client.run_json("orchestration", "worker-show", "--dispatch", str(dispatch_id), "--json")
@@ -771,9 +797,9 @@ def _start_worker(
         worktree_id=exact_worktree_id,
         worktree_selector=arguments[arguments.index("--worktree") + 1],
         terminal_id=terminal_id,
-        agent=choice.agent,
-        model=choice.model,
-        effort=choice.effort,
+        agent=launch["agent"],
+        model=launch["model"],
+        effort=launch["effort"],
     )
     store.mark_intention(intention_id, "applied", request_id=request_id, response=response)
     return _apply_intention(store, run, "worker-start", response)
@@ -788,6 +814,13 @@ def _delivery(payload: Mapping[str, Any]) -> tuple[str | None, list[dict[str, An
     if not isinstance(delivery_id, str) or not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
         raise OrchestrateError("Orca check returned a malformed Delivery", code="orca_contract_error")
     return delivery_id, messages
+
+
+def _join_admission(store: StateStore, run: RunRecord) -> tuple[RunRecord, str]:
+    status = joined_preflight_status(store, run)
+    if status == "admitted" and run.phase == "awaiting_preflight":
+        run = store.update_run(run.local_id, phase="waiting")
+    return run, status
 
 
 def _validate_native_settlement(client: OrcaClient, run: RunRecord, outcome: str) -> None:
@@ -941,6 +974,7 @@ def _process_delivery(client: OrcaClient, store: StateStore, run: RunRecord, del
         outcome = payload.get("outcome")
         if outcome not in {"succeeded", "failed"}:
             raise OrchestrateError("worker_done has no recognized outcome", code="delivery_unsupported")
+        current, admission = _join_admission(store, current)
         _validate_native_settlement(client, current, outcome)
         _release_disposition(client, store, current)
         current = store.finalize_worker_message(
@@ -950,6 +984,8 @@ def _process_delivery(client: OrcaClient, store: StateStore, run: RunRecord, del
             outcome=outcome,
             subject=str(message.get("subject", "worker_done")),
             payload=message,
+            admitted=admission == "admitted",
+            admission_detail={"status": admission, "dispatchId": current.dispatch_id},
         )
     if escalation_unresolved:
         current = store.update_run(current.local_id, phase="blocked")
@@ -1031,8 +1067,8 @@ def _bind_native_run(
 
 def _supervise(client: OrcaClient, store: StateStore, run: RunRecord, *, wait_timeout_ms: int) -> JsonObject:
     deadline = time.monotonic() + (wait_timeout_ms / 1000)
-    current = run
-    while current.phase == "waiting":
+    current, _ = _join_admission(store, run)
+    while current.phase in {"awaiting_preflight", "waiting"}:
         remaining = max(1, int((deadline - time.monotonic()) * 1000))
         if remaining <= 1:
             break
@@ -1052,8 +1088,10 @@ def _supervise(client: OrcaClient, store: StateStore, run: RunRecord, *, wait_ti
         )
         delivery_id, messages = _delivery(payload)
         if not delivery_id:
+            current, _ = _join_admission(store, current)
             continue
         store.journal_delivery(current.local_id, delivery_id, payload, messages)
+        current, _ = _join_admission(store, current)
         current = _process_delivery(client, store, current, delivery_id, messages)
         if store.pending_questions(current.local_id) or current.phase == "blocked":
             break
@@ -1070,7 +1108,6 @@ def implement(
     require_context: bool = True,
 ) -> JsonObject:
     profile = ProjectProfile.load(root)
-    _require_profile_selection(profile)
     if objective is None:
         return resume(
             profile.root,
@@ -1079,6 +1116,7 @@ def implement(
             wait_timeout_ms=wait_timeout_ms,
             require_context=require_context,
         )
+    _require_profile_selection(profile)
     identity = require_plain_controller(client, profile.root) if require_context else None
     with StateStore(profile.root) as store:
         normalized = objective.strip()
@@ -1099,12 +1137,13 @@ def implement(
             with store.lock(run.local_id):
                 run = _create_native_run(client, store, run)
                 run = _create_task_and_packet(client, store, run, profile)
-                _ensure_packet(store, run, profile)
+                packet_json = _ensure_packet(store, run, profile)
                 run = _start_worker(
                     client,
                     store,
                     run,
                     profile,
+                    packet_json,
                     worktree_id=identity.worktree_id if identity else None,
                 )
                 return _supervise(client, store, run, wait_timeout_ms=wait_timeout_ms)
@@ -1119,7 +1158,6 @@ def resume(
     require_context: bool = True,
 ) -> JsonObject:
     profile = ProjectProfile.load(root)
-    _require_profile_selection(profile)
     with StateStore(profile.root) as store:
         run = store.select_run(run_id)
         identity = (
@@ -1133,22 +1171,26 @@ def resume(
             else (require_plain_controller(client, profile.root) if require_context else None)
         )
         with store.lock(run.local_id):
+            prepared_start = any(
+                row["operation"] == "worker-start" and row["status"] == "prepared"
+                for row in store.unsettled_intentions(run.local_id)
+            )
+            if prepared_start:
+                _require_profile_selection(profile)
+                validate_packet_sources(profile, run, _ensure_packet(store, run, profile))
             run = reconcile_intentions(client, store, run)
             run = _bind_native_run(client, store, run, identity)
-            reader = read_project(profile, run.objective)
-            current_sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
             if run.phase in {"preparing", "run_created", "task_created"}:
+                _require_profile_selection(profile)
+                reader = read_project(profile, run.objective)
+                current_sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
                 _require_candidate_coverage(current_sources)
-            if (
-                current_sources.digest != run.source_digest
-                and run.phase not in TERMINAL_PHASES
-                and run.phase != "waiting"
-            ):
-                raise OrchestrateError(
-                    "Bound project sources changed; resume will not launch or repeat external effects",
-                    code="source_binding_changed",
-                    data={"expected": run.source_digest, "actual": current_sources.digest},
-                )
+                if current_sources.digest != run.source_digest:
+                    raise OrchestrateError(
+                        "Bound project sources changed; resume will not launch or repeat external effects",
+                        code="source_binding_changed",
+                        data={"expected": run.source_digest, "actual": current_sources.digest},
+                    )
             if run.delivery_id:
                 run = _reprocess_bound_delivery(client, store, run)
             if run.delivery_id and not store.pending_questions(run.local_id) and run.phase != "blocked":
@@ -1161,17 +1203,21 @@ def resume(
             if run.phase == "run_created":
                 run = _create_task_and_packet(client, store, run, profile)
             if run.phase == "task_created":
-                _ensure_packet(store, run, profile)
+                packet_json = _ensure_packet(store, run, profile)
                 _validate_task_binding(
                     client,
                     run,
-                    store.get_packet(run.local_id, str(run.task_id)),
+                    packet_json,
                 )
+                # Missing local packet history is restored only after native Orca
+                # proves the exact immutable Task spec; reconstruction is not proof.
+                store.save_packet(run.local_id, str(run.task_id), packet_json)
                 run = _start_worker(
                     client,
                     store,
                     run,
                     profile,
+                    packet_json,
                     worktree_id=identity.worktree_id if identity else None,
                 )
             return _supervise(client, store, run, wait_timeout_ms=wait_timeout_ms)
@@ -1234,7 +1280,6 @@ def answer(
     require_context: bool = True,
 ) -> JsonObject:
     profile = ProjectProfile.load(root)
-    _require_profile_selection(profile)
     with StateStore(profile.root) as store:
         run = store.get_run(run_id)
         identity = (

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -21,7 +23,7 @@ from orchestrate.controller import (
 )
 from orchestrate.errors import OrchestrateError
 from orchestrate.identity import require_plain_controller
-from orchestrate.packets import packet_spec
+from orchestrate.packets import canonical_packet_json, make_packet, packet_spec
 from orchestrate.profile import setup_project
 from orchestrate.readers import read_project
 from orchestrate.sources import build_source_index
@@ -102,7 +104,7 @@ def _worker_start(root: Path) -> dict[str, object]:
         "effective": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
     }
     terminal_effect = {"kind": "terminal", "role": "agent", "action": "created", "id": terminal_id}
-    return mutation(
+    response = mutation(
         "request_worker",
         runId="run_1",
         taskId="task_1",
@@ -119,6 +121,8 @@ def _worker_start(root: Path) -> dict[str, object]:
         ],
         residualResources=[terminal_effect],
     )
+    response["_meta"] = {"runtimeId": "runtime_test"}
+    return response
 
 
 def _worker_start_readback(root: Path) -> dict[str, object]:
@@ -148,8 +152,59 @@ def _worker_start_readback(root: Path) -> dict[str, object]:
                     "setupSource": "existing_worktree",
                 },
             },
-        }
+        },
+        "_meta": {"runtimeId": "runtime_test"},
     }
+
+
+def _worker_start_with_preflight(root: Path) -> Response:
+    def respond(_: FakeClient, __: tuple[str, ...]) -> dict[str, object]:
+        response = _worker_start(root)
+        with StateStore(root) as store:
+            run = store.select_run(None)
+            packet_json = store.get_packet_json(run.local_id, str(run.task_id))
+            packet = store.get_packet(run.local_id, str(run.task_id))
+            launch = packet["admission"]["launch"]
+            reader = packet["reader"]
+            observation = {
+                "schema": "orchestrate-worker-preflight/v1",
+                "outcome": "passed",
+                "runId": "run_1",
+                "taskId": "task_1",
+                "dispatchId": "dispatch_1",
+                "packetId": packet["packetId"],
+                "packetJsonSha256": hashlib.sha256(packet_json.encode("utf-8")).hexdigest(),
+                "expectedSourceDigest": run.source_digest,
+                "observedSourceDigest": run.source_digest,
+                "profileDigest": packet["profileDigest"],
+                "routingDigest": hashlib.sha256(
+                    json.dumps(reader, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+                "candidate": packet["candidate"],
+                "native": {
+                    "runtimeId": "runtime_test",
+                    "actor": launch["agent"],
+                    "terminalHandle": "term_worker",
+                    "executionHostId": "local",
+                    "hostPlatform": "win32",
+                    "worktreeId": f"repo::{root.resolve()}",
+                    "worktreeRoot": str(root.resolve()),
+                    "launch": launch,
+                },
+                "observedAt": "2026-01-01T00:00:00Z",
+                "limitations": [],
+                "mismatches": [],
+            }
+            store.record_preflight(
+                run.local_id,
+                run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                observation=observation,
+            )
+        return response
+
+    return respond
 
 
 def settlement_responses(outcome: str = "succeeded") -> list[Response]:
@@ -214,7 +269,7 @@ def completion_responses(root: Path, objective: str, outcome: str = "succeeded")
         {"result": {"run": {"id": "run_1", "objective": objective}}},
         mutation("request_task", task={"id": "task_1"}),
         _task_readback,
-        _worker_start(root),
+        _worker_start_with_preflight(root),
         _worker_start_readback(root),
         delivery,
         *settlement_responses(outcome),
@@ -584,7 +639,7 @@ class ControllerTests(unittest.TestCase):
             completed = _process_delivery(FakeClient(settlement_responses()), store, run, "delivery_1", [message])  # type: ignore[arg-type]
             replay_client = FakeClient([])
             replayed = _process_delivery(replay_client, store, completed, "delivery_1", [message])  # type: ignore[arg-type]
-            self.assertEqual(replayed.phase, "worker_succeeded")
+            self.assertEqual(replayed.phase, "worker_unadmitted")
             self.assertEqual(replay_client.calls, [])
 
     def test_release_receipt_survives_failed_readback_without_reissuing_release(self) -> None:
@@ -626,9 +681,9 @@ class ControllerTests(unittest.TestCase):
                 [message],
             )  # type: ignore[arg-type]
 
-            self.assertEqual(recovered.phase, "worker_succeeded")
+            self.assertEqual(recovered.phase, "worker_unadmitted")
             self.assertFalse(any("worker-release" in call for call in recovery_client.calls))
-            self.assertEqual(len(store.evidence(run.local_id)), 1)
+            self.assertEqual(len(store.evidence(run.local_id)), 2)
 
     def test_resume_reprocesses_terminal_phase_observed_delivery_and_acks(self) -> None:
         profile = setup_project(self.root)
@@ -685,7 +740,7 @@ class ControllerTests(unittest.TestCase):
             wait_timeout_ms=1,
             require_context=False,
         )
-        self.assertEqual(report["status"], "worker_succeeded")
+        self.assertEqual(report["status"], "worker_unadmitted")
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
             persisted = store.get_run(local_id)
             self.assertIsNone(persisted.delivery_id)
@@ -713,15 +768,88 @@ class ControllerTests(unittest.TestCase):
         report = implement(self.root, objective, client=client, wait_timeout_ms=100, require_context=False)  # type: ignore[arg-type]
         task_call = next(call for call in client.calls if "task-create" in call)
         spec = task_call[task_call.index("--spec") + 1]
-        dispatched = json.loads(spec[spec.index("{"):])
+        embedded_json = spec[spec.index("{"):]
+        dispatched = json.loads(embedded_json)
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
             stored = store.get_packet(str(report["localRunId"]), "task_1")
+            stored_bytes = store.connection.execute(
+                "SELECT CAST(packet_json AS BLOB) AS packet_bytes FROM packets WHERE run_local_id = ? AND task_id = ?",
+                (str(report["localRunId"]), "task_1"),
+            ).fetchone()["packet_bytes"]
+        self.assertEqual(stored_bytes, embedded_json.encode("utf-8"))
         self.assertEqual(dispatched, stored)
-        self.assertEqual(dispatched["schema"], "orchestrate-worker-packet/v2")
+        self.assertEqual(dispatched["schema"], "orchestrate-worker-packet/v3")
+        self.assertEqual(dispatched["admission"]["commandTemplate"][1:4], ["-I", "-m", "orchestrate"])
+        self.assertEqual(
+            Path(dispatched["admission"]["commandTemplate"][0]).resolve(),
+            Path(sys.executable).resolve(),
+        )
         self.assertEqual(dispatched["native"]["taskIdSource"], "orca-injected-task-and-dispatch-preamble")
         self.assertNotIn("taskId", dispatched["native"])
         self.assertEqual(dispatched["operationalProfile"]["selectedDigest"], dispatched["profileDigest"])
         self.assertEqual(dispatched["operationalProfile"]["selectionSource"], "initial-setup-selection")
+
+    def test_legacy_packet_json_is_not_rewritten_and_still_requires_task_readback(self) -> None:
+        objective = "Resume a legacy packet row"
+        profile = setup_project(self.root)
+        reader = read_project(profile, objective)
+        sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+        responses: list[Response] = [
+            mutation("request_use", run={"id": "run_1"}),
+            {"result": {"run": {"id": "run_1"}}},
+            {"result": {"run": {"id": "run_1", "objective": objective}}},
+        ]
+        client = FakeClient(responses)
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective=objective, profile_digest=profile.digest, source_digest=sources.digest)
+            run = store.update_run(run.local_id, native_run_id="run_1", task_id="task_1", phase="task_created")
+            packet = make_packet(
+                objective=objective,
+                profile=profile,
+                sources=sources,
+                launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+                python_executable=str(Path(sys.executable).resolve()),
+                run_id="run_1",
+                reader=reader,
+            )
+            legacy_json = json.dumps(packet, sort_keys=True)
+            store.connection.execute(
+                "INSERT INTO packets VALUES (?, ?, ?, datetime('now'))",
+                (run.local_id, "task_1", legacy_json),
+            )
+            local_id = run.local_id
+
+        responses.append(
+            {
+                "result": {
+                    "tasks": [
+                        {
+                            "id": "task_1",
+                            "run_id": "run_1",
+                            "task_title": objective,
+                            "spec": packet_spec(packet),
+                            "status": "ready",
+                        }
+                    ]
+                }
+            }
+        )
+        responses.extend(
+            [
+                _worker_start(self.root),
+                _worker_start_readback(self.root),
+            ]
+        )
+        resume(
+            self.root,
+            local_id,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=1,
+            require_context=False,
+        )
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            self.assertEqual(store.get_packet_json(local_id, "task_1"), legacy_json)
+            self.assertNotEqual(legacy_json, canonical_packet_json(packet))
 
     def test_worker_launch_substitution_holds_before_waiting(self) -> None:
         objective = "Reject substituted model"
@@ -749,6 +877,52 @@ class ControllerTests(unittest.TestCase):
                 reconcile_intentions(FakeClient([]), store, run)  # type: ignore[arg-type]
             self.assertEqual(replay.exception.code, "worker_launch_mismatch")
             self.assertEqual(store.get_run(run.local_id).phase, "task_created")
+
+    def test_last_prelaunch_source_validation_stops_before_worker_start(self) -> None:
+        objective = "Reject prelaunch drift"
+        responses = completion_responses(self.root, objective)[:3]
+
+        def drift_after_task_readback(client: FakeClient, arguments: tuple[str, ...]) -> dict[str, object]:
+            response = _task_readback(client, arguments)
+            (self.root / "AGENTS.md").write_text("Changed before worker-start.\n", encoding="utf-8")
+            return response
+
+        responses.append(drift_after_task_readback)
+        client = FakeClient(responses)
+        with self.assertRaises(OrchestrateError) as caught:
+            implement(self.root, objective, client=client, wait_timeout_ms=1, require_context=False)  # type: ignore[arg-type]
+        self.assertEqual(caught.exception.code, "source_binding_changed")
+        self.assertFalse(any(call[:2] == ("orchestration", "worker-start") for call in client.calls))
+
+    def test_admitted_output_before_launch_receipt_is_preserved_through_resume(self) -> None:
+        objective = "Preserve post-admission output"
+        responses = completion_responses(self.root, objective)[:4]
+        admitted_start = _worker_start_with_preflight(self.root)
+
+        def start_then_output(client: FakeClient, arguments: tuple[str, ...]) -> dict[str, object]:
+            response = admitted_start(client, arguments)  # type: ignore[operator]
+            (self.root / "output.txt").write_text("legitimate worker output\n", encoding="utf-8")
+            return response
+
+        responses.extend([start_then_output, _worker_start_readback(self.root)])
+        initial = implement(
+            self.root, objective, client=FakeClient(responses), wait_timeout_ms=1, require_context=False,  # type: ignore[arg-type]
+        )
+        self.assertEqual(initial["status"], "waiting")
+        resume_responses: list[Response] = [
+            mutation("request_use", run={"id": "run_1"}),
+            {"result": {"run": {"id": "run_1"}}},
+            {"result": {"run": {"id": "run_1", "objective": objective}}},
+            completion_responses(self.root, objective)[6],
+            *settlement_responses(),
+            mutation("request_ack", messages=[]),
+        ]
+        final = resume(
+            self.root, str(initial["localRunId"]), client=FakeClient(resume_responses),
+            wait_timeout_ms=100, require_context=False,  # type: ignore[arg-type]
+        )
+        self.assertEqual(final["status"], "worker_succeeded")
+        self.assertEqual((self.root / "output.txt").read_text(encoding="utf-8").strip(), "legitimate worker output")
 
     def test_prepared_worker_start_crash_recovery_still_validates_effective_launch(self) -> None:
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
@@ -861,10 +1035,21 @@ class ControllerTests(unittest.TestCase):
             run = store.create_run(objective=objective, profile_digest=profile.digest, source_digest=sources.digest)
             run = store.update_run(run.local_id, native_run_id="run_1", task_id="task_1", phase="task_created")
             local_id = run.local_id
+        recovered_packet = make_packet(
+            objective=objective,
+            profile=profile,
+            sources=sources,
+            launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+            python_executable=str(Path(sys.executable).resolve()),
+            run_id="run_1",
+            reader=reader,
+        )
 
         def recovered_task_readback(_: FakeClient, __: tuple[str, ...]) -> dict[str, object]:
             with StateStore(self.root, home=Path(self.state_temp.name)) as recovered_store:
-                recovered_packet = recovered_store.get_packet(local_id, "task_1")
+                with self.assertRaises(OrchestrateError) as missing:
+                    recovered_store.get_packet(local_id, "task_1")
+                self.assertEqual(missing.exception.code, "packet_not_found")
             return {
                 "result": {
                     "tasks": [

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -45,7 +46,8 @@ class FakeClient:
                         "hostPlatform": "win32",
                         "surface": "visible",
                     }
-                }
+                },
+                "_meta": {"runtimeId": "runtime_test"},
             }
         if arguments[0:2] == ("terminal", "show"):
             return {
@@ -55,10 +57,15 @@ class FakeClient:
                         "worktreeId": "repo::fixture",
                         "worktreePath": self.worktree_path,
                         "executionHostId": "local",
+                        "tabId": "tab_controller",
+                        "incarnationId": "incarnation_controller",
+                        "orphaned": False,
+                        "hostPlatform": "win32",
                         "connected": True,
                         "writable": True,
                     }
-                }
+                },
+                "_meta": {"runtimeId": "runtime_test"},
             }
         if arguments[0:2] == ("terminal", "wait"):
             self.waits += 1
@@ -88,7 +95,8 @@ class FakeClient:
                         "exitCode": self.exit_code,
                         "exitCause": {"kind": "exited", "exitCode": self.exit_code},
                     }
-                }
+                },
+                "_meta": {"runtimeId": "runtime_test"},
             }
         if arguments[0:2] == ("terminal", "send"):
             return {"result": {"send": {"handle": "term_controller", "accepted": True, "bytesWritten": 1}}}
@@ -164,6 +172,54 @@ class UncertainCloseClient(FakeClient):
         return super().run_json(*arguments, **keywords)
 
 
+class ReconciledCloseClient(FakeClient):
+    def run_json(self, *arguments: str, **keywords: object) -> dict[str, object]:
+        if arguments[0:2] == ("terminal", "show"):
+            self.calls.append(arguments)
+            return {
+                "result": {"terminal": {
+                    "handle": "term_controller", "tabId": "tab_controller",
+                    "incarnationId": "incarnation_controller", "ptyId": "fixture@@pty-controller",
+                    "worktreeId": "repo::fixture", "worktreePath": self.worktree_path,
+                    "executionHostId": "local", "hostPlatform": "win32",
+                    "connected": False, "writable": False, "orphaned": False,
+                }},
+                "_meta": {"runtimeId": "runtime_test"},
+            }
+        if arguments[0:2] == ("terminal", "list"):
+            self.calls.append(arguments)
+            return {
+                "result": {
+                    "terminals": [{
+                        "handle": "term_caller", "incarnationId": "incarnation_caller",
+                        "worktreeId": "repo::fixture", "worktreePath": self.worktree_path,
+                        "tabId": "tab_caller", "executionHostId": "local",
+                    }],
+                    "visualLayouts": [{
+                        "worktreeId": "repo::fixture", "worktreePath": self.worktree_path,
+                        "root": {"type": "group", "groupId": "group_1", "activeTabId": "tab_caller", "tabs": [{
+                            "tabId": "tab_caller", "activeLeafId": "leaf_caller",
+                            "panes": {"type": "terminal", "handle": "term_caller", "tabId": "tab_caller", "leafId": "leaf_caller"},
+                        }]},
+                    }],
+                    "hostScope": {"hostIds": ["local"], "omittedHostIds": []},
+                    "topologyRevisions": {"repo::fixture": 2},
+                    "totalCount": 1,
+                    "truncated": False,
+                },
+                "_meta": {"runtimeId": "runtime_test"},
+            }
+        return super().run_json(*arguments, **keywords)
+
+
+class StaleRuntimeCloseClient(ReconciledCloseClient):
+    def run_json(self, *arguments: str, **keywords: object) -> dict[str, object]:
+        response = super().run_json(*arguments, **keywords)
+        if arguments[0:2] == ("terminal", "list"):
+            response["_meta"] = {"runtimeId": "runtime_restarted"}
+        return response
+
+
 class BootstrapTests(unittest.TestCase):
     def test_payload_round_trip_preserves_spaces_unicode_and_argument_boundaries(self) -> None:
         arguments = ["implement", "fix spaced path 雪", "--project", "C:/a b/雪"]
@@ -188,8 +244,10 @@ class BootstrapTests(unittest.TestCase):
         linux = controller_command(payload, result, python="/opt/python 3.13/bin/python", platform="linux")
         self.assertIn("exit $LASTEXITCODE", windows)
         self.assertIn("& 'C:/Program Files/Python/python.exe'", windows)
+        self.assertIn(" -I -m orchestrate ", windows)
         self.assertIn(" exec ", linux)
         self.assertIn("'/opt/python 3.13/bin/python'", linux)
+        self.assertIn(" -I -m orchestrate ", linux)
 
     def test_launcher_journals_mirrors_output_and_returns_inner_exit_code(self) -> None:
         client = FakeClient()
@@ -300,7 +358,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertFalse(any(call[:2] == ("terminal", "send") for call in recovery.calls))
             self.assertFalse(any(call[:2] == ("terminal", "create") for call in recovery.calls))
 
-    def test_uncertain_close_blocks_retry_without_reissuing_close(self) -> None:
+    def test_uncertain_close_reconciles_exact_exited_and_absent_without_reissuing_close(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
             os.environ,
             {"ORCHESTRATE_HOME": state, "ORCA_TERMINAL_HANDLE": ""},
@@ -311,11 +369,62 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(initial.exception.code, "bootstrap_effect_uncertain")
             self.assertEqual(sum(call[:2] == ("terminal", "close") for call in first.calls), 1)
 
-            recovery = FakeClient()
-            with self.assertRaises(OrchestrateError) as replay:
+            recovery = ReconciledCloseClient()
+            recovery.command = first.command
+            recovery.worktree_path = first.worktree_path
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = launch_controller(Path(directory), ["status"], client=recovery)  # type: ignore[arg-type]
+            self.assertEqual(result, 7)
+            self.assertEqual(output.getvalue(), "controller output\n")
+            self.assertFalse(any(call[:2] == ("terminal", "close") for call in recovery.calls))
+            self.assertTrue(any(call[:2] == ("terminal", "list") for call in recovery.calls))
+            database = Path(state) / "bootstrap" / "state.sqlite3"
+            with closing(sqlite3.connect(database)) as connection:
+                connection.row_factory = sqlite3.Row
+                journal = connection.execute("SELECT * FROM invocations").fetchone()
+            self.assertEqual(journal["phase"], "reported")
+            self.assertIsNotNone(journal["error_json"])
+            self.assertIsNotNone(journal["exit_response_json"])
+            cleanup = json.loads(journal["cleanup_observation_json"])
+            self.assertEqual(cleanup["outcome"], "observed-exited-and-absent")
+
+    def test_uncertain_close_holds_when_durable_child_result_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
+            os.environ,
+            {"ORCHESTRATE_HOME": state, "ORCA_TERMINAL_HANDLE": ""},
+        ):
+            first = UncertainCloseClient()
+            with self.assertRaises(OrchestrateError):
+                launch_controller(Path(directory), ["status"], client=first)  # type: ignore[arg-type]
+            database = Path(state) / "bootstrap" / "state.sqlite3"
+            with closing(sqlite3.connect(database)) as connection:
+                result_path = connection.execute("SELECT result_path FROM invocations").fetchone()[0]
+            Path(result_path).unlink()
+
+            recovery = ReconciledCloseClient()
+            recovery.command = first.command
+            recovery.worktree_path = first.worktree_path
+            with self.assertRaises(OrchestrateError) as held:
                 launch_controller(Path(directory), ["status"], client=recovery)  # type: ignore[arg-type]
-            self.assertEqual(replay.exception.code, "bootstrap_effect_uncertain")
+            self.assertEqual(held.exception.code, "bootstrap_effect_uncertain")
             self.assertEqual(recovery.calls, [])
+
+    def test_uncertain_close_holds_on_stale_runtime_without_repeating_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
+            os.environ,
+            {"ORCHESTRATE_HOME": state, "ORCA_TERMINAL_HANDLE": ""},
+        ):
+            first = UncertainCloseClient()
+            with self.assertRaises(OrchestrateError):
+                launch_controller(Path(directory), ["status"], client=first)  # type: ignore[arg-type]
+            recovery = StaleRuntimeCloseClient()
+            recovery.command = first.command
+            recovery.worktree_path = first.worktree_path
+            with self.assertRaises(OrchestrateError) as held:
+                launch_controller(Path(directory), ["status"], client=recovery)  # type: ignore[arg-type]
+            self.assertEqual(held.exception.code, "bootstrap_effect_uncertain")
+            self.assertFalse(any(call[:2] == ("terminal", "close") for call in recovery.calls))
 
     def test_cli_bootstrap_passthrough_emits_one_json_document_and_exact_exit(self) -> None:
         child = {"schema": "orchestrate-report/v1", "status": "worker_succeeded"}

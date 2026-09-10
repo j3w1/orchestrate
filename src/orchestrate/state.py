@@ -261,6 +261,16 @@ class StateStore(AbstractContextManager["StateStore"]):
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (run_local_id, task_id)
             );
+            CREATE TABLE IF NOT EXISTS preflight_observations (
+                run_local_id TEXT NOT NULL REFERENCES runs(local_id),
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                dispatch_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                observation_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (run_local_id, task_id, dispatch_id)
+            );
             CREATE TABLE IF NOT EXISTS deliveries (
                 run_local_id TEXT NOT NULL REFERENCES runs(local_id),
                 delivery_id TEXT NOT NULL,
@@ -333,7 +343,7 @@ class StateStore(AbstractContextManager["StateStore"]):
         return self._row_to_run(row)
 
     def active_runs(self) -> list[RunRecord]:
-        terminal = ("worker_succeeded", "worker_failed", "blocked", "completed")
+        terminal = ("worker_succeeded", "worker_failed", "worker_unadmitted", "completed")
         placeholders = ",".join("?" for _ in terminal)
         rows = self.connection.execute(
             f"""SELECT * FROM runs
@@ -428,32 +438,107 @@ class StateStore(AbstractContextManager["StateStore"]):
             (run_local_id,),
         ).fetchall()
 
-    def save_packet(self, run_local_id: str, task_id: str, packet: dict[str, Any]) -> None:
-        encoded = json.dumps(packet, sort_keys=True)
+    def save_packet(self, run_local_id: str, task_id: str, packet_json: str) -> None:
+        try:
+            packet = json.loads(packet_json)
+        except json.JSONDecodeError as exc:
+            raise OrchestrateError(
+                "The immutable Task packet is not valid JSON",
+                code="packet_identity_conflict",
+            ) from exc
+        if not isinstance(packet, dict):
+            raise OrchestrateError(
+                "The immutable Task packet must be a JSON object",
+                code="packet_identity_conflict",
+            )
         existing = self.connection.execute(
             "SELECT packet_json FROM packets WHERE run_local_id = ? AND task_id = ?",
             (run_local_id, task_id),
         ).fetchone()
         if existing is not None:
-            if existing["packet_json"] != encoded:
+            legacy_json = json.dumps(packet, sort_keys=True)
+            if existing["packet_json"] not in {packet_json, legacy_json}:
                 raise OrchestrateError(
                     "The immutable Task packet conflicts with its stored identity",
                     code="packet_identity_conflict",
                 )
+            # Pre-canonical rows remain immutable. The controller derives canonical
+            # bytes in memory and still requires exact native Task-spec readback.
             return
         self.connection.execute(
             "INSERT INTO packets VALUES (?, ?, ?, ?)",
-            (run_local_id, task_id, encoded, utc_now()),
+            (run_local_id, task_id, packet_json, utc_now()),
         )
 
-    def get_packet(self, run_local_id: str, task_id: str) -> dict[str, Any]:
+    def get_packet_json(self, run_local_id: str, task_id: str) -> str:
         row = self.connection.execute(
             "SELECT packet_json FROM packets WHERE run_local_id = ? AND task_id = ?",
             (run_local_id, task_id),
         ).fetchone()
         if row is None:
             raise OrchestrateError("No packet is stored for that exact Task", code="packet_not_found")
-        return json.loads(row["packet_json"])
+        return str(row["packet_json"])
+
+    def get_packet(self, run_local_id: str, task_id: str) -> dict[str, Any]:
+        try:
+            packet = json.loads(self.get_packet_json(run_local_id, task_id))
+        except json.JSONDecodeError as exc:
+            raise OrchestrateError(
+                "The stored immutable Task packet is not valid JSON",
+                code="packet_identity_conflict",
+            ) from exc
+        if not isinstance(packet, dict):
+            raise OrchestrateError(
+                "The stored immutable Task packet is not a JSON object",
+                code="packet_identity_conflict",
+            )
+        return packet
+
+    def record_preflight(
+        self,
+        run_local_id: str,
+        *,
+        run_id: str,
+        task_id: str,
+        dispatch_id: str,
+        observation: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        outcome = observation.get("outcome")
+        if outcome not in {"passed", "rejected"}:
+            raise ValueError("Preflight outcome must be passed or rejected")
+        encoded = json.dumps(observation, sort_keys=True, separators=(",", ":"))
+        with self.transaction():
+            existing = self.connection.execute(
+                """SELECT observation_json FROM preflight_observations
+                   WHERE run_local_id = ? AND task_id = ? AND dispatch_id = ?""",
+                (run_local_id, task_id, dispatch_id),
+            ).fetchone()
+            if existing is not None:
+                return json.loads(existing["observation_json"]), False
+            self.connection.execute(
+                "INSERT INTO preflight_observations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (run_local_id, run_id, task_id, dispatch_id, outcome, encoded, utc_now()),
+            )
+        return observation, True
+
+    def get_preflight(self, run_local_id: str, task_id: str, dispatch_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """SELECT observation_json FROM preflight_observations
+               WHERE run_local_id = ? AND task_id = ? AND dispatch_id = ?""",
+            (run_local_id, task_id, dispatch_id),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            decoded = json.loads(row["observation_json"])
+        except json.JSONDecodeError as exc:
+            raise OrchestrateError(
+                "Stored preflight observation is malformed",
+                code="preflight_identity_conflict",
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise OrchestrateError("Stored preflight observation is malformed", code="preflight_identity_conflict")
+        return decoded
 
     def journal_delivery(self, run_local_id: str, delivery_id: str, response: dict[str, Any], messages: list[dict[str, Any]]) -> None:
         now = utc_now()
@@ -522,6 +607,8 @@ class StateStore(AbstractContextManager["StateStore"]):
         outcome: str,
         subject: str,
         payload: object,
+        admitted: bool = True,
+        admission_detail: object = None,
     ) -> RunRecord:
         """Commit evidence, terminal phase, and message effect atomically."""
 
@@ -529,8 +616,8 @@ class StateStore(AbstractContextManager["StateStore"]):
             f"{run_local_id}\0{delivery_id}\0{message_id}\0worker-claim".encode("utf-8")
         ).hexdigest()
         now = utc_now()
-        phase = "worker_succeeded" if outcome == "succeeded" else "worker_failed"
-        verification = "pending" if outcome == "succeeded" else "not_run"
+        phase = ("worker_succeeded" if outcome == "succeeded" else "worker_failed") if admitted else "worker_unadmitted"
+        verification = "pending" if admitted and outcome == "succeeded" else "not_run"
         with self.transaction():
             self.connection.execute(
                 "INSERT OR IGNORE INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -544,6 +631,22 @@ class StateStore(AbstractContextManager["StateStore"]):
                     now,
                 ),
             )
+            if not admitted:
+                admission_id = "evidence_" + hashlib.sha256(
+                    f"{run_local_id}\0{delivery_id}\0{message_id}\0admission".encode("utf-8")
+                ).hexdigest()
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        admission_id,
+                        run_local_id,
+                        "worker-admission",
+                        "rejected",
+                        "worker completion lacked joined preflight admission",
+                        json.dumps(admission_detail, sort_keys=True),
+                        now,
+                    ),
+                )
             self.connection.execute(
                 """UPDATE runs SET worker_outcome = ?, phase = ?, verification_status = ?, updated_at = ?
                    WHERE local_id = ?""",
