@@ -15,7 +15,13 @@ import uuid
 from .errors import OrchestrateError
 from .identity import require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError
-from .orca_compat import WorkerShowShapeError, worker_show_dispatch_identity
+from .orca_compat import (
+    TerminalResourceIdentity,
+    WorkerShowShapeError,
+    worker_show_dispatch_identity,
+    worker_show_identity,
+    worker_terminal_resource_identity,
+)
 from .state import make_private_state_directory, require_private_state_target, state_home
 
 
@@ -438,22 +444,43 @@ def _validate_native_settlement(
         raise ProbeContractError("Native Task state does not match the exact worker_done result")
 
 
-def _validate_release(worker_payload: Mapping[str, Any], dispatch_id: str) -> None:
+def _validate_release(
+    worker_payload: Mapping[str, Any],
+    *,
+    run_id: str,
+    task_id: str,
+    dispatch_id: str,
+    expected_resource: TerminalResourceIdentity,
+) -> None:
     result = _result_object(worker_payload)
     dispatch = result.get("dispatch")
+    worker = result.get("worker")
     resource = result.get("terminalResource")
-    if not isinstance(dispatch, Mapping) or dispatch.get("id") != dispatch_id:
-        raise ProbeContractError("Post-release worker-show did not return the exact Dispatch")
+    if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping):
+        raise ProbeContractError("Post-release worker-show omitted the exact worker identity")
+    try:
+        identity = worker_show_identity(dispatch, worker)
+    except WorkerShowShapeError as exc:
+        raise ProbeContractError(str(exc)) from exc
     if (
-        not isinstance(resource, Mapping)
-        or not isinstance(resource.get("id"), str)
+        dispatch.get("id") != dispatch_id
+        or identity.dispatch.run_id != run_id
+        or identity.dispatch.task_id != task_id
+        or identity.dispatch_id != dispatch_id
+        or identity.worktree_id != expected_resource.worktree_id
+    ):
+        raise ProbeContractError("Post-release worker-show did not return the exact Dispatch")
+    if not isinstance(resource, Mapping):
+        raise ProbeContractError("Post-release worker-show omitted the terminal resource")
+    try:
+        resource_identity = worker_terminal_resource_identity(resource, dispatch_id=dispatch_id)
+    except WorkerShowShapeError as exc:
+        raise ProbeContractError(str(exc)) from exc
+    if (
+        resource_identity != expected_resource
         or resource.get("ownershipState") != "released"
         or resource.get("releaseState") != "released"
         or resource.get("retainedReason") is not None
-        or resource.get("originDispatchId") != dispatch_id
-        or resource.get("ownerDispatchId") != dispatch_id
-        or not isinstance(resource.get("terminalHandle"), str)
-        or not isinstance(resource.get("worktreeId"), str)
         or not isinstance(resource.get("releaseRequestedAt"), str)
         or not isinstance(resource.get("releaseCompletedAt"), str)
         or resource.get("releaseError") is not None
@@ -470,7 +497,7 @@ def _validate_worker_start(
     run_id: str,
     task_id: str,
     worktree_id: str,
-) -> str:
+) -> tuple[str, str]:
     result = _result_object(payload)
     dispatch_id = result.get("dispatchId")
     if (
@@ -519,7 +546,54 @@ def _validate_worker_start(
     allowed = {("worktree", worktree_id), ("terminal", terminals[0]["id"])}
     if any((item.get("kind"), item.get("id")) not in allowed for item in resources):
         raise ProbeContractError("worker-start reported an unexpected residual resource")
-    return dispatch_id
+    return dispatch_id, str(terminals[0]["id"])
+
+
+def _validate_started_worker(
+    worker_payload: Mapping[str, Any],
+    *,
+    run_id: str,
+    task_id: str,
+    dispatch_id: str,
+    worktree_id: str,
+    terminal_handle: str,
+) -> TerminalResourceIdentity:
+    result = _result_object(worker_payload)
+    dispatch = result.get("dispatch")
+    worker = result.get("worker")
+    resource = result.get("terminalResource")
+    if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping):
+        raise ProbeContractError("Initial worker-show omitted the accepted worker identity")
+    try:
+        identity = worker_show_identity(dispatch, worker)
+    except WorkerShowShapeError as exc:
+        raise ProbeContractError(str(exc)) from exc
+    if (
+        dispatch.get("id") != dispatch_id
+        or identity.dispatch.run_id != run_id
+        or identity.dispatch.task_id != task_id
+        or dispatch.get("status") != "dispatched"
+        or identity.dispatch.last_failure is not None
+        or worker.get("state") != "ready"
+        or worker.get("stage") != "input_accepted"
+        or identity.dispatch_id != dispatch_id
+        or identity.worktree_id != worktree_id
+        or identity.terminal_handle != terminal_handle
+        or identity.last_error is not None
+    ):
+        raise ProbeContractError("Initial worker-show did not confirm the exact accepted worker")
+    if not isinstance(resource, Mapping):
+        raise ProbeContractError("Initial worker-show omitted the terminal resource")
+    try:
+        resource_identity = worker_terminal_resource_identity(resource, dispatch_id=dispatch_id)
+    except WorkerShowShapeError as exc:
+        raise ProbeContractError(str(exc)) from exc
+    if (
+        resource_identity.worktree_id != worktree_id
+        or resource_identity.terminal_handle != terminal_handle
+    ):
+        raise ProbeContractError("Initial worker-show terminal resource conflicts with the accepted worker")
+    return resource_identity
 
 
 def run_worker_probe(client: OrcaClient, probe_token: str, *, project: Path, wait_timeout_ms: int) -> JsonObject:
@@ -599,7 +673,7 @@ def run_worker_probe(client: OrcaClient, probe_token: str, *, project: Path, wai
     worktree_id = receipt.get("worktreeId")
     if not isinstance(worktree_id, str):
         raise ProbeContractError("The probe receipt omitted its exact worktree identity")
-    dispatch_id = _contract_step(
+    dispatch_id, terminal_handle = _contract_step(
         receipts,
         "dispatchIdentity",
         lambda: _validate_worker_start(
@@ -607,6 +681,28 @@ def run_worker_probe(client: OrcaClient, probe_token: str, *, project: Path, wai
             run_id=run_id,
             task_id=task_id,
             worktree_id=worktree_id,
+        ),
+    )
+    started_worker = _probe_call(
+        client,
+        receipts,
+        "startedWorker",
+        "orchestration",
+        "worker-show",
+        "--dispatch",
+        dispatch_id,
+        "--json",
+    )
+    expected_resource = _contract_step(
+        receipts,
+        "workerResourceIdentity",
+        lambda: _validate_started_worker(
+            started_worker,
+            run_id=run_id,
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+            worktree_id=worktree_id,
+            terminal_handle=terminal_handle,
         ),
     )
     delivery_payload = _probe_call(
@@ -695,7 +791,13 @@ def run_worker_probe(client: OrcaClient, probe_token: str, *, project: Path, wai
     _contract_step(
         receipts,
         "releaseDisposition",
-        lambda: _validate_release(released_worker, dispatch_id),
+        lambda: _validate_release(
+            released_worker,
+            run_id=run_id,
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+            expected_resource=expected_resource,
+        ),
     )
     readback = _probe_baseline(project)
     if readback != baseline:

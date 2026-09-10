@@ -15,12 +15,18 @@ from .admission import joined_preflight_status, validate_packet_sources
 from .errors import OrchestrateError
 from .identity import ControllerIdentity, require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError, orca_task_title
-from .orca_compat import WorkerShowShapeError, worker_show_dispatch_identity, worker_show_identity
+from .orca_compat import (
+    TerminalResourceIdentity,
+    WorkerShowShapeError,
+    worker_show_dispatch_identity,
+    worker_show_identity,
+    worker_terminal_resource_identity,
+)
 from .packets import canonical_packet_json, make_packet, packet_spec_from_json
 from .profile import ProjectProfile
 from .readers import read_project
 from .sources import SourceIndex, build_source_index
-from .state import RunRecord, StateStore
+from .state import RunRecord, StateStore, WorkerResourceBinding
 
 
 REPORT_SCHEMA = "orchestrate-report/v1"
@@ -35,6 +41,26 @@ def _result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     if not isinstance(result, Mapping):
         raise OrchestrateError("Orca response omitted result", code="orca_contract_error")
     return result
+
+
+def _response_returncode(payload: Mapping[str, Any]) -> int:
+    returncode = getattr(payload, "returncode", 0)
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        raise OrchestrateError("Orca response lost its subprocess exit status", code="orca_contract_error")
+    return returncode
+
+
+def _validate_worker_start_returncode(payload: Mapping[str, Any], returncode: int) -> None:
+    state = _result(payload).get("state")
+    if (returncode == 0 and state == "ready") or (
+        returncode == 1 and state in {"failed", "outcome_unknown"}
+    ):
+        return
+    raise OrchestrateError(
+        "worker-start exit status does not match its documented semantic result",
+        code="worker_start_exit_mismatch",
+        data={"returncode": returncode, "state": state},
+    )
 
 
 def _entity_id(payload: Mapping[str, Any], entity: str) -> str:
@@ -97,6 +123,7 @@ def _mutation(
             intention_id,
             "uncertain",
             request_id=_request_id(payload),
+            returncode=exc.result.returncode if exc.result is not None else None,
             error=payload or {"message": str(exc), "code": exc.code},
         )
         raise OrchestrateError(
@@ -122,6 +149,7 @@ def _mutation(
         intention_id,
         "applied",
         request_id=request_id,
+        returncode=_response_returncode(response),
         response=response,
     )
     return response
@@ -241,6 +269,7 @@ def _reconcile_confirmed_worker_start(
     intention_id: str,
     arguments: list[object],
     response: Mapping[str, Any],
+    returncode: int,
     request_id: str,
     expected_worktree_id: str | None = None,
 ) -> RunRecord:
@@ -248,6 +277,7 @@ def _reconcile_confirmed_worker_start(
     model = _stored_argument(arguments, "--model")
     effort = _stored_argument(arguments, "--effort")
     worktree_selector = _stored_argument(arguments, "--worktree")
+    _validate_worker_start_returncode(response, returncode)
     result = _result(response)
     if _is_prompt_stall_result(result):
         worktree_id, terminal_id = _validate_prompt_stall_start(
@@ -286,7 +316,7 @@ def _reconcile_confirmed_worker_start(
         "--json",
     )
     if _is_prompt_stall_result(result):
-        _validate_prompt_stall_readback(
+        resource_identity = _validate_prompt_stall_readback(
             readback,
             run=run,
             dispatch_id=dispatch_id,
@@ -298,7 +328,7 @@ def _reconcile_confirmed_worker_start(
             effort=effort,
         )
     else:
-        _validate_worker_start_readback(
+        resource_identity = _validate_worker_start_readback(
             readback,
             run=run,
             dispatch_id=dispatch_id,
@@ -309,16 +339,25 @@ def _reconcile_confirmed_worker_start(
             model=model,
             effort=effort,
         )
+    store.record_worker_resource_binding(
+        run.local_id,
+        dispatch_id=str(dispatch_id),
+        resource_id=resource_identity.resource_id,
+        terminal_handle=resource_identity.terminal_handle,
+        worktree_id=resource_identity.worktree_id,
+        readback=readback,
+    )
     store.mark_intention(
         intention_id,
         "applied",
         request_id=request_id,
+        returncode=returncode,
         response=response,
     )
     return _apply_intention(store, run, "worker-start", response)
 
 
-def _stored_prompt_stall_receipt(row: Mapping[str, Any]) -> Mapping[str, Any] | None:
+def _stored_prompt_stall_receipt(row: Mapping[str, Any]) -> tuple[Mapping[str, Any], int] | None:
     """Recover fea035d's misclassified nonzero ok=true worker-start receipt."""
 
     if row["operation"] != "worker-start" or row["status"] not in {"invoking", "uncertain"}:
@@ -345,7 +384,14 @@ def _stored_prompt_stall_receipt(row: Mapping[str, Any]) -> Mapping[str, Any] | 
             "Stored worker-start failure conflicts with its native mutation receipt",
             code="intention_binding_mismatch",
         )
-    return payload
+    returncode = row["returncode"]
+    if returncode is None:
+        # The frozen predecessor stored only this exact error envelope. It reached
+        # error_json because its strict client rejected the documented nonzero.
+        returncode = 1
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        raise OrchestrateError("Stored worker-start exit status is malformed", code="orca_contract_error")
+    return payload, returncode
 
 
 def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) -> RunRecord:
@@ -353,12 +399,14 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
     for row in store.unsettled_intentions(run.local_id):
         stored_prompt_stall = _stored_prompt_stall_receipt(row)
         if stored_prompt_stall is not None:
-            request_id = _mutation_request_id(stored_prompt_stall)
+            stored_response, stored_returncode = stored_prompt_stall
+            request_id = _mutation_request_id(stored_response)
             store.mark_intention(
                 row["id"],
                 "receipt_confirmed",
                 request_id=request_id,
-                response=stored_prompt_stall,
+                returncode=stored_returncode,
+                response=stored_response,
             )
             current = _reconcile_confirmed_worker_start(
                 client,
@@ -366,7 +414,8 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                 current,
                 intention_id=row["id"],
                 arguments=json.loads(row["arguments_json"]),
-                response=stored_prompt_stall,
+                response=stored_response,
+                returncode=stored_returncode,
                 request_id=request_id,
             )
             continue
@@ -379,6 +428,15 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                 )
             arguments = json.loads(row["arguments_json"])
             response = json.loads(row["response_json"])
+            returncode = row["returncode"]
+            if returncode is None and _is_prompt_stall_result(_result(response)):
+                returncode = 1
+            if isinstance(returncode, bool) or not isinstance(returncode, int):
+                raise OrchestrateError(
+                    "A confirmed worker-start receipt lacks its exact subprocess exit status",
+                    code="unknown_external_effect",
+                    data={"operation": row["operation"], "intentionId": row["id"]},
+                )
             current = _reconcile_confirmed_worker_start(
                 client,
                 store,
@@ -386,6 +444,7 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                 intention_id=row["id"],
                 arguments=arguments,
                 response=response,
+                returncode=returncode,
                 request_id=row["request_id"],
             )
             continue
@@ -396,7 +455,7 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                 replay = client.run_json(
                     *arguments,
                     "--json",
-                    allow_nonzero_ok=row["operation"] == "worker-start",
+                    allow_worker_start_nonzero=row["operation"] == "worker-start",
                 )
             except OrcaCommandError as exc:
                 payload = exc.result.payload if exc.result is not None else None
@@ -404,6 +463,7 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                     row["id"],
                     "uncertain",
                     request_id=_request_id(payload),
+                    returncode=exc.result.returncode if exc.result is not None else None,
                     error=payload or {"message": str(exc), "code": exc.code},
                 )
                 raise OrchestrateError(
@@ -426,10 +486,12 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                     data={"operation": row["operation"], "requestId": _request_id(replay)},
                 ) from exc
             if row["operation"] == "worker-start":
+                returncode = _response_returncode(replay)
                 store.mark_intention(
                     row["id"],
                     "receipt_confirmed",
                     request_id=replay_request_id,
+                    returncode=returncode,
                     response=replay,
                 )
                 current = _reconcile_confirmed_worker_start(
@@ -439,6 +501,7 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                     intention_id=row["id"],
                     arguments=arguments,
                     response=replay,
+                    returncode=returncode,
                     request_id=replay_request_id,
                 )
             else:
@@ -489,14 +552,16 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
             "--retry-request",
             request_id,
             "--json",
-            allow_nonzero_ok=row["operation"] == "worker-start",
+            allow_worker_start_nonzero=row["operation"] == "worker-start",
         )
         _mutation_request_id(replay, expected=request_id)
         if row["operation"] == "worker-start":
+            returncode = _response_returncode(replay)
             store.mark_intention(
                 row["id"],
                 "receipt_confirmed",
                 request_id=request_id,
+                returncode=returncode,
                 response=replay,
             )
             current = _reconcile_confirmed_worker_start(
@@ -506,6 +571,7 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                 intention_id=row["id"],
                 arguments=arguments,
                 response=replay,
+                returncode=returncode,
                 request_id=request_id,
             )
         else:
@@ -875,7 +941,7 @@ def _validate_worker_start_readback(
     agent: str,
     model: str,
     effort: str,
-) -> None:
+) -> TerminalResourceIdentity:
     result = _result(payload)
     dispatch = result.get("dispatch")
     worker = result.get("worker")
@@ -917,6 +983,25 @@ def _validate_worker_start_readback(
         worktree_id=worktree_id,
         terminal_id=terminal_id,
     )
+    terminal_resource = result.get("terminalResource")
+    if not isinstance(terminal_resource, Mapping):
+        raise OrchestrateError("worker-show omitted its terminal resource", code="orca_contract_error")
+    try:
+        resource_identity = worker_terminal_resource_identity(
+            terminal_resource,
+            dispatch_id=dispatch_id,
+        )
+    except WorkerShowShapeError as exc:
+        raise OrchestrateError(str(exc), code="orca_contract_error") from exc
+    if (
+        resource_identity.terminal_handle != terminal_id
+        or resource_identity.worktree_id != worktree_id
+    ):
+        raise OrchestrateError(
+            "worker-show terminal resource conflicts with the accepted worker",
+            code="orca_contract_error",
+        )
+    return resource_identity
 
 
 def _validate_prompt_stall_readback(
@@ -930,7 +1015,8 @@ def _validate_prompt_stall_readback(
     agent: str,
     model: str,
     effort: str,
-) -> None:
+    allow_released_terminal: bool = False,
+) -> TerminalResourceIdentity:
     result = _result(payload)
     dispatch = result.get("dispatch")
     worker = result.get("worker")
@@ -940,6 +1026,20 @@ def _validate_prompt_stall_readback(
         identity = worker_show_identity(dispatch, worker)
     except WorkerShowShapeError as exc:
         raise OrchestrateError(str(exc), code="orca_contract_error") from exc
+    terminal_resource = result.get("terminalResource")
+    if not isinstance(terminal_resource, Mapping):
+        raise OrchestrateError(
+            "worker-show omitted the failed worker terminal resource",
+            code="orca_contract_error",
+        )
+    try:
+        resource_identity = worker_terminal_resource_identity(
+            terminal_resource,
+            dispatch_id=dispatch_id,
+        )
+    except WorkerShowShapeError as exc:
+        raise OrchestrateError(str(exc), code="orca_contract_error") from exc
+    released_terminal = allow_released_terminal and terminal_resource.get("releaseState") == "released"
     if (
         dispatch.get("id") != dispatch_id
         or identity.dispatch.run_id != run.native_run_id
@@ -947,11 +1047,16 @@ def _validate_prompt_stall_readback(
         or dispatch.get("status") != "failed"
         or identity.dispatch.last_failure != PROMPT_STALL_ERROR
         or worker.get("state") != "failed"
-        or worker.get("stage") != PROMPT_STALL_STAGE
+        or worker.get("stage") not in (
+            {PROMPT_STALL_STAGE, "released"} if released_terminal else {PROMPT_STALL_STAGE}
+        )
         or identity.last_error != PROMPT_STALL_ERROR
         or identity.dispatch_id != dispatch_id
         or identity.worktree_id != worktree_id
-        or identity.terminal_handle != terminal_id
+        or (
+            identity.terminal_handle != terminal_id
+            and not (released_terminal and identity.terminal_handle is None)
+        )
     ):
         raise OrchestrateError(
             "worker-show did not confirm the exact failed prompt-stall worker",
@@ -984,19 +1089,15 @@ def _validate_prompt_stall_readback(
         or resources[0].get("id") != terminal_id
     ):
         raise OrchestrateError("worker-show lost the failed worker terminal identity", code="orca_contract_error")
-    terminal_resource = result.get("terminalResource")
     if (
-        not isinstance(terminal_resource, Mapping)
-        or not isinstance(terminal_resource.get("id"), str)
-        or terminal_resource.get("originDispatchId") != dispatch_id
-        or terminal_resource.get("ownerDispatchId") != dispatch_id
-        or terminal_resource.get("terminalHandle") != terminal_id
-        or terminal_resource.get("worktreeId") != worktree_id
+        resource_identity.terminal_handle != terminal_id
+        or resource_identity.worktree_id != worktree_id
     ):
         raise OrchestrateError(
             "worker-show did not bind the failed Dispatch to its exact terminal resource",
             code="orca_contract_error",
         )
+    return resource_identity
 
 
 def _start_worker(
@@ -1035,7 +1136,7 @@ def _start_worker(
             *arguments,
             "--json",
             timeout_seconds=90,
-            allow_nonzero_ok=True,
+            allow_worker_start_nonzero=True,
         )
     except OrcaCommandError as exc:
         payload = exc.result.payload if exc.result is not None else None
@@ -1043,6 +1144,7 @@ def _start_worker(
             intention_id,
             "uncertain",
             request_id=_request_id(payload),
+            returncode=exc.result.returncode if exc.result is not None else None,
             error=payload or {"message": str(exc), "code": exc.code},
         )
         raise OrchestrateError(
@@ -1050,6 +1152,7 @@ def _start_worker(
             code="mutation_outcome_uncertain",
             data={"operation": "worker-start", "requestId": _request_id(payload), "orcaCode": exc.code},
         ) from exc
+    returncode = _response_returncode(response)
     try:
         request_id = _mutation_request_id(response)
     except OrchestrateError as exc:
@@ -1068,6 +1171,7 @@ def _start_worker(
         intention_id,
         "receipt_confirmed",
         request_id=request_id,
+        returncode=returncode,
         response=response,
     )
     current = _reconcile_confirmed_worker_start(
@@ -1077,6 +1181,7 @@ def _start_worker(
         intention_id=intention_id,
         arguments=arguments,
         response=response,
+        returncode=returncode,
         request_id=request_id,
         expected_worktree_id=worktree_id,
     )
@@ -1127,6 +1232,72 @@ def _validate_native_settlement(client: OrcaClient, run: RunRecord, outcome: str
         raise OrchestrateError("worker_done does not match native Task settlement", code="settlement_mismatch")
 
 
+def _recover_prompt_stall_resource_binding(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+) -> tuple[WorkerResourceBinding, Mapping[str, Any]]:
+    rows = store.connection.execute(
+        """SELECT arguments_json, response_json, returncode FROM intentions
+           WHERE run_local_id = ? AND operation = 'worker-start' AND status = 'applied'""",
+        (run.local_id,),
+    ).fetchall()
+    if len(rows) != 1 or not rows[0]["response_json"]:
+        raise OrchestrateError(
+            "The exact pre-release worker resource binding is unavailable",
+            code="release_unconfirmed",
+        )
+    arguments = json.loads(rows[0]["arguments_json"])
+    response = json.loads(rows[0]["response_json"])
+    if not isinstance(arguments, list) or not isinstance(response, Mapping):
+        raise OrchestrateError("Stored worker-start recovery data is malformed", code="orca_contract_error")
+    returncode = rows[0]["returncode"]
+    if returncode is None and _is_prompt_stall_result(_result(response)):
+        returncode = 1
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        raise OrchestrateError(
+            "The pre-release worker-start exit status is unavailable",
+            code="release_unconfirmed",
+        )
+    _validate_worker_start_returncode(response, returncode)
+    worktree_id, terminal_id = _validate_prompt_stall_start(
+        response,
+        run=run,
+        worktree_id=None,
+        agent=_stored_argument(arguments, "--agent"),
+        model=_stored_argument(arguments, "--model"),
+        effort=_stored_argument(arguments, "--effort"),
+    )
+    readback = client.run_json(
+        "orchestration",
+        "worker-show",
+        "--dispatch",
+        str(run.dispatch_id),
+        "--json",
+    )
+    resource = _validate_prompt_stall_readback(
+        readback,
+        run=run,
+        dispatch_id=str(run.dispatch_id),
+        worktree_id=worktree_id,
+        worktree_selector=_stored_argument(arguments, "--worktree"),
+        terminal_id=terminal_id,
+        agent=_stored_argument(arguments, "--agent"),
+        model=_stored_argument(arguments, "--model"),
+        effort=_stored_argument(arguments, "--effort"),
+        allow_released_terminal=True,
+    )
+    binding = store.record_worker_resource_binding(
+        run.local_id,
+        dispatch_id=str(run.dispatch_id),
+        resource_id=resource.resource_id,
+        terminal_handle=resource.terminal_handle,
+        worktree_id=resource.worktree_id,
+        readback=readback,
+    )
+    return binding, readback
+
+
 def _release_disposition(
     client: OrcaClient,
     store: StateStore,
@@ -1139,19 +1310,28 @@ def _release_disposition(
            WHERE run_local_id = ? AND operation = 'worker-release' AND status = 'applied'""",
         (run.local_id,),
     ).fetchall()
-    released = False
+    release_applied = False
     release_response: Mapping[str, Any] | None = None
     for row in rows:
         arguments = json.loads(row["arguments_json"])
         if isinstance(arguments, list) and "--dispatch" in arguments:
             index = arguments.index("--dispatch")
-            released = index + 1 < len(arguments) and arguments[index + 1] == run.dispatch_id
-        if released:
+            release_applied = index + 1 < len(arguments) and arguments[index + 1] == run.dispatch_id
+        if release_applied:
             if row["response_json"]:
                 decoded = json.loads(row["response_json"])
                 release_response = decoded if isinstance(decoded, Mapping) else None
             break
-    if not released:
+    binding = store.get_worker_resource_binding(run.local_id)
+    recovered_readback: Mapping[str, Any] | None = None
+    if binding is None:
+        binding, recovered_readback = _recover_prompt_stall_resource_binding(client, store, run)
+    if binding.dispatch_id != run.dispatch_id:
+        raise OrchestrateError(
+            "The stored worker resource belongs to another Dispatch",
+            code="release_unconfirmed",
+        )
+    if not release_applied:
         release_response = _mutation(
             client,
             store,
@@ -1162,35 +1342,77 @@ def _release_disposition(
     if release_response is None:
         raise OrchestrateError("Worker release receipt is unavailable", code="release_unconfirmed")
     release_result = _result(release_response)
-    if (
-        release_result.get("dispatchId") != run.dispatch_id
-        or release_result.get("state") not in {"released", "already_released", "retained"}
-    ):
+    release_state = release_result.get("state")
+    if release_result.get("dispatchId") != run.dispatch_id or release_state not in {
+        "released",
+        "already_released",
+        "retained",
+        "release_pending",
+    }:
         raise OrchestrateError("Worker release receipt does not bind the exact Dispatch", code="release_unconfirmed")
-    worker = client.run_json("orchestration", "worker-show", "--dispatch", str(run.dispatch_id), "--json")
+    if release_state == "release_pending":
+        archive_metadata = release_result.get("archive")
+        if (
+            release_result.get("processAction") != "none"
+            or not isinstance(release_result.get("recovery"), str)
+            or not release_result["recovery"]
+            or (archive_metadata is not None and not isinstance(archive_metadata, Mapping))
+            or ("lastError" in release_result and not isinstance(release_result.get("lastError"), str))
+        ):
+            raise OrchestrateError(
+                "Worker release_pending receipt omitted its exact recovery metadata",
+                code="release_unconfirmed",
+            )
+    worker = recovered_readback if release_applied and recovered_readback is not None else client.run_json(
+        "orchestration", "worker-show", "--dispatch", str(run.dispatch_id), "--json"
+    )
     result = _result(worker)
     dispatch = result.get("dispatch")
-    if not isinstance(dispatch, Mapping) or dispatch.get("id") != run.dispatch_id:
+    shown_worker = result.get("worker")
+    if not isinstance(dispatch, Mapping) or not isinstance(shown_worker, Mapping):
+        raise OrchestrateError("worker-show release readback omitted its exact worker", code="release_unconfirmed")
+    try:
+        shown_identity = worker_show_identity(dispatch, shown_worker)
+    except WorkerShowShapeError as exc:
+        raise OrchestrateError(str(exc), code="release_unconfirmed") from exc
+    if (
+        dispatch.get("id") != run.dispatch_id
+        or shown_identity.dispatch.run_id != run.native_run_id
+        or shown_identity.dispatch.task_id != run.task_id
+        or shown_identity.dispatch_id != run.dispatch_id
+        or shown_identity.worktree_id != binding.worktree_id
+    ):
         raise OrchestrateError("worker-show release readback belongs to another Dispatch", code="release_unconfirmed")
     resource = result.get("terminalResource")
     if not isinstance(resource, Mapping):
         raise OrchestrateError("worker-show omitted terminal release state", code="release_unconfirmed")
+    try:
+        resource_identity = worker_terminal_resource_identity(
+            resource,
+            dispatch_id=str(run.dispatch_id),
+        )
+    except WorkerShowShapeError as exc:
+        raise OrchestrateError(str(exc), code="release_unconfirmed") from exc
+    if (
+        resource_identity.resource_id != binding.resource_id
+        or resource_identity.terminal_handle != binding.terminal_handle
+        or resource_identity.worktree_id != binding.worktree_id
+    ):
+        raise OrchestrateError(
+            "worker-show release readback changed the bound terminal resource identity",
+            code="release_unconfirmed",
+        )
     ownership = resource.get("ownershipState")
     state = resource.get("releaseState")
     reason = resource.get("retainedReason")
     archive = resource.get("archive")
     exact_owner = (
-        isinstance(resource.get("id"), str)
-        and resource.get("originDispatchId") == run.dispatch_id
-        and resource.get("ownerDispatchId") == run.dispatch_id
-        and isinstance(resource.get("terminalHandle"), str)
-        and isinstance(resource.get("worktreeId"), str)
-        and resource.get("releaseError") is None
+        resource.get("releaseError") is None
         and isinstance(archive, Mapping)
     )
     if (
         exact_owner
-        and release_result.get("state") in {"released", "already_released"}
+        and release_state in {"released", "already_released", "release_pending"}
         and ownership == "released"
         and state == "released"
         and reason is None
@@ -1200,10 +1422,19 @@ def _release_disposition(
         and archive.get("status") == "captured"
     ):
         return
+    if release_state == "release_pending":
+        raise OrchestrateError(
+            "Worker terminal release remains pending exact Orca recovery",
+            code="release_pending",
+            data={
+                "release": dict(release_result),
+                "terminalResource": dict(resource),
+            },
+        )
     if (
         not require_released
         and exact_owner
-        and release_result.get("state") == "retained"
+        and release_state == "retained"
         and ownership == "user_owned"
         and state == "retained"
         and reason == "user_takeover"

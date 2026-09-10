@@ -99,6 +99,39 @@ class StateTests(unittest.TestCase):
 
                 self.assertEqual(store.select_run(None).local_id, run.local_id)
 
+    def test_worker_resource_binding_is_immutable_and_keeps_validated_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            with StateStore(Path(project_dir), home=Path(home_dir)) as store:
+                run = store.create_run(objective="one", profile_digest="p", source_digest="s")
+                first = store.record_worker_resource_binding(
+                    run.local_id,
+                    dispatch_id="dispatch_1",
+                    resource_id="resource_1",
+                    terminal_handle="term_1",
+                    worktree_id="worktree_1",
+                    readback={"state": "owned"},
+                )
+                repeated = store.record_worker_resource_binding(
+                    run.local_id,
+                    dispatch_id="dispatch_1",
+                    resource_id="resource_1",
+                    terminal_handle="term_1",
+                    worktree_id="worktree_1",
+                    readback={"state": "released"},
+                )
+                self.assertEqual(first, repeated)
+                self.assertEqual(first.readback_json, '{"state":"owned"}')
+                with self.assertRaises(OrchestrateError) as caught:
+                    store.record_worker_resource_binding(
+                        run.local_id,
+                        dispatch_id="dispatch_1",
+                        resource_id="resource_other",
+                        terminal_handle="term_1",
+                        worktree_id="worktree_1",
+                        readback={"state": "released"},
+                    )
+                self.assertEqual(caught.exception.code, "worker_resource_binding_mismatch")
+
     def test_worker_evidence_phase_and_message_effect_roll_back_as_one_transaction(self) -> None:
         with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
             with StateStore(Path(project_dir), home=Path(home_dir)) as store:

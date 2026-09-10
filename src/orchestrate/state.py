@@ -122,6 +122,16 @@ class RunRecord:
     delivery_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class WorkerResourceBinding:
+    run_local_id: str
+    dispatch_id: str
+    resource_id: str
+    terminal_handle: str
+    worktree_id: str
+    readback_json: str
+
+
 class RunLock(AbstractContextManager["RunLock"]):
     """A non-blocking host-local process lock, distinct from Orca ownership."""
 
@@ -249,10 +259,20 @@ class StateStore(AbstractContextManager["StateStore"]):
                 arguments_json TEXT NOT NULL,
                 request_id TEXT,
                 status TEXT NOT NULL,
+                returncode INTEGER,
                 response_json TEXT,
                 error_json TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS worker_resource_bindings (
+                run_local_id TEXT PRIMARY KEY REFERENCES runs(local_id),
+                dispatch_id TEXT NOT NULL UNIQUE,
+                resource_id TEXT NOT NULL,
+                terminal_handle TEXT NOT NULL,
+                worktree_id TEXT NOT NULL,
+                readback_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS packets (
                 run_local_id TEXT NOT NULL REFERENCES runs(local_id),
@@ -309,6 +329,11 @@ class StateStore(AbstractContextManager["StateStore"]):
             );
             """
         )
+        intention_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(intentions)").fetchall()
+        }
+        if "returncode" not in intention_columns:
+            self.connection.execute("ALTER TABLE intentions ADD COLUMN returncode INTEGER")
         self.connection.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema', ?)",
             (STATE_SCHEMA,),
@@ -418,18 +443,76 @@ class StateStore(AbstractContextManager["StateStore"]):
         )
         return intention_id
 
-    def mark_intention(self, intention_id: str, status: str, *, request_id: str | None = None, response: object = None, error: object = None) -> None:
+    def mark_intention(
+        self,
+        intention_id: str,
+        status: str,
+        *,
+        request_id: str | None = None,
+        returncode: int | None = None,
+        response: object = None,
+        error: object = None,
+    ) -> None:
+        if returncode is not None and (isinstance(returncode, bool) or not isinstance(returncode, int)):
+            raise ValueError("The subprocess return code must be an integer")
         self.connection.execute(
             """UPDATE intentions SET status = ?, request_id = COALESCE(?, request_id),
-               response_json = ?, error_json = ?, updated_at = ? WHERE id = ?""",
+               returncode = COALESCE(?, returncode), response_json = ?, error_json = ?,
+               updated_at = ? WHERE id = ?""",
             (
                 status,
                 request_id,
+                returncode,
                 json.dumps(response) if response is not None else None,
                 json.dumps(error) if error is not None else None,
                 utc_now(),
                 intention_id,
             ),
+        )
+
+    def record_worker_resource_binding(
+        self,
+        run_local_id: str,
+        *,
+        dispatch_id: str,
+        resource_id: str,
+        terminal_handle: str,
+        worktree_id: str,
+        readback: object,
+    ) -> WorkerResourceBinding:
+        values = (dispatch_id, resource_id, terminal_handle, worktree_id)
+        if any(not isinstance(value, str) or not value for value in values):
+            raise ValueError("Worker resource identities must be non-empty strings")
+        existing = self.connection.execute(
+            "SELECT * FROM worker_resource_bindings WHERE run_local_id = ?",
+            (run_local_id,),
+        ).fetchone()
+        if existing is not None:
+            observed = tuple(existing[name] for name in ("dispatch_id", "resource_id", "terminal_handle", "worktree_id"))
+            if observed != values:
+                raise OrchestrateError(
+                    "The worker terminal resource conflicts with its immutable local binding",
+                    code="worker_resource_binding_mismatch",
+                )
+            return WorkerResourceBinding(
+                **{field: existing[field] for field in WorkerResourceBinding.__dataclass_fields__}
+            )
+        encoded = json.dumps(readback, sort_keys=True, separators=(",", ":"))
+        self.connection.execute(
+            "INSERT INTO worker_resource_bindings VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (run_local_id, *values, encoded, utc_now()),
+        )
+        return self.get_worker_resource_binding(run_local_id)
+
+    def get_worker_resource_binding(self, run_local_id: str) -> WorkerResourceBinding | None:
+        row = self.connection.execute(
+            "SELECT * FROM worker_resource_bindings WHERE run_local_id = ?",
+            (run_local_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return WorkerResourceBinding(
+            **{field: row[field] for field in WorkerResourceBinding.__dataclass_fields__}
         )
 
     def unsettled_intentions(self, run_local_id: str) -> list[sqlite3.Row]:

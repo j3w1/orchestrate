@@ -62,8 +62,12 @@ class PreflightClient:
                     agentTerminalHandle="term_worker", lastError=None,
                 )
             else:
-                dispatch.update(run_id="run_1", task_id="task_1")
-                worker.update(worktree_id=worktree_id, agent_terminal_handle="term_worker")
+                dispatch.update(run_id="run_1", task_id="task_1", last_failure=None)
+                worker.update(
+                    worktree_id=worktree_id,
+                    agent_terminal_handle="term_worker",
+                    last_error=None,
+                )
             return self._wrap({
                 "dispatch": dispatch,
                 "worker": worker,

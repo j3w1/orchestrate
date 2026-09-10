@@ -142,8 +142,73 @@ class DoctorTests(unittest.TestCase):
                 "run_id": "run_probe",
                 "task_id": "task_probe",
                 "status": native,
+                "last_failure": None if outcome == "succeeded" else "worker_failed",
             }
         )
+        started_dispatch = (
+            {
+                "id": "dispatch_probe",
+                "runId": "run_probe",
+                "taskId": "task_probe",
+                "task_id": "task_probe",
+                "status": "dispatched",
+                "lastFailure": None,
+            }
+            if current_worker_shape
+            else {
+                "id": "dispatch_probe",
+                "run_id": "run_probe",
+                "task_id": "task_probe",
+                "status": "dispatched",
+                "last_failure": None,
+            }
+        )
+        started_worker = (
+            {
+                "dispatchId": "dispatch_probe",
+                "worktreeId": "worktree_1",
+                "agentTerminalHandle": "term_probe",
+                "lastError": None,
+                "state": "ready",
+                "stage": "input_accepted",
+            }
+            if current_worker_shape
+            else {
+                "worktree_id": "worktree_1",
+                "agent_terminal_handle": "term_probe",
+                "last_error": None,
+                "state": "ready",
+                "stage": "input_accepted",
+            }
+        )
+        released_worker = (
+            {
+                "dispatchId": "dispatch_probe",
+                "worktreeId": "worktree_1",
+                "agentTerminalHandle": None,
+                "lastError": None if outcome == "succeeded" else "worker_failed",
+                "state": outcome,
+                "stage": "released",
+            }
+            if current_worker_shape
+            else {
+                "worktree_id": "worktree_1",
+                "agent_terminal_handle": None,
+                "last_error": None if outcome == "succeeded" else "worker_failed",
+                "state": outcome,
+                "stage": "released",
+            }
+        )
+        terminal_resource = {
+            "id": "terminal-resource-probe",
+            "ownershipState": "owned",
+            "releaseState": "not_requested",
+            "retainedReason": None,
+            "originDispatchId": "dispatch_probe",
+            "ownerDispatchId": "dispatch_probe",
+            "terminalHandle": "term_probe",
+            "worktreeId": "worktree_1",
+        }
         return [
             *self.caller_responses("run_probe"),
             {"ok": True, "result": {"run": {"id": "run_probe", "objective": objective}}},
@@ -183,6 +248,14 @@ class DoctorTests(unittest.TestCase):
                     "mutation": {"requestId": "request_worker", "replayed": False},
                 },
             },
+            {
+                "ok": True,
+                "result": {
+                    "dispatch": started_dispatch,
+                    "worker": started_worker,
+                    "terminalResource": terminal_resource,
+                },
+            },
             {"ok": True, "result": {"deliveryId": "delivery_probe", "messages": messages}},
             {
                 "ok": True,
@@ -207,7 +280,8 @@ class DoctorTests(unittest.TestCase):
             {
                 "ok": True,
                 "result": {
-                    "dispatch": {"id": "dispatch_probe"},
+                    "dispatch": settled_dispatch,
+                    "worker": released_worker,
                     "terminalResource": {
                         "id": "terminal-resource-probe",
                         "ownershipState": "released",
@@ -330,10 +404,44 @@ class DoctorTests(unittest.TestCase):
     def test_malformed_fifo_entry_is_not_filtered_or_acknowledged(self) -> None:
         minted = self.mint_probe()
         receipt = json.loads((Path(self.state_temp.name) / "probes" / f"{minted['probeToken']}.json").read_text())
-        client = FakeClient(self.worker_responses(receipt["objective"], [17, self.done_message()])[:12])
+        client = FakeClient(self.worker_responses(receipt["objective"], [17, self.done_message()])[:13])
         with self.assertRaisesRegex(ProbeContractError, "delivery id or messages"):
             run_worker_probe(client, minted["probeToken"], project=self.root, wait_timeout_ms=10)  # type: ignore[arg-type]
         self.assertFalse(any("--ack" in call or "worker-release" in call for call in client.calls))
+
+    def test_active_doctor_release_rejects_each_changed_resource_identity(self) -> None:
+        for changed_field, changed_value in (
+            ("id", "terminal-resource-other"),
+            ("terminalHandle", "term_other"),
+            ("worktreeId", "worktree_other"),
+        ):
+            with self.subTest(changed_field=changed_field):
+                minted = self.mint_probe()
+                receipt = json.loads(
+                    (Path(self.state_temp.name) / "probes" / f"{minted['probeToken']}.json").read_text()
+                )
+                responses = self.worker_responses(
+                    receipt["objective"],
+                    [self.done_message()],
+                    current_worker_shape=True,
+                )
+                released = next(
+                    response
+                    for response in responses
+                    if isinstance(response.get("result"), dict)
+                    and isinstance(response["result"].get("terminalResource"), dict)
+                    and response["result"]["terminalResource"].get("releaseState") == "released"
+                )
+                released["result"]["terminalResource"][changed_field] = changed_value
+                client = FakeClient(responses)
+                with self.assertRaises(ProbeContractError):
+                    run_worker_probe(
+                        client,
+                        minted["probeToken"],
+                        project=self.root,
+                        wait_timeout_ms=10,
+                    )  # type: ignore[arg-type]
+                self.assertFalse(any("--ack" in call for call in client.calls))
 
     def test_run_creation_timeout_preserves_unknown_receipt_and_prior_reads(self) -> None:
         timeout = OrcaCommandError(

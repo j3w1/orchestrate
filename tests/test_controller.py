@@ -23,6 +23,7 @@ from orchestrate.controller import (
 )
 from orchestrate.errors import OrchestrateError
 from orchestrate.identity import require_plain_controller
+from orchestrate.orca import OrcaJsonResponse
 from orchestrate.packets import canonical_packet_json, make_packet, packet_spec
 from orchestrate.profile import setup_project
 from orchestrate.readers import read_project
@@ -134,12 +135,19 @@ def _worker_start_readback(root: Path) -> dict[str, object]:
     terminal_effect = {"kind": "terminal", "role": "agent", "action": "created", "id": "term_worker"}
     return {
         "result": {
-            "dispatch": {"id": "dispatch_1", "run_id": "run_1", "task_id": "task_1", "status": "dispatched"},
+            "dispatch": {
+                "id": "dispatch_1",
+                "run_id": "run_1",
+                "task_id": "task_1",
+                "last_failure": None,
+                "status": "dispatched",
+            },
             "worker": {
                 "state": "ready",
                 "stage": "input_accepted",
                 "worktree_id": worktree_id,
                 "agent_terminal_handle": "term_worker",
+                "last_error": None,
                 "effects": [],
                 "residualResources": [terminal_effect],
                 "startOptions": {
@@ -152,12 +160,22 @@ def _worker_start_readback(root: Path) -> dict[str, object]:
                     "setupSource": "existing_worktree",
                 },
             },
+            "terminalResource": {
+                "id": "terminal-resource-1",
+                "ownershipState": "owned",
+                "releaseState": "not_requested",
+                "retainedReason": None,
+                "originDispatchId": "dispatch_1",
+                "ownerDispatchId": "dispatch_1",
+                "terminalHandle": "term_worker",
+                "worktreeId": worktree_id,
+            },
         },
         "_meta": {"runtimeId": "runtime_test"},
     }
 
 
-def _prompt_stall_start(root: Path, *, include_ok: bool = False) -> dict[str, object]:
+def _prompt_stall_start(root: Path, *, include_ok: bool = False) -> OrcaJsonResponse:
     worktree_id = f"repo::{root.resolve()}"
     terminal_id = "term_worker"
     launch = {
@@ -186,7 +204,7 @@ def _prompt_stall_start(root: Path, *, include_ok: bool = False) -> dict[str, ob
     response["_meta"] = {"runtimeId": "runtime_test"}
     if include_ok:
         response["ok"] = True
-    return response
+    return OrcaJsonResponse(response, returncode=1)
 
 
 def _prompt_stall_readback(root: Path, *, current_shape: bool = False) -> dict[str, object]:
@@ -253,10 +271,38 @@ def _prompt_stall_readback(root: Path, *, current_shape: bool = False) -> dict[s
     }
 
 
-def _released_prompt_stall_readback(root: Path) -> dict[str, object]:
+def _released_prompt_stall_readback(root: Path, *, current_shape: bool = False) -> dict[str, object]:
+    worktree_id = f"repo::{root.resolve()}"
+    dispatch: dict[str, object] = {"id": "dispatch_1", "status": "failed"}
+    worker: dict[str, object] = {"state": "failed", "stage": "released"}
+    if current_shape:
+        dispatch.update(
+            runId="run_1",
+            taskId="task_1",
+            task_id="task_1",
+            lastFailure="agent_prompt_stalled",
+        )
+        worker.update(
+            dispatchId="dispatch_1",
+            worktreeId=worktree_id,
+            agentTerminalHandle=None,
+            lastError="agent_prompt_stalled",
+        )
+    else:
+        dispatch.update(
+            run_id="run_1",
+            task_id="task_1",
+            last_failure="agent_prompt_stalled",
+        )
+        worker.update(
+            worktree_id=worktree_id,
+            agent_terminal_handle=None,
+            last_error="agent_prompt_stalled",
+        )
     return {
         "result": {
-            "dispatch": {"id": "dispatch_1"},
+            "dispatch": dispatch,
+            "worker": worker,
             "terminalResource": {
                 "id": "terminal-resource-1",
                 "ownershipState": "released",
@@ -265,7 +311,7 @@ def _released_prompt_stall_readback(root: Path) -> dict[str, object]:
                 "originDispatchId": "dispatch_1",
                 "ownerDispatchId": "dispatch_1",
                 "terminalHandle": "term_worker",
-                "worktreeId": f"repo::{root.resolve()}",
+                "worktreeId": worktree_id,
                 "releaseRequestedAt": "2026-01-01T00:00:00Z",
                 "releaseCompletedAt": "2026-01-01T00:00:01Z",
                 "releaseError": None,
@@ -273,6 +319,83 @@ def _released_prompt_stall_readback(root: Path) -> dict[str, object]:
             },
         }
     }
+
+
+def _release_worker_show(
+    resource: Mapping[str, object],
+    *,
+    run_id: str,
+    task_id: str,
+    dispatch_id: str,
+    status: str = "completed",
+    current_shape: bool = False,
+) -> dict[str, object]:
+    last_failure = None if status == "completed" else "worker_failed"
+    dispatch: dict[str, object] = {"id": dispatch_id, "status": status}
+    worker: dict[str, object] = {"state": "succeeded" if status == "completed" else "failed", "stage": "released"}
+    if current_shape:
+        dispatch.update(
+            runId=run_id,
+            taskId=task_id,
+            task_id=task_id,
+            lastFailure=last_failure,
+        )
+        worker.update(
+            dispatchId=dispatch_id,
+            worktreeId=resource.get("worktreeId"),
+            agentTerminalHandle=None,
+            lastError=last_failure,
+        )
+    else:
+        dispatch.update(run_id=run_id, task_id=task_id, last_failure=last_failure)
+        worker.update(
+            worktree_id=resource.get("worktreeId"),
+            agent_terminal_handle=None,
+            last_error=last_failure,
+        )
+    return {"result": {"dispatch": dispatch, "worker": worker, "terminalResource": dict(resource)}}
+
+
+def _released_resource(
+    dispatch_id: str,
+    *,
+    resource_id: str = "terminal-resource-1",
+    terminal_handle: str = "term_worker",
+    worktree_id: str = "repo::fixture",
+) -> dict[str, object]:
+    return {
+        "id": resource_id,
+        "ownershipState": "released",
+        "releaseState": "released",
+        "retainedReason": None,
+        "originDispatchId": dispatch_id,
+        "ownerDispatchId": dispatch_id,
+        "terminalHandle": terminal_handle,
+        "worktreeId": worktree_id,
+        "releaseRequestedAt": "2026-01-01T00:00:00Z",
+        "releaseCompletedAt": "2026-01-01T00:00:01Z",
+        "releaseError": None,
+        "archive": {"source": "transcript", "status": "captured"},
+    }
+
+
+def _record_fixture_binding(
+    store: StateStore,
+    run_local_id: str,
+    *,
+    dispatch_id: str = "dispatch_1",
+    resource_id: str = "terminal-resource-1",
+    terminal_handle: str = "term_worker",
+    worktree_id: str = "repo::fixture",
+) -> None:
+    store.record_worker_resource_binding(
+        run_local_id,
+        dispatch_id=dispatch_id,
+        resource_id=resource_id,
+        terminal_handle=terminal_handle,
+        worktree_id=worktree_id,
+        readback={"fixture": "validated-start-readback"},
+    )
 
 
 def _worker_start_with_preflight(root: Path) -> Response:
@@ -325,30 +448,58 @@ def _worker_start_with_preflight(root: Path) -> Response:
     return respond
 
 
-def settlement_responses(outcome: str = "succeeded") -> list[Response]:
+def settlement_responses(
+    outcome: str = "succeeded",
+    *,
+    worktree_id: str = "repo::fixture",
+    current_shape: bool = False,
+    release_state: str = "released",
+) -> list[Response]:
     native_status = "completed" if outcome == "succeeded" else "failed"
+    dispatch: dict[str, object] = {"id": "dispatch_1", "status": native_status}
+    released_worker: dict[str, object] = {"state": outcome, "stage": "released"}
+    if current_shape:
+        dispatch.update(
+            runId="run_1",
+            taskId="task_1",
+            task_id="task_1",
+            lastFailure=None if outcome == "succeeded" else "worker_failed",
+        )
+        released_worker.update(
+            dispatchId="dispatch_1",
+            worktreeId=worktree_id,
+            agentTerminalHandle=None,
+            lastError=None if outcome == "succeeded" else "worker_failed",
+        )
+    else:
+        dispatch.update(
+            run_id="run_1",
+            task_id="task_1",
+            last_failure=None if outcome == "succeeded" else "worker_failed",
+        )
+        released_worker.update(
+            worktree_id=worktree_id,
+            agent_terminal_handle=None,
+            last_error=None if outcome == "succeeded" else "worker_failed",
+        )
     return [
         {
             "result": {
-                "dispatch": {
-                    "id": "dispatch_1",
-                    "run_id": "run_1",
-                    "task_id": "task_1",
-                    "status": native_status,
-                }
+                "dispatch": dispatch,
             }
         },
         {"result": {"tasks": [{"id": "task_1", "run_id": "run_1", "status": native_status}]}},
         mutation(
             "request_release",
             dispatchId="dispatch_1",
-            state="released",
+            state=release_state,
             processAction="closed",
             archive=None,
         ),
         {
             "result": {
-                "dispatch": {"id": "dispatch_1"},
+                "dispatch": dispatch,
+                "worker": released_worker,
                 "terminalResource": {
                     "id": "terminal-resource-1",
                     "ownershipState": "released",
@@ -357,7 +508,7 @@ def settlement_responses(outcome: str = "succeeded") -> list[Response]:
                     "originDispatchId": "dispatch_1",
                     "ownerDispatchId": "dispatch_1",
                     "terminalHandle": "term_worker",
-                    "worktreeId": "repo::fixture",
+                    "worktreeId": worktree_id,
                     "releaseRequestedAt": "2026-01-01T00:00:00Z",
                     "releaseCompletedAt": "2026-01-01T00:00:01Z",
                     "releaseError": None,
@@ -390,7 +541,7 @@ def completion_responses(root: Path, objective: str, outcome: str = "succeeded")
         _worker_start_with_preflight(root),
         _worker_start_readback(root),
         delivery,
-        *settlement_responses(outcome),
+        *settlement_responses(outcome, worktree_id=f"repo::{root.resolve()}"),
         mutation("request_ack", messages=[]),
     ]
 
@@ -612,17 +763,19 @@ class ControllerTests(unittest.TestCase):
                 dispatch_id="dispatch_1",
                 phase="waiting",
             )
+            _record_fixture_binding(store, run.local_id)
+            opaque_resource = {
+                "releaseState": "retained",
+                "detail": "not external_terminal; owned resource is still live",
+            }
             responses: list[Response] = [
                 mutation("request_release", dispatchId="dispatch_1", state="retained"),
-                {
-                    "result": {
-                        "dispatch": {"id": "dispatch_1"},
-                        "terminalResource": {
-                            "releaseState": "retained",
-                            "detail": "not external_terminal; owned resource is still live",
-                        },
-                    }
-                },
+                _release_worker_show(
+                    opaque_resource,
+                    run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id="dispatch_1",
+                ),
             ]
             with self.assertRaises(OrchestrateError) as caught:
                 _release_disposition(FakeClient(responses), store, run)  # type: ignore[arg-type]
@@ -653,11 +806,24 @@ class ControllerTests(unittest.TestCase):
                 "releaseError": None,
                 "archive": {"source": None, "status": None},
             }
+            _record_fixture_binding(
+                store,
+                run.local_id,
+                dispatch_id=dispatch_id,
+                resource_id="terminal-resource-takeover",
+                terminal_handle="term_exact",
+                worktree_id="worktree_exact",
+            )
             _release_disposition(
                 FakeClient(
                     [
                         mutation("request_release", dispatchId=dispatch_id, state="retained"),
-                        {"result": {"dispatch": {"id": dispatch_id}, "terminalResource": resource}},
+                        _release_worker_show(
+                            resource,
+                            run_id="run_takeover",
+                            task_id="task_takeover",
+                            dispatch_id=dispatch_id,
+                        ),
                     ]
                 ),
                 store,
@@ -665,7 +831,16 @@ class ControllerTests(unittest.TestCase):
             )  # type: ignore[arg-type]
             with self.assertRaises(OrchestrateError) as prompt_stall_hold:
                 _release_disposition(
-                    FakeClient([{"result": {"dispatch": {"id": dispatch_id}, "terminalResource": resource}}]),
+                    FakeClient(
+                        [
+                            _release_worker_show(
+                                resource,
+                                run_id="run_takeover",
+                                task_id="task_takeover",
+                                dispatch_id=dispatch_id,
+                            )
+                        ]
+                    ),
                     store,
                     run,
                     require_released=True,
@@ -691,18 +866,122 @@ class ControllerTests(unittest.TestCase):
                 "originDispatchId": dispatch_id,
                 "ownerDispatchId": dispatch_id,
             }
+            _record_fixture_binding(
+                store,
+                run.local_id,
+                dispatch_id=dispatch_id,
+                resource_id="terminal-resource-external",
+                terminal_handle="term_exact",
+                worktree_id="worktree_exact",
+            )
             with self.assertRaises(OrchestrateError) as caught:
                 _release_disposition(
                     FakeClient(
                         [
                             mutation("request_external", dispatchId=dispatch_id, state="retained"),
-                            {"result": {"dispatch": {"id": dispatch_id}, "terminalResource": external}},
+                            _release_worker_show(
+                                external,
+                                run_id="run_external",
+                                task_id="task_external",
+                                dispatch_id=dispatch_id,
+                            ),
                         ]
                     ),
                     store,
                     run,
                 )  # type: ignore[arg-type]
             self.assertEqual(caught.exception.code, "release_unconfirmed")
+
+    def test_release_readback_binds_all_resource_ids_for_both_orca_shapes(self) -> None:
+        for current_shape in (False, True):
+            for receipt_state in ("released", "already_released"):
+                with self.subTest(current_shape=current_shape, receipt_state=receipt_state):
+                    with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+                        run = store.create_run(
+                            objective=f"release-{current_shape}-{receipt_state}",
+                            profile_digest="p",
+                            source_digest="s",
+                        )
+                        run = store.update_run(
+                            run.local_id,
+                            native_run_id=f"run-{current_shape}-{receipt_state}",
+                            task_id=f"task-{current_shape}-{receipt_state}",
+                            dispatch_id=f"dispatch-{current_shape}-{receipt_state}",
+                            phase="launch_cleanup_pending",
+                        )
+                        dispatch_id = str(run.dispatch_id)
+                        resource = _released_resource(dispatch_id)
+                        _record_fixture_binding(store, run.local_id, dispatch_id=dispatch_id)
+                        _release_disposition(
+                            FakeClient(
+                                [
+                                    mutation(
+                                        f"request-{current_shape}-{receipt_state}",
+                                        dispatchId=dispatch_id,
+                                        state=receipt_state,
+                                    ),
+                                    _release_worker_show(
+                                        resource,
+                                        run_id=str(run.native_run_id),
+                                        task_id=str(run.task_id),
+                                        dispatch_id=dispatch_id,
+                                        status="failed",
+                                        current_shape=current_shape,
+                                    ),
+                                ]
+                            ),
+                            store,
+                            run,
+                            require_released=True,
+                        )  # type: ignore[arg-type]
+
+        for changed_field, changed_value in (
+            ("id", "terminal-resource-other"),
+            ("terminalHandle", "term_other"),
+            ("worktreeId", "worktree_other"),
+        ):
+            with self.subTest(changed_field=changed_field):
+                with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+                    run = store.create_run(
+                        objective=f"mismatch-{changed_field}",
+                        profile_digest="p",
+                        source_digest="s",
+                    )
+                    run = store.update_run(
+                        run.local_id,
+                        native_run_id=f"run-{changed_field}",
+                        task_id=f"task-{changed_field}",
+                        dispatch_id=f"dispatch-{changed_field}",
+                        phase="launch_cleanup_pending",
+                    )
+                    dispatch_id = str(run.dispatch_id)
+                    resource = _released_resource(dispatch_id)
+                    resource[changed_field] = changed_value
+                    _record_fixture_binding(store, run.local_id, dispatch_id=dispatch_id)
+                    with self.assertRaises(OrchestrateError) as caught:
+                        _release_disposition(
+                            FakeClient(
+                                [
+                                    mutation(
+                                        f"request-{changed_field}",
+                                        dispatchId=dispatch_id,
+                                        state="released",
+                                    ),
+                                    _release_worker_show(
+                                        resource,
+                                        run_id=str(run.native_run_id),
+                                        task_id=str(run.task_id),
+                                        dispatch_id=dispatch_id,
+                                        status="failed",
+                                        current_shape=True,
+                                    ),
+                                ]
+                            ),
+                            store,
+                            run,
+                            require_released=True,
+                        )  # type: ignore[arg-type]
+                    self.assertEqual(caught.exception.code, "release_unconfirmed")
 
     def test_question_delivery_remains_unacknowledged_then_answers_exactly(self) -> None:
         objective = "Ask when blocked"
@@ -847,6 +1126,7 @@ class ControllerTests(unittest.TestCase):
             }
             payload = {"result": {"deliveryId": "delivery_1", "messages": [message]}}
             store.journal_delivery(run.local_id, "delivery_1", payload, [message])
+            _record_fixture_binding(store, run.local_id)
             completed = _process_delivery(FakeClient(settlement_responses()), store, run, "delivery_1", [message])  # type: ignore[arg-type]
             replay_client = FakeClient([])
             replayed = _process_delivery(replay_client, store, completed, "delivery_1", [message])  # type: ignore[arg-type]
@@ -871,13 +1151,12 @@ class ControllerTests(unittest.TestCase):
             }
             delivery = {"result": {"deliveryId": "delivery_1", "messages": [message]}}
             store.journal_delivery(run.local_id, "delivery_1", delivery, [message])
+            _record_fixture_binding(store, run.local_id)
             first_responses = settlement_responses()
-            first_responses[-1] = {
-                "result": {
-                    "dispatch": {"id": "dispatch_1"},
-                    "terminalResource": {"releaseState": "release_pending"},
-                }
-            }
+            pending_readback = settlement_responses()[-1]
+            pending_readback["result"]["terminalResource"]["releaseState"] = "releasing"  # type: ignore[index]
+            pending_readback["result"]["terminalResource"]["releaseCompletedAt"] = None  # type: ignore[index]
+            first_responses[-1] = pending_readback
             with self.assertRaises(OrchestrateError) as initial:
                 _process_delivery(FakeClient(first_responses), store, run, "delivery_1", [message])  # type: ignore[arg-type]
             self.assertEqual(initial.exception.code, "release_unconfirmed")
@@ -935,6 +1214,7 @@ class ControllerTests(unittest.TestCase):
                 request_id="request_release",
                 response=mutation("request_release", dispatchId="dispatch_1", state="released"),
             )
+            _record_fixture_binding(store, run.local_id)
             local_id = run.local_id
         responses: list[Response] = [
             mutation("request_use", run={"id": "run_1"}),
@@ -1089,6 +1369,64 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(replay.exception.code, "worker_launch_mismatch")
             self.assertEqual(store.get_run(run.local_id).phase, "task_created")
 
+    def test_worker_start_exit_contract_is_enforced_for_fresh_and_recovery_callers(self) -> None:
+        objective = "Reject mismatched worker-start exit status"
+        ready_nonzero = OrcaJsonResponse(_worker_start(self.root), returncode=1)
+        with self.assertRaises(OrchestrateError) as fresh:
+            implement(
+                self.root,
+                objective,
+                client=FakeClient([*completion_responses(self.root, objective)[:4], ready_nonzero]),  # type: ignore[arg-type]
+                wait_timeout_ms=1,
+                require_context=False,
+            )
+        self.assertEqual(fresh.exception.code, "worker_start_exit_mismatch")
+
+        arguments = [
+            "orchestration",
+            "worker-start",
+            "--run",
+            "run_1",
+            "--task",
+            "task_1",
+            "--worktree",
+            f"path:{self.root.resolve()}",
+            "--agent",
+            "codex",
+            "--model",
+            "gpt-5.6-sol",
+            "--effort",
+            "high",
+        ]
+        for state, returncode in (("ready", 1), ("failed", 37)):
+            with self.subTest(state=state, returncode=returncode):
+                with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+                    run = store.create_run(
+                        objective=f"recover-{state}-{returncode}",
+                        profile_digest="p",
+                        source_digest="s",
+                    )
+                    run = store.update_run(
+                        run.local_id,
+                        native_run_id=f"run-{state}-{returncode}",
+                        task_id="task_1",
+                        phase="task_created",
+                    )
+                    response = _worker_start(self.root) if state == "ready" else _prompt_stall_start(self.root)
+                    response["result"]["runId"] = str(run.native_run_id)  # type: ignore[index]
+                    intention = store.prepare_intention(run.local_id, "worker-start", arguments)
+                    store.mark_intention(
+                        intention,
+                        "receipt_confirmed",
+                        request_id="request_worker",
+                        returncode=returncode,
+                        response=response,
+                    )
+                    with self.assertRaises(OrchestrateError) as recovered:
+                        reconcile_intentions(FakeClient([]), store, run)  # type: ignore[arg-type]
+                    self.assertEqual(recovered.exception.code, "worker_start_exit_mismatch")
+                    self.assertEqual(store.get_run(run.local_id).phase, "task_created")
+
     def test_prompt_stall_binds_failed_dispatch_and_releases_terminal_before_return(self) -> None:
         objective = "Contain a stalled prompt"
         responses = completion_responses(self.root, objective)[:4]
@@ -1136,6 +1474,121 @@ class ControllerTests(unittest.TestCase):
             }
             self.assertEqual(statuses["worker-start"], "applied")
             self.assertEqual(statuses["worker-release"], "applied")
+
+    def test_release_pending_restart_converges_by_exact_readback_without_release_replay(self) -> None:
+        objective = "Recover a pending prompt-stall release"
+        pending_readback = _prompt_stall_readback(self.root, current_shape=True)
+        pending_resource = pending_readback["result"]["terminalResource"]  # type: ignore[index]
+        pending_resource.update(  # type: ignore[union-attr]
+            releaseState="releasing",
+            releaseRequestedAt="2026-01-01T00:00:00Z",
+            releaseCompletedAt=None,
+            releaseError=None,
+            archive={"source": "transcript", "status": "captured"},
+        )
+        recovery_text = (
+            "The owning endpoint is temporarily unavailable; recovery will retry this release "
+            "after reconnect without another coordinator decision."
+        )
+        first_responses = completion_responses(self.root, objective)[:4]
+        first_responses.extend(
+            [
+                _prompt_stall_start(self.root),
+                _prompt_stall_readback(self.root, current_shape=True),
+                mutation(
+                    "request_release_pending",
+                    dispatchId="dispatch_1",
+                    state="release_pending",
+                    processAction="none",
+                    archive={"source": "transcript", "status": "captured"},
+                    lastError="endpoint unavailable",
+                    recovery=recovery_text,
+                ),
+                pending_readback,
+            ]
+        )
+        with self.assertRaises(OrchestrateError) as initial:
+            implement(
+                self.root,
+                objective,
+                client=FakeClient(first_responses),  # type: ignore[arg-type]
+                wait_timeout_ms=1,
+                require_context=False,
+            )
+        self.assertEqual(initial.exception.code, "release_pending")
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            pending_run = store.select_run(None)
+            self.assertEqual(pending_run.phase, "launch_cleanup_pending")
+            stored_release = store.connection.execute(
+                "SELECT response_json FROM intentions WHERE run_local_id = ? AND operation = 'worker-release'",
+                (pending_run.local_id,),
+            ).fetchone()
+            self.assertEqual(
+                json.loads(stored_release["response_json"])["result"]["recovery"],
+                recovery_text,
+            )
+            local_id = pending_run.local_id
+
+        still_pending_client = FakeClient(
+            [
+                mutation("request_use_still_pending", run={"id": "run_1"}),
+                {"result": {"run": {"id": "run_1"}}},
+                {"result": {"run": {"id": "run_1", "objective": objective}}},
+                pending_readback,
+            ]
+        )
+        with self.assertRaises(OrchestrateError) as still_pending:
+            resume(
+                self.root,
+                local_id,
+                client=still_pending_client,  # type: ignore[arg-type]
+                wait_timeout_ms=1,
+                require_context=False,
+            )
+        self.assertEqual(still_pending.exception.code, "release_pending")
+        self.assertFalse(
+            any(call[:2] == ("orchestration", "worker-start") for call in still_pending_client.calls)
+        )
+        self.assertFalse(
+            any(call[:2] == ("orchestration", "worker-release") for call in still_pending_client.calls)
+        )
+        self.assertFalse(any(call[:2] == ("terminal", "close") for call in still_pending_client.calls))
+        self.assertEqual(
+            sum(call[:2] == ("orchestration", "worker-show") for call in still_pending_client.calls),
+            1,
+        )
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            self.assertEqual(store.get_run(local_id).phase, "launch_cleanup_pending")
+
+        recovery_client = FakeClient(
+            [
+                mutation("request_use", run={"id": "run_1"}),
+                {"result": {"run": {"id": "run_1"}}},
+                {"result": {"run": {"id": "run_1", "objective": objective}}},
+                _released_prompt_stall_readback(self.root, current_shape=True),
+            ]
+        )
+        report = resume(
+            self.root,
+            local_id,
+            client=recovery_client,  # type: ignore[arg-type]
+            wait_timeout_ms=1,
+            require_context=False,
+        )
+        self.assertEqual(report["status"], "worker_failed")
+        self.assertEqual(report["workerOutcome"], "failed")
+        self.assertEqual(report["verification"], "not_run")
+        self.assertFalse(any(call[:2] == ("orchestration", "worker-start") for call in recovery_client.calls))
+        self.assertFalse(any(call[:2] == ("orchestration", "worker-release") for call in recovery_client.calls))
+        self.assertFalse(any(call[:2] == ("terminal", "close") for call in recovery_client.calls))
+        self.assertEqual(
+            sum(call[:2] == ("orchestration", "worker-show") for call in recovery_client.calls),
+            1,
+        )
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            recovered = store.get_run(local_id)
+            self.assertEqual(recovered.phase, "worker_failed")
+            self.assertEqual(recovered.verification_status, "not_run")
 
     def test_resume_recovers_fea_prompt_stall_receipt_without_replaying_worker_start(self) -> None:
         objective = "Recover the stored failed start"
@@ -1247,7 +1700,7 @@ class ControllerTests(unittest.TestCase):
             {"result": {"run": {"id": "run_1"}}},
             {"result": {"run": {"id": "run_1", "objective": objective}}},
             completion_responses(self.root, objective)[6],
-            *settlement_responses(),
+            *settlement_responses(worktree_id=f"repo::{self.root.resolve()}"),
             mutation("request_ack", messages=[]),
         ]
         final = resume(

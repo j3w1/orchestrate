@@ -151,6 +151,14 @@ class OrcaCommandError(RuntimeError):
         return "orca_command_failed"
 
 
+class OrcaJsonResponse(dict[str, Any]):
+    """One decoded response retaining the subprocess status for semantic validation."""
+
+    def __init__(self, payload: Mapping[str, Any], *, returncode: int) -> None:
+        super().__init__(payload)
+        self.returncode = returncode
+
+
 class OrcaClient:
     """Invoke one resolved Orca executable with argument arrays and split streams."""
 
@@ -216,8 +224,8 @@ class OrcaClient:
         self,
         *arguments: str,
         timeout_seconds: float | None = None,
-        allow_nonzero_ok: bool = False,
-    ) -> JsonObject:
+        allow_worker_start_nonzero: bool = False,
+    ) -> OrcaJsonResponse:
         argv = (*self.command, *arguments)
         try:
             completed = self._runner(
@@ -287,10 +295,19 @@ class OrcaClient:
             message = error.get("message") if isinstance(error, dict) else None
             detail = message or stderr.strip() or "Orca response did not prove ok=true"
             raise OrcaCommandError(detail, result)
-        if completed.returncode != 0 and not allow_nonzero_ok:
-            raise OrcaCommandError(
-                stderr.strip()
-                or f"Orca command exited with {completed.returncode} after returning an ok=true result",
-                result,
+        if completed.returncode != 0:
+            response_result = decoded.get("result")
+            documented_worker_start_failure = (
+                allow_worker_start_nonzero
+                and arguments[:2] == ("orchestration", "worker-start")
+                and completed.returncode == 1
+                and isinstance(response_result, Mapping)
+                and response_result.get("state") in {"failed", "outcome_unknown"}
             )
-        return decoded
+            if not documented_worker_start_failure:
+                raise OrcaCommandError(
+                    stderr.strip()
+                    or f"Orca command exited with {completed.returncode} after returning an ok=true result",
+                    result,
+                )
+        return OrcaJsonResponse(decoded, returncode=completed.returncode)
