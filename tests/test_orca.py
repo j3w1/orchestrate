@@ -5,6 +5,7 @@ import subprocess
 import unittest
 
 from orchestrate.orca import OrcaClient, OrcaCommandError, orca_task_title, resolve_orca_command
+from orchestrate.orca_compat import WorkerShowShapeError, worker_show_identity
 
 
 class ResolveCommandTests(unittest.TestCase):
@@ -96,6 +97,48 @@ class ClientTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(OrcaCommandError, "ok=true"):
                     OrcaClient(("orca",), runner=runner).run_json("status", "--json")
+
+    def test_nonzero_ok_receipt_requires_explicit_command_specific_opt_in(self) -> None:
+        response = {
+            "ok": True,
+            "result": {
+                "state": "failed",
+                "stage": "dispatch_input",
+                "lastError": "agent_prompt_stalled",
+            },
+        }
+
+        def runner(argv: tuple[str, ...], **_: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(argv, 1, json.dumps(response), "")
+
+        client = OrcaClient(("orca",), runner=runner)
+        with self.assertRaisesRegex(OrcaCommandError, "exited with 1"):
+            client.run_json("orchestration", "worker-start", "--json")
+        self.assertEqual(
+            client.run_json(
+                "orchestration",
+                "worker-start",
+                "--json",
+                allow_nonzero_ok=True,
+            ),
+            response,
+        )
+
+    def test_worker_show_compatibility_rejects_mixed_version_identity(self) -> None:
+        dispatch = {
+            "id": "dispatch_1",
+            "runId": "run_1",
+            "taskId": "task_1",
+            "task_id": "task_1",
+        }
+        mixed_worker = {
+            "dispatchId": "dispatch_1",
+            "worktree_id": "worktree_1",
+            "agentTerminalHandle": "term_1",
+            "lastError": None,
+        }
+        with self.assertRaisesRegex(WorkerShowShapeError, "mixed or incomplete"):
+            worker_show_identity(dispatch, mixed_worker)
 
 
 if __name__ == "__main__":

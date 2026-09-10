@@ -15,6 +15,7 @@ from .admission import joined_preflight_status, validate_packet_sources
 from .errors import OrchestrateError
 from .identity import ControllerIdentity, require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError, orca_task_title
+from .orca_compat import WorkerShowShapeError, worker_show_dispatch_identity, worker_show_identity
 from .packets import canonical_packet_json, make_packet, packet_spec_from_json
 from .profile import ProjectProfile
 from .readers import read_project
@@ -24,6 +25,9 @@ from .state import RunRecord, StateStore
 
 REPORT_SCHEMA = "orchestrate-report/v1"
 TERMINAL_PHASES = {"worker_succeeded", "worker_failed", "worker_unadmitted", "blocked", "completed"}
+PROMPT_STALL_ERROR = "agent_prompt_stalled"
+PROMPT_STALL_STAGE = "dispatch_input"
+PROMPT_STALL_CLEANUP_PHASE = "launch_cleanup_pending"
 
 
 def _result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -141,14 +145,27 @@ def _apply_intention(store: StateStore, run: RunRecord, operation: str, response
             fields["phase"] = "task_created"
         return store.update_run(run.local_id, **fields)
     if operation == "worker-start":
-        identity = _result(response).get("dispatchId")
+        result = _result(response)
+        identity = result.get("dispatchId")
         if not isinstance(identity, str):
             raise OrchestrateError("worker-start response omitted dispatchId", code="orca_contract_error")
         if run.dispatch_id not in {None, identity}:
             raise OrchestrateError("Dispatch receipt conflicts with the local binding", code="intention_binding_mismatch")
         fields = {"dispatch_id": identity}
         if run.phase == "task_created":
-            fields["phase"] = "awaiting_preflight"
+            if result.get("state") == "ready":
+                fields["phase"] = "awaiting_preflight"
+            elif _is_prompt_stall_result(result):
+                fields.update(
+                    phase=PROMPT_STALL_CLEANUP_PHASE,
+                    worker_outcome="failed",
+                    verification_status="not_run",
+                )
+            else:
+                raise OrchestrateError(
+                    "worker-start response has no supported local state transition",
+                    code="orca_contract_error",
+                )
         return store.update_run(run.local_id, **fields)
     return store.get_run(run.local_id)
 
@@ -225,19 +242,41 @@ def _reconcile_confirmed_worker_start(
     arguments: list[object],
     response: Mapping[str, Any],
     request_id: str,
+    expected_worktree_id: str | None = None,
 ) -> RunRecord:
     agent = _stored_argument(arguments, "--agent")
     model = _stored_argument(arguments, "--model")
     effort = _stored_argument(arguments, "--effort")
     worktree_selector = _stored_argument(arguments, "--worktree")
-    worktree_id, terminal_id = _validate_worker_start(
-        response,
-        run=run,
-        worktree_id=None,
-        agent=agent,
-        model=model,
-        effort=effort,
-    )
+    result = _result(response)
+    if _is_prompt_stall_result(result):
+        worktree_id, terminal_id = _validate_prompt_stall_start(
+            response,
+            run=run,
+            worktree_id=expected_worktree_id,
+            agent=agent,
+            model=model,
+            effort=effort,
+        )
+    elif result.get("state") == "ready":
+        worktree_id, terminal_id = _validate_worker_start(
+            response,
+            run=run,
+            worktree_id=expected_worktree_id,
+            agent=agent,
+            model=model,
+            effort=effort,
+        )
+    else:
+        raise OrchestrateError(
+            "worker-start produced a non-ready outcome without a bounded reconciliation contract",
+            code="unknown_external_effect",
+            data={
+                "dispatchId": result.get("dispatchId"),
+                "state": result.get("state"),
+                "stage": result.get("stage"),
+            },
+        )
     dispatch_id = _result(response)["dispatchId"]
     readback = client.run_json(
         "orchestration",
@@ -246,17 +285,30 @@ def _reconcile_confirmed_worker_start(
         str(dispatch_id),
         "--json",
     )
-    _validate_worker_start_readback(
-        readback,
-        run=run,
-        dispatch_id=dispatch_id,
-        worktree_id=worktree_id,
-        worktree_selector=worktree_selector,
-        terminal_id=terminal_id,
-        agent=agent,
-        model=model,
-        effort=effort,
-    )
+    if _is_prompt_stall_result(result):
+        _validate_prompt_stall_readback(
+            readback,
+            run=run,
+            dispatch_id=dispatch_id,
+            worktree_id=worktree_id,
+            worktree_selector=worktree_selector,
+            terminal_id=terminal_id,
+            agent=agent,
+            model=model,
+            effort=effort,
+        )
+    else:
+        _validate_worker_start_readback(
+            readback,
+            run=run,
+            dispatch_id=dispatch_id,
+            worktree_id=worktree_id,
+            worktree_selector=worktree_selector,
+            terminal_id=terminal_id,
+            agent=agent,
+            model=model,
+            effort=effort,
+        )
     store.mark_intention(
         intention_id,
         "applied",
@@ -266,9 +318,58 @@ def _reconcile_confirmed_worker_start(
     return _apply_intention(store, run, "worker-start", response)
 
 
+def _stored_prompt_stall_receipt(row: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Recover fea035d's misclassified nonzero ok=true worker-start receipt."""
+
+    if row["operation"] != "worker-start" or row["status"] not in {"invoking", "uncertain"}:
+        return None
+    encoded = row["error_json"]
+    if not isinstance(encoded, str):
+        return None
+    try:
+        payload = json.loads(encoded)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping) or payload.get("ok") is not True:
+        return None
+    try:
+        result = _result(payload)
+        request_id = _mutation_request_id(payload)
+    except OrchestrateError:
+        return None
+    if not _is_prompt_stall_result(result):
+        return None
+    stored_request_id = row["request_id"]
+    if stored_request_id not in {None, request_id}:
+        raise OrchestrateError(
+            "Stored worker-start failure conflicts with its native mutation receipt",
+            code="intention_binding_mismatch",
+        )
+    return payload
+
+
 def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) -> RunRecord:
     current = _replay_applied_intentions(store, run)
     for row in store.unsettled_intentions(run.local_id):
+        stored_prompt_stall = _stored_prompt_stall_receipt(row)
+        if stored_prompt_stall is not None:
+            request_id = _mutation_request_id(stored_prompt_stall)
+            store.mark_intention(
+                row["id"],
+                "receipt_confirmed",
+                request_id=request_id,
+                response=stored_prompt_stall,
+            )
+            current = _reconcile_confirmed_worker_start(
+                client,
+                store,
+                current,
+                intention_id=row["id"],
+                arguments=json.loads(row["arguments_json"]),
+                response=stored_prompt_stall,
+                request_id=request_id,
+            )
+            continue
         if row["status"] == "receipt_confirmed":
             if row["operation"] != "worker-start" or not row["response_json"]:
                 raise OrchestrateError(
@@ -292,7 +393,11 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
             arguments = json.loads(row["arguments_json"])
             store.mark_intention(row["id"], "invoking")
             try:
-                replay = client.run_json(*arguments, "--json")
+                replay = client.run_json(
+                    *arguments,
+                    "--json",
+                    allow_nonzero_ok=row["operation"] == "worker-start",
+                )
             except OrcaCommandError as exc:
                 payload = exc.result.payload if exc.result is not None else None
                 store.mark_intention(
@@ -379,7 +484,13 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                 f"Unrecognized request recovery state: {state}",
                 code="orca_contract_error",
             )
-        replay = client.run_json(*arguments, "--retry-request", request_id, "--json")
+        replay = client.run_json(
+            *arguments,
+            "--retry-request",
+            request_id,
+            "--json",
+            allow_nonzero_ok=row["operation"] == "worker-start",
+        )
         _mutation_request_id(replay, expected=request_id)
         if row["operation"] == "worker-start":
             store.mark_intention(
@@ -417,6 +528,8 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
         next_obligation = "worker claim is preserved but cannot satisfy verification without joined admission"
     elif run.phase == "worker_failed":
         next_obligation = "inspect the failed attempt before an explicit retry decision"
+    elif run.phase == PROMPT_STALL_CLEANUP_PHASE:
+        next_obligation = "reconcile and release the exact failed worker terminal before any retry"
     else:
         next_obligation = "continue the deterministic Run state machine"
     return {
@@ -602,6 +715,15 @@ def _effect(
     return matching[0]
 
 
+def _is_prompt_stall_result(result: Mapping[str, Any]) -> bool:
+    return (
+        result.get("state") == "failed"
+        and result.get("stage") == PROMPT_STALL_STAGE
+        and result.get("failedStage") == PROMPT_STALL_STAGE
+        and result.get("lastError") == PROMPT_STALL_ERROR
+    )
+
+
 def _validate_residual_resources(
     resources: object,
     *,
@@ -675,6 +797,73 @@ def _validate_worker_start(
     return actual_worktree_id, terminal_id
 
 
+def _validate_prompt_stall_start(
+    payload: Mapping[str, Any],
+    *,
+    run: RunRecord,
+    worktree_id: str | None,
+    agent: str,
+    model: str,
+    effort: str,
+) -> tuple[str, str]:
+    """Validate Orca 1.4.198's exact failed-after-injection-attempt receipt."""
+
+    result = _result(payload)
+    if (
+        result.get("runId") != run.native_run_id
+        or result.get("taskId") != run.task_id
+        or not isinstance(result.get("dispatchId"), str)
+        or not _is_prompt_stall_result(result)
+        or not isinstance(result.get("setup"), Mapping)
+        or result["setup"].get("state") != "not_applicable"
+    ):
+        raise OrchestrateError(
+            "worker-start did not prove the exact failed prompt-stall attempt",
+            code="orca_contract_error",
+        )
+    launch = result.get("launch")
+    expected_launch = {"agent": agent, "model": model, "effort": effort}
+    if (
+        not isinstance(launch, Mapping)
+        or launch.get("requested") != expected_launch
+        or launch.get("effective") != expected_launch
+    ):
+        raise OrchestrateError("failed worker-start substituted the requested launch", code="worker_launch_mismatch")
+    effects = result.get("effects")
+    if not isinstance(effects, list) or len(effects) != 3:
+        raise OrchestrateError("failed worker-start omitted its exact effects", code="orca_contract_error")
+    worktree = _effect(effects, kind="worktree")
+    actual_worktree_id = worktree.get("id")
+    if (
+        worktree.get("action") != "reused"
+        or not isinstance(actual_worktree_id, str)
+        or (worktree_id is not None and actual_worktree_id != worktree_id)
+    ):
+        raise OrchestrateError("failed worker-start used a different workspace", code="worker_workspace_mismatch")
+    setup = _effect(effects, kind="setup")
+    if setup.get("action") != "not_applicable" or setup.get("state") != "not_applicable":
+        raise OrchestrateError("failed worker-start attempted unexpected setup", code="worker_workspace_mismatch")
+    terminal = _effect(effects, kind="terminal", role="agent")
+    terminal_id = terminal.get("id")
+    if terminal.get("action") != "created" or not isinstance(terminal_id, str):
+        raise OrchestrateError("failed worker-start did not identify its created terminal", code="orca_contract_error")
+    resources = result.get("residualResources")
+    if (
+        not isinstance(resources, list)
+        or len(resources) != 1
+        or not isinstance(resources[0], Mapping)
+        or resources[0].get("kind") != "terminal"
+        or resources[0].get("role") != "agent"
+        or resources[0].get("action") != "created"
+        or resources[0].get("id") != terminal_id
+    ):
+        raise OrchestrateError(
+            "failed worker-start did not preserve one exact releasable terminal",
+            code="orca_contract_error",
+        )
+    return actual_worktree_id, terminal_id
+
+
 def _validate_worker_start_readback(
     payload: Mapping[str, Any],
     *,
@@ -690,17 +879,22 @@ def _validate_worker_start_readback(
     result = _result(payload)
     dispatch = result.get("dispatch")
     worker = result.get("worker")
+    if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping):
+        raise OrchestrateError("worker-show omitted the accepted worker identity", code="orca_contract_error")
+    try:
+        identity = worker_show_identity(dispatch, worker)
+    except WorkerShowShapeError as exc:
+        raise OrchestrateError(str(exc), code="orca_contract_error") from exc
     if (
-        not isinstance(dispatch, Mapping)
-        or dispatch.get("id") != dispatch_id
-        or dispatch.get("run_id") != run.native_run_id
-        or dispatch.get("task_id") != run.task_id
+        dispatch.get("id") != dispatch_id
+        or identity.dispatch.run_id != run.native_run_id
+        or identity.dispatch.task_id != run.task_id
         or dispatch.get("status") != "dispatched"
-        or not isinstance(worker, Mapping)
         or worker.get("state") != "ready"
         or worker.get("stage") != "input_accepted"
-        or worker.get("worktree_id") != worktree_id
-        or worker.get("agent_terminal_handle") != terminal_id
+        or identity.dispatch_id != dispatch_id
+        or identity.worktree_id != worktree_id
+        or identity.terminal_handle != terminal_id
     ):
         raise OrchestrateError("worker-show did not confirm the exact accepted worker", code="orca_contract_error")
     options = worker.get("startOptions")
@@ -723,6 +917,86 @@ def _validate_worker_start_readback(
         worktree_id=worktree_id,
         terminal_id=terminal_id,
     )
+
+
+def _validate_prompt_stall_readback(
+    payload: Mapping[str, Any],
+    *,
+    run: RunRecord,
+    dispatch_id: str,
+    worktree_id: str,
+    worktree_selector: str,
+    terminal_id: str,
+    agent: str,
+    model: str,
+    effort: str,
+) -> None:
+    result = _result(payload)
+    dispatch = result.get("dispatch")
+    worker = result.get("worker")
+    if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping):
+        raise OrchestrateError("worker-show omitted the failed worker identity", code="orca_contract_error")
+    try:
+        identity = worker_show_identity(dispatch, worker)
+    except WorkerShowShapeError as exc:
+        raise OrchestrateError(str(exc), code="orca_contract_error") from exc
+    if (
+        dispatch.get("id") != dispatch_id
+        or identity.dispatch.run_id != run.native_run_id
+        or identity.dispatch.task_id != run.task_id
+        or dispatch.get("status") != "failed"
+        or identity.dispatch.last_failure != PROMPT_STALL_ERROR
+        or worker.get("state") != "failed"
+        or worker.get("stage") != PROMPT_STALL_STAGE
+        or identity.last_error != PROMPT_STALL_ERROR
+        or identity.dispatch_id != dispatch_id
+        or identity.worktree_id != worktree_id
+        or identity.terminal_handle != terminal_id
+    ):
+        raise OrchestrateError(
+            "worker-show did not confirm the exact failed prompt-stall worker",
+            code="orca_contract_error",
+        )
+    options = worker.get("startOptions")
+    expected_launch = {"agent": agent, "model": model, "effort": effort}
+    if (
+        not isinstance(options, Mapping)
+        or options.get("worktree") != worktree_selector
+        or options.get("resolvedWorktreeId") != worktree_id
+        or options.get("terminal") is not None
+        or options.get("agent") != agent
+        or options.get("setup") != "not_applicable"
+        or options.get("setupSource") != "existing_worktree"
+        or not isinstance(options.get("launch"), Mapping)
+        or options["launch"].get("requested") != expected_launch
+        or options["launch"].get("effective") != expected_launch
+    ):
+        raise OrchestrateError(
+            "worker-show failed-start launch readback does not match the request",
+            code="worker_launch_mismatch",
+        )
+    resources = worker.get("residualResources")
+    if (
+        not isinstance(resources, list)
+        or len(resources) != 1
+        or not isinstance(resources[0], Mapping)
+        or resources[0].get("kind") != "terminal"
+        or resources[0].get("id") != terminal_id
+    ):
+        raise OrchestrateError("worker-show lost the failed worker terminal identity", code="orca_contract_error")
+    terminal_resource = result.get("terminalResource")
+    if (
+        not isinstance(terminal_resource, Mapping)
+        or not isinstance(terminal_resource.get("id"), str)
+        or terminal_resource.get("originDispatchId") != dispatch_id
+        or terminal_resource.get("ownerDispatchId") != dispatch_id
+        or terminal_resource.get("terminalHandle") != terminal_id
+        or terminal_resource.get("worktreeId") != worktree_id
+    ):
+        raise OrchestrateError(
+            "worker-show did not bind the failed Dispatch to its exact terminal resource",
+            code="orca_contract_error",
+        )
 
 
 def _start_worker(
@@ -757,7 +1031,12 @@ def _start_worker(
     intention_id = store.prepare_intention(run.local_id, "worker-start", arguments)
     store.mark_intention(intention_id, "invoking")
     try:
-        response = client.run_json(*arguments, "--json", timeout_seconds=90)
+        response = client.run_json(
+            *arguments,
+            "--json",
+            timeout_seconds=90,
+            allow_nonzero_ok=True,
+        )
     except OrcaCommandError as exc:
         payload = exc.result.payload if exc.result is not None else None
         store.mark_intention(
@@ -791,29 +1070,17 @@ def _start_worker(
         request_id=request_id,
         response=response,
     )
-    exact_worktree_id, terminal_id = _validate_worker_start(
-        response,
-        run=run,
-        worktree_id=worktree_id,
-        agent=launch["agent"],
-        model=launch["model"],
-        effort=launch["effort"],
+    current = _reconcile_confirmed_worker_start(
+        client,
+        store,
+        run,
+        intention_id=intention_id,
+        arguments=arguments,
+        response=response,
+        request_id=request_id,
+        expected_worktree_id=worktree_id,
     )
-    dispatch_id = _result(response)["dispatchId"]
-    readback = client.run_json("orchestration", "worker-show", "--dispatch", str(dispatch_id), "--json")
-    _validate_worker_start_readback(
-        readback,
-        run=run,
-        dispatch_id=dispatch_id,
-        worktree_id=exact_worktree_id,
-        worktree_selector=arguments[arguments.index("--worktree") + 1],
-        terminal_id=terminal_id,
-        agent=launch["agent"],
-        model=launch["model"],
-        effort=launch["effort"],
-    )
-    store.mark_intention(intention_id, "applied", request_id=request_id, response=response)
-    return _apply_intention(store, run, "worker-start", response)
+    return _finish_prompt_stall_cleanup(client, store, current)
 
 
 def _delivery(payload: Mapping[str, Any]) -> tuple[str | None, list[dict[str, Any]]]:
@@ -840,11 +1107,17 @@ def _validate_native_settlement(client: OrcaClient, run: RunRecord, outcome: str
     dispatch = _result(worker).get("dispatch")
     task_rows = _result(tasks).get("tasks")
     expected = "completed" if outcome == "succeeded" else "failed"
-    if not isinstance(dispatch, Mapping) or any(
+    if not isinstance(dispatch, Mapping):
+        raise OrchestrateError("worker_done settlement omitted its native Dispatch", code="settlement_mismatch")
+    try:
+        identity = worker_show_dispatch_identity(dispatch)
+    except WorkerShowShapeError as exc:
+        raise OrchestrateError(str(exc), code="settlement_mismatch") from exc
+    if any(
         (
             dispatch.get("id") != run.dispatch_id,
-            dispatch.get("task_id") != run.task_id,
-            dispatch.get("run_id") != run.native_run_id,
+            identity.task_id != run.task_id,
+            identity.run_id != run.native_run_id,
             dispatch.get("status") != expected,
         )
     ):
@@ -854,7 +1127,13 @@ def _validate_native_settlement(client: OrcaClient, run: RunRecord, outcome: str
         raise OrchestrateError("worker_done does not match native Task settlement", code="settlement_mismatch")
 
 
-def _release_disposition(client: OrcaClient, store: StateStore, run: RunRecord) -> None:
+def _release_disposition(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    *,
+    require_released: bool = False,
+) -> None:
     rows = store.connection.execute(
         """SELECT arguments_json, response_json FROM intentions
            WHERE run_local_id = ? AND operation = 'worker-release' AND status = 'applied'""",
@@ -885,7 +1164,7 @@ def _release_disposition(client: OrcaClient, store: StateStore, run: RunRecord) 
     release_result = _result(release_response)
     if (
         release_result.get("dispatchId") != run.dispatch_id
-        or release_result.get("state") not in {"released", "retained"}
+        or release_result.get("state") not in {"released", "already_released", "retained"}
     ):
         raise OrchestrateError("Worker release receipt does not bind the exact Dispatch", code="release_unconfirmed")
     worker = client.run_json("orchestration", "worker-show", "--dispatch", str(run.dispatch_id), "--json")
@@ -911,7 +1190,7 @@ def _release_disposition(client: OrcaClient, store: StateStore, run: RunRecord) 
     )
     if (
         exact_owner
-        and release_result.get("state") == "released"
+        and release_result.get("state") in {"released", "already_released"}
         and ownership == "released"
         and state == "released"
         and reason is None
@@ -922,7 +1201,8 @@ def _release_disposition(client: OrcaClient, store: StateStore, run: RunRecord) 
     ):
         return
     if (
-        exact_owner
+        not require_released
+        and exact_owner
         and release_result.get("state") == "retained"
         and ownership == "user_owned"
         and state == "retained"
@@ -937,6 +1217,18 @@ def _release_disposition(client: OrcaClient, store: StateStore, run: RunRecord) 
         "Worker terminal release is not in a confirmed terminal disposition",
         code="release_unconfirmed",
         data={"terminalResource": dict(resource)},
+    )
+
+
+def _finish_prompt_stall_cleanup(client: OrcaClient, store: StateStore, run: RunRecord) -> RunRecord:
+    if run.phase != PROMPT_STALL_CLEANUP_PHASE:
+        return run
+    _release_disposition(client, store, run, require_released=True)
+    return store.update_run(
+        run.local_id,
+        phase="worker_failed",
+        worker_outcome="failed",
+        verification_status="not_run",
     )
 
 
@@ -1191,6 +1483,7 @@ def resume(
                 validate_packet_sources(profile, run, _ensure_packet(store, run, profile))
             run = reconcile_intentions(client, store, run)
             run = _bind_native_run(client, store, run, identity)
+            run = _finish_prompt_stall_cleanup(client, store, run)
             if run.phase in {"preparing", "run_created", "task_created"}:
                 _require_profile_selection(profile)
                 reader = read_project(profile, run.objective)

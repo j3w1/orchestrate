@@ -113,13 +113,37 @@ class DoctorTests(unittest.TestCase):
         )
         return create_run_probe(client, project=self.root)  # type: ignore[arg-type]
 
-    def worker_responses(self, objective: str, messages: list[Any], *, outcome: str = "succeeded") -> list[dict[str, Any]]:
+    def worker_responses(
+        self,
+        objective: str,
+        messages: list[Any],
+        *,
+        outcome: str = "succeeded",
+        current_worker_shape: bool = False,
+    ) -> list[dict[str, Any]]:
         native = "completed" if outcome == "succeeded" else "failed"
         launch = {
             "requested": {"agent": "codex", "model": None, "effort": None},
             "effective": {"agent": "codex", "model": None, "effort": None},
         }
         terminal_effect = {"kind": "terminal", "role": "agent", "action": "created", "id": "term_probe"}
+        settled_dispatch = (
+            {
+                "id": "dispatch_probe",
+                "runId": "run_probe",
+                "taskId": "task_probe",
+                "task_id": "task_probe",
+                "status": native,
+                "lastFailure": None,
+            }
+            if current_worker_shape
+            else {
+                "id": "dispatch_probe",
+                "run_id": "run_probe",
+                "task_id": "task_probe",
+                "status": native,
+            }
+        )
         return [
             *self.caller_responses("run_probe"),
             {"ok": True, "result": {"run": {"id": "run_probe", "objective": objective}}},
@@ -163,12 +187,7 @@ class DoctorTests(unittest.TestCase):
             {
                 "ok": True,
                 "result": {
-                    "dispatch": {
-                        "id": "dispatch_probe",
-                        "run_id": "run_probe",
-                        "task_id": "task_probe",
-                        "status": native,
-                    }
+                    "dispatch": settled_dispatch,
                 },
             },
             {
@@ -283,7 +302,13 @@ class DoctorTests(unittest.TestCase):
     def test_worker_probe_releases_before_acknowledging(self) -> None:
         minted = self.mint_probe()
         receipt = json.loads((Path(self.state_temp.name) / "probes" / f"{minted['probeToken']}.json").read_text())
-        client = FakeClient(self.worker_responses(receipt["objective"], [self.done_message()]))
+        client = FakeClient(
+            self.worker_responses(
+                receipt["objective"],
+                [self.done_message()],
+                current_worker_shape=True,
+            )
+        )
         report = run_worker_probe(client, minted["probeToken"], project=self.root, wait_timeout_ms=10)  # type: ignore[arg-type]
         self.assertEqual(report["status"], "pass")
         release_index = next(i for i, call in enumerate(client.calls) if "worker-release" in call)

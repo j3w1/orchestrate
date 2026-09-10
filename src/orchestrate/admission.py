@@ -13,6 +13,7 @@ from typing import Any
 
 from .errors import OrchestrateError
 from .orca import JsonObject, OrcaClient, OrcaCommandError
+from .orca_compat import WorkerShowShapeError, worker_show_identity
 from .packets import (
     PACKET_SCHEMA,
     PREFLIGHT_SCHEMA,
@@ -280,17 +281,22 @@ def _native_identity(
         raise OrchestrateError("Worker preflight is in a different workspace", code="worker_workspace_mismatch")
     options = worker.get("startOptions") if isinstance(worker, Mapping) else None
     option_launch = options.get("launch") if isinstance(options, Mapping) else None
+    if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping):
+        raise OrchestrateError("worker-show omitted the preflight worker identity", code="preflight_identity_conflict")
+    try:
+        worker_identity = worker_show_identity(dispatch, worker)
+    except WorkerShowShapeError as exc:
+        raise OrchestrateError(str(exc), code="preflight_identity_conflict") from exc
     if (
-        not isinstance(dispatch, Mapping)
-        or dispatch.get("id") != dispatch_id
-        or dispatch.get("run_id") != run.native_run_id
-        or dispatch.get("task_id") != task_id
+        dispatch.get("id") != dispatch_id
+        or worker_identity.dispatch.run_id != run.native_run_id
+        or worker_identity.dispatch.task_id != task_id
         or dispatch.get("status") != "dispatched"
-        or not isinstance(worker, Mapping)
         or worker.get("state") != "ready"
         or worker.get("stage") != "input_accepted"
-        or worker.get("worktree_id") != worktree_id
-        or worker.get("agent_terminal_handle") != handle
+        or worker_identity.dispatch_id != dispatch_id
+        or worker_identity.worktree_id != worktree_id
+        or worker_identity.terminal_handle != handle
         or not isinstance(options, Mapping)
         or options.get("resolvedWorktreeId") != worktree_id
         or options.get("agent") != launch.get("agent")

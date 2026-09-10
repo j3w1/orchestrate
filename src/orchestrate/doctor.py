@@ -15,6 +15,7 @@ import uuid
 from .errors import OrchestrateError
 from .identity import require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError
+from .orca_compat import WorkerShowShapeError, worker_show_dispatch_identity
 from .state import make_private_state_directory, require_private_state_target, state_home
 
 
@@ -412,11 +413,15 @@ def _validate_native_settlement(
     dispatch = worker_result.get("dispatch")
     if not isinstance(dispatch, Mapping):
         raise ProbeContractError("worker-show omitted the native Dispatch record")
+    try:
+        identity = worker_show_dispatch_identity(dispatch)
+    except WorkerShowShapeError as exc:
+        raise ProbeContractError(str(exc)) from exc
     expected_status = "completed" if worker_outcome == "succeeded" else "failed"
     if (
         dispatch.get("id") != dispatch_id
-        or dispatch.get("run_id") != run_id
-        or dispatch.get("task_id") != task_id
+        or identity.run_id != run_id
+        or identity.task_id != task_id
         or dispatch.get("status") != expected_status
     ):
         raise ProbeContractError("Native Dispatch state does not match the exact worker_done result")

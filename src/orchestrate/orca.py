@@ -212,7 +212,12 @@ class OrcaClient:
             )
         return result
 
-    def run_json(self, *arguments: str, timeout_seconds: float | None = None) -> JsonObject:
+    def run_json(
+        self,
+        *arguments: str,
+        timeout_seconds: float | None = None,
+        allow_nonzero_ok: bool = False,
+    ) -> JsonObject:
         argv = (*self.command, *arguments)
         try:
             completed = self._runner(
@@ -277,9 +282,15 @@ class OrcaClient:
             stderr=stderr,
             payload=decoded,
         )
-        if completed.returncode != 0 or decoded.get("ok") is not True:
+        if decoded.get("ok") is not True:
             error = decoded.get("error")
             message = error.get("message") if isinstance(error, dict) else None
             detail = message or stderr.strip() or "Orca response did not prove ok=true"
             raise OrcaCommandError(detail, result)
+        if completed.returncode != 0 and not allow_nonzero_ok:
+            raise OrcaCommandError(
+                stderr.strip()
+                or f"Orca command exited with {completed.returncode} after returning an ok=true result",
+                result,
+            )
         return decoded

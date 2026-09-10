@@ -23,9 +23,10 @@ def git(root: Path, *arguments: str) -> None:
 
 
 class PreflightClient:
-    def __init__(self, root: Path, packet: dict[str, object]) -> None:
+    def __init__(self, root: Path, packet: dict[str, object], *, current_worker_shape: bool = False) -> None:
         self.root = root
         self.packet = packet
+        self.current_worker_shape = current_worker_shape
         self.calls: list[tuple[str, ...]] = []
 
     @staticmethod
@@ -46,16 +47,26 @@ class PreflightClient:
         if arguments[:2] == ("worktree", "current"):
             return self._wrap({"worktree": {"id": worktree_id, "path": str(self.root.resolve())}})
         if arguments[:2] == ("orchestration", "worker-show"):
-            return self._wrap({
-                "dispatch": {"id": "dispatch_1", "run_id": "run_1", "task_id": "task_1", "status": "dispatched"},
-                "worker": {
-                    "state": "ready", "stage": "input_accepted", "worktree_id": worktree_id,
-                    "agent_terminal_handle": "term_worker",
-                    "startOptions": {
-                        "resolvedWorktreeId": worktree_id, "agent": "codex",
-                        "launch": {"requested": launch, "effective": launch},
-                    },
+            dispatch = {"id": "dispatch_1", "status": "dispatched"}
+            worker = {
+                "state": "ready", "stage": "input_accepted",
+                "startOptions": {
+                    "resolvedWorktreeId": worktree_id, "agent": "codex",
+                    "launch": {"requested": launch, "effective": launch},
                 },
+            }
+            if self.current_worker_shape:
+                dispatch.update(runId="run_1", taskId="task_1", task_id="task_1", lastFailure=None)
+                worker.update(
+                    dispatchId="dispatch_1", worktreeId=worktree_id,
+                    agentTerminalHandle="term_worker", lastError=None,
+                )
+            else:
+                dispatch.update(run_id="run_1", task_id="task_1")
+                worker.update(worktree_id=worktree_id, agent_terminal_handle="term_worker")
+            return self._wrap({
+                "dispatch": dispatch,
+                "worker": worker,
             })
         if arguments[:2] == ("orchestration", "task-list"):
             return self._wrap({"tasks": [{
@@ -119,6 +130,19 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(OrchestrateError) as replay:
             self._run()
         self.assertEqual(replay.exception.code, "preflight_already_passed")
+
+    def test_orca_1_4_199_worker_show_identity_is_admitted_explicitly(self) -> None:
+        report = worker_preflight(
+            self.root,
+            run_id="run_1",
+            task_id="task_1",
+            dispatch_id="dispatch_1",
+            packet_id=str(self.packet["packetId"]),
+            client=PreflightClient(self.root, self.packet, current_worker_shape=True),  # type: ignore[arg-type]
+            environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+            platform="win32",
+        )
+        self.assertEqual(report["status"], "admitted")
 
     def test_rejected_then_restored_sources_never_become_admitted(self) -> None:
         original = (self.root / "AGENTS.md").read_bytes()

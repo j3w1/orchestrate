@@ -157,6 +157,124 @@ def _worker_start_readback(root: Path) -> dict[str, object]:
     }
 
 
+def _prompt_stall_start(root: Path, *, include_ok: bool = False) -> dict[str, object]:
+    worktree_id = f"repo::{root.resolve()}"
+    terminal_id = "term_worker"
+    launch = {
+        "requested": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+        "effective": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+    }
+    terminal_effect = {"kind": "terminal", "role": "agent", "action": "created", "id": terminal_id}
+    response = mutation(
+        "request_worker",
+        runId="run_1",
+        taskId="task_1",
+        dispatchId="dispatch_1",
+        state="failed",
+        stage="dispatch_input",
+        failedStage="dispatch_input",
+        lastError="agent_prompt_stalled",
+        setup={"state": "not_applicable"},
+        launch=launch,
+        effects=[
+            {"kind": "worktree", "action": "reused", "id": worktree_id},
+            {"kind": "setup", "action": "not_applicable", "state": "not_applicable"},
+            terminal_effect,
+        ],
+        residualResources=[terminal_effect],
+    )
+    response["_meta"] = {"runtimeId": "runtime_test"}
+    if include_ok:
+        response["ok"] = True
+    return response
+
+
+def _prompt_stall_readback(root: Path, *, current_shape: bool = False) -> dict[str, object]:
+    worktree_id = f"repo::{root.resolve()}"
+    launch = {
+        "requested": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+        "effective": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+    }
+    terminal_effect = {"kind": "terminal", "role": "agent", "action": "created", "id": "term_worker"}
+    dispatch: dict[str, object] = {"id": "dispatch_1", "status": "failed"}
+    worker: dict[str, object] = {
+        "state": "failed",
+        "stage": "dispatch_input",
+        "residualResources": [terminal_effect],
+        "startOptions": {
+            "worktree": f"path:{root.resolve()}",
+            "resolvedWorktreeId": worktree_id,
+            "terminal": None,
+            "agent": "codex",
+            "launch": launch,
+            "setup": "not_applicable",
+            "setupSource": "existing_worktree",
+        },
+    }
+    if current_shape:
+        dispatch.update(
+            runId="run_1",
+            taskId="task_1",
+            task_id="task_1",
+            lastFailure="agent_prompt_stalled",
+        )
+        worker.update(
+            dispatchId="dispatch_1",
+            lastError="agent_prompt_stalled",
+            worktreeId=worktree_id,
+            agentTerminalHandle="term_worker",
+        )
+    else:
+        dispatch.update(
+            run_id="run_1",
+            task_id="task_1",
+            last_failure="agent_prompt_stalled",
+        )
+        worker.update(
+            last_error="agent_prompt_stalled",
+            worktree_id=worktree_id,
+            agent_terminal_handle="term_worker",
+        )
+    return {
+        "result": {
+            "dispatch": dispatch,
+            "worker": worker,
+            "terminalResource": {
+                "id": "terminal-resource-1",
+                "ownershipState": "owned",
+                "releaseState": "not_requested",
+                "retainedReason": None,
+                "originDispatchId": "dispatch_1",
+                "ownerDispatchId": "dispatch_1",
+                "terminalHandle": "term_worker",
+                "worktreeId": worktree_id,
+            },
+        }
+    }
+
+
+def _released_prompt_stall_readback(root: Path) -> dict[str, object]:
+    return {
+        "result": {
+            "dispatch": {"id": "dispatch_1"},
+            "terminalResource": {
+                "id": "terminal-resource-1",
+                "ownershipState": "released",
+                "releaseState": "released",
+                "retainedReason": None,
+                "originDispatchId": "dispatch_1",
+                "ownerDispatchId": "dispatch_1",
+                "terminalHandle": "term_worker",
+                "worktreeId": f"repo::{root.resolve()}",
+                "releaseRequestedAt": "2026-01-01T00:00:00Z",
+                "releaseCompletedAt": "2026-01-01T00:00:01Z",
+                "releaseError": None,
+                "archive": {"source": "transcript", "status": "captured"},
+            },
+        }
+    }
+
+
 def _worker_start_with_preflight(root: Path) -> Response:
     def respond(_: FakeClient, __: tuple[str, ...]) -> dict[str, object]:
         response = _worker_start(root)
@@ -545,6 +663,14 @@ class ControllerTests(unittest.TestCase):
                 store,
                 run,
             )  # type: ignore[arg-type]
+            with self.assertRaises(OrchestrateError) as prompt_stall_hold:
+                _release_disposition(
+                    FakeClient([{"result": {"dispatch": {"id": dispatch_id}, "terminalResource": resource}}]),
+                    store,
+                    run,
+                    require_released=True,
+                )  # type: ignore[arg-type]
+            self.assertEqual(prompt_stall_hold.exception.code, "release_unconfirmed")
 
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
             run = store.create_run(objective="external", profile_digest="p", source_digest="s")
@@ -962,6 +1088,128 @@ class ControllerTests(unittest.TestCase):
                 reconcile_intentions(FakeClient([]), store, run)  # type: ignore[arg-type]
             self.assertEqual(replay.exception.code, "worker_launch_mismatch")
             self.assertEqual(store.get_run(run.local_id).phase, "task_created")
+
+    def test_prompt_stall_binds_failed_dispatch_and_releases_terminal_before_return(self) -> None:
+        objective = "Contain a stalled prompt"
+        responses = completion_responses(self.root, objective)[:4]
+        responses.extend(
+            [
+                _prompt_stall_start(self.root),
+                _prompt_stall_readback(self.root, current_shape=True),
+                mutation(
+                    "request_release",
+                    dispatchId="dispatch_1",
+                    state="released",
+                    processAction="closed_agent_terminal",
+                    archive={"source": "transcript", "status": "captured"},
+                ),
+                _released_prompt_stall_readback(self.root),
+            ]
+        )
+        client = FakeClient(responses)
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=1,
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "worker_failed")
+        self.assertEqual(report["dispatchId"], "dispatch_1")
+        self.assertEqual(report["workerOutcome"], "failed")
+        self.assertEqual(report["verification"], "not_run")
+        self.assertFalse(any(call[:2] == ("orchestration", "check") for call in client.calls))
+        start_index = next(i for i, call in enumerate(client.calls) if "worker-start" in call)
+        release_index = next(i for i, call in enumerate(client.calls) if "worker-release" in call)
+        self.assertLess(start_index, release_index)
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            persisted = store.get_run(str(report["localRunId"]))
+            self.assertEqual(persisted.phase, "worker_failed")
+            statuses = {
+                row["operation"]: row["status"]
+                for row in store.connection.execute(
+                    "SELECT operation, status FROM intentions WHERE run_local_id = ?",
+                    (persisted.local_id,),
+                ).fetchall()
+            }
+            self.assertEqual(statuses["worker-start"], "applied")
+            self.assertEqual(statuses["worker-release"], "applied")
+
+    def test_resume_recovers_fea_prompt_stall_receipt_without_replaying_worker_start(self) -> None:
+        objective = "Recover the stored failed start"
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective=objective, profile_digest="p", source_digest="s")
+            run = store.update_run(
+                run.local_id,
+                native_run_id="run_1",
+                task_id="task_1",
+                phase="task_created",
+            )
+            arguments = [
+                "orchestration",
+                "worker-start",
+                "--run",
+                "run_1",
+                "--task",
+                "task_1",
+                "--worktree",
+                f"path:{self.root.resolve()}",
+                "--agent",
+                "codex",
+                "--model",
+                "gpt-5.6-sol",
+                "--effort",
+                "high",
+            ]
+            intention = store.prepare_intention(run.local_id, "worker-start", arguments)
+            store.mark_intention(
+                intention,
+                "uncertain",
+                request_id="request_worker",
+                error=_prompt_stall_start(self.root, include_ok=True),
+            )
+            local_id = run.local_id
+
+        responses: list[Response] = [
+            _prompt_stall_readback(self.root),
+            mutation("request_use", run={"id": "run_1"}),
+            {"result": {"run": {"id": "run_1"}}},
+            {"result": {"run": {"id": "run_1", "objective": objective}}},
+            mutation(
+                "request_release",
+                dispatchId="dispatch_1",
+                state="released",
+                processAction="closed_agent_terminal",
+                archive={"source": "transcript", "status": "captured"},
+            ),
+            _released_prompt_stall_readback(self.root),
+        ]
+        client = FakeClient(responses)
+
+        report = resume(
+            self.root,
+            local_id,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=1,
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "worker_failed")
+        self.assertEqual(report["dispatchId"], "dispatch_1")
+        self.assertFalse(any(call[:2] == ("orchestration", "worker-start") for call in client.calls))
+        self.assertFalse(any(call[:2] == ("orchestration", "request-show") for call in client.calls))
+        self.assertEqual(sum(call[:2] == ("orchestration", "worker-release") for call in client.calls), 1)
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            persisted = store.get_run(local_id)
+            self.assertEqual(persisted.phase, "worker_failed")
+            stored_start = store.connection.execute(
+                "SELECT status, response_json FROM intentions WHERE id = ?",
+                (intention,),
+            ).fetchone()
+            self.assertEqual(stored_start["status"], "applied")
+            self.assertEqual(json.loads(stored_start["response_json"])["result"]["lastError"], "agent_prompt_stalled")
 
     def test_last_prelaunch_source_validation_stops_before_worker_start(self) -> None:
         objective = "Reject prelaunch drift"
