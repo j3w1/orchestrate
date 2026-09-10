@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -15,7 +17,7 @@ from orchestrate.packets import canonical_packet_json, make_packet, packet_spec
 from orchestrate.profile import setup_project
 from orchestrate.readers import read_project
 from orchestrate.sources import build_source_index
-from orchestrate.state import StateStore
+from orchestrate.state import AdmissionEffectFence, StateStore
 
 
 def git(root: Path, *arguments: str) -> None:
@@ -218,6 +220,63 @@ class AdmissionTests(unittest.TestCase):
             self._preflight("dispatch_2", PreflightClient(self.root, self.packet))
         self.assertEqual(replay.exception.code, "preflight_already_rejected")
         self.assertEqual(self._stored_rows(), after)
+
+    def test_two_concurrent_public_preflights_cannot_both_receive_fresh_grants(self) -> None:
+        first_inside_fence = threading.Event()
+        release_first = threading.Event()
+        second_at_fence = threading.Event()
+        second_thread: dict[str, int | None] = {"identity": None}
+
+        class BlockingFirstClient(PreflightClient):
+            def run_json(self, *arguments: str, **kwargs: object) -> dict[str, object]:
+                if arguments[:2] == ("terminal", "show"):
+                    first_inside_fence.set()
+                    if not release_first.wait(5):
+                        raise AssertionError("first preflight was not released")
+                return super().run_json(*arguments, **kwargs)
+
+        original_enter = AdmissionEffectFence.__enter__
+
+        def observed_enter(fence: AdmissionEffectFence) -> AdmissionEffectFence:
+            if threading.get_ident() == second_thread["identity"]:
+                second_at_fence.set()
+            return original_enter(fence)  # type: ignore[return-value]
+
+        first_client = BlockingFirstClient(self.root, self.packet)
+        second_client = PreflightClient(self.root, self.packet)
+
+        def first_preflight() -> dict[str, object]:
+            return self._preflight("dispatch_1", first_client)
+
+        def second_preflight() -> dict[str, object]:
+            second_thread["identity"] = threading.get_ident()
+            return self._preflight("dispatch_2", second_client)
+
+        with patch.object(AdmissionEffectFence, "__enter__", observed_enter), ThreadPoolExecutor(
+            max_workers=2,
+        ) as executor:
+            first = executor.submit(first_preflight)
+            self.assertTrue(first_inside_fence.wait(5))
+            second = executor.submit(second_preflight)
+            self.assertTrue(second_at_fence.wait(5))
+            self.assertFalse(second.done())
+            self.assertEqual(self._stored_rows(), [])
+            # The waiting preflight loaded the earlier unbound Run, then the
+            # controller established its Dispatch while the fence was held.
+            # Its rejection must use the refreshed post-fence Run binding.
+            with StateStore(self.root) as store:
+                store.update_run(self.local_id, dispatch_id="dispatch_1")
+            release_first.set()
+
+            self.assertEqual(first.result(timeout=5)["editingGrant"], "fresh")
+            with self.assertRaises(OrchestrateError) as rejected:
+                second.result(timeout=5)
+
+        self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(rejected.exception.data["cause"], "preflight_identity_conflict")  # type: ignore[index]
+        self.assertEqual(second_client.calls, [])
+        rows = self._stored_rows()
+        self.assertEqual([(row[0], row[1]) for row in rows], [("dispatch_1", "passed"), ("dispatch_2", "rejected")])
 
     def test_join_treats_other_dispatch_observation_as_conflicting_not_absent(self) -> None:
         self.assertEqual(self._run()["status"], "admitted")

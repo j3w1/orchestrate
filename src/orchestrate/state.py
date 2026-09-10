@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import time
 import uuid
 from typing import Any, Iterator
 
@@ -135,9 +136,30 @@ class WorkerResourceBinding:
 class RunLock(AbstractContextManager["RunLock"]):
     """A non-blocking host-local process lock, distinct from Orca ownership."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        timeout_seconds: float = 0.0,
+        contention_code: str = "controller_contention",
+        contention_message: str = "Another controller holds this host-local Run lock",
+    ) -> None:
         self.path = path
+        self.timeout_seconds = timeout_seconds
+        self.contention_code = contention_code
+        self.contention_message = contention_message
         self._file: Any = None
+
+    def _acquire(self) -> None:
+        if sys.platform == "win32":
+            import msvcrt
+
+            self._file.seek(0)
+            msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def __enter__(self) -> "RunLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,24 +168,25 @@ class RunLock(AbstractContextManager["RunLock"]):
         if self._file.tell() == 0:
             self._file.write(b"0")
             self._file.flush()
+        deadline = time.monotonic() + self.timeout_seconds
         try:
-            if sys.platform == "win32":
-                import msvcrt
-
-                self._file.seek(0)
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
+            while True:
+                try:
+                    self._acquire()
+                    break
+                except OSError as exc:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise OrchestrateError(
+                            self.contention_message,
+                            code=self.contention_code,
+                            data={"lock": self.path.name},
+                        ) from exc
+                    time.sleep(min(0.01, remaining))
+        except BaseException:
             self._file.close()
             self._file = None
-            raise OrchestrateError(
-                "Another controller holds this host-local Run lock",
-                code="controller_contention",
-                data={"lock": self.path.name},
-            ) from exc
+            raise
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -182,6 +205,25 @@ class RunLock(AbstractContextManager["RunLock"]):
         finally:
             self._file.close()
             self._file = None
+
+
+class AdmissionEffectFence(RunLock):
+    """Bounded Run-scoped ordering for managed admission evidence and effects.
+
+    This is deliberately a separate OS lock from controller ownership. A worker
+    may therefore complete its first preflight while implement/resume owns the
+    controller Run lock, while a concurrent preflight and admitted controller
+    effect cannot cross. The operating system releases the byte-range lock when
+    a process exits, including an ungraceful exit.
+    """
+
+    def __init__(self, path: Path, *, timeout_seconds: float = 5.0) -> None:
+        super().__init__(
+            path,
+            timeout_seconds=timeout_seconds,
+            contention_code="admission_effect_contention",
+            contention_message="Timed out waiting for the host-local admission/effect fence",
+        )
 
 
 class StateStore(AbstractContextManager["StateStore"]):
@@ -342,6 +384,10 @@ class StateStore(AbstractContextManager["StateStore"]):
     def lock(self, identity: str) -> RunLock:
         safe = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         return RunLock(self.directory / "locks" / f"{safe}.lock")
+
+    def admission_effect_fence(self, identity: str) -> AdmissionEffectFence:
+        safe = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return AdmissionEffectFence(self.directory / "admission-effect-fences" / f"{safe}.lock")
 
     def create_run(self, *, objective: str, profile_digest: str, source_digest: str) -> RunRecord:
         now = utc_now()

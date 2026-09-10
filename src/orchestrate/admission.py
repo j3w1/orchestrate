@@ -376,114 +376,121 @@ def worker_preflight(
     selected_platform = sys.platform if platform is None else platform
     with StateStore(profile.root) as store:
         run = store.get_run(run_id)
-        existing = store.get_preflight(run.local_id, task_id, dispatch_id)
-        if existing is not None:
-            code = "preflight_already_passed" if existing.get("outcome") == "passed" else "preflight_already_rejected"
-            raise OrchestrateError("This Dispatch already has an immutable preflight observation; no fresh editing grant was issued", code=code)
-        native: dict[str, Any] | None = None
-        validation: PacketValidation | None = None
-        try:
-            if run.task_id != task_id or run.native_run_id != run_id or run.dispatch_id not in {None, dispatch_id}:
-                raise OrchestrateError("Preflight selectors do not match the local Run", code="preflight_identity_conflict")
-            foreign = other_dispatch_observations(store, run.local_id, task_id, dispatch_id)
-            if foreign:
-                raise OrchestrateError(
-                    "Another immutable preflight observation already binds this Run/Task to a different Dispatch",
-                    code="preflight_dispatch_conflict",
-                    data={"boundDispatchId": run.dispatch_id, "otherObservations": foreign},
+        # Controller ownership deliberately does not cover this fence: the first
+        # worker preflight may run before worker-start returns to implement/resume.
+        with store.admission_effect_fence(run.local_id):
+            # Fence acquisition may have waited while worker-start bound the
+            # authoritative Dispatch/resource state. Never validate against the
+            # pre-lock Run snapshot.
+            run = store.get_run(run.local_id)
+            existing = store.get_preflight(run.local_id, task_id, dispatch_id)
+            if existing is not None:
+                code = "preflight_already_passed" if existing.get("outcome") == "passed" else "preflight_already_rejected"
+                raise OrchestrateError("This Dispatch already has an immutable preflight observation; no fresh editing grant was issued", code=code)
+            native: dict[str, Any] | None = None
+            validation: PacketValidation | None = None
+            try:
+                if run.task_id != task_id or run.native_run_id != run_id or run.dispatch_id not in {None, dispatch_id}:
+                    raise OrchestrateError("Preflight selectors do not match the local Run", code="preflight_identity_conflict")
+                foreign = other_dispatch_observations(store, run.local_id, task_id, dispatch_id)
+                if foreign:
+                    raise OrchestrateError(
+                        "Another immutable preflight observation already binds this Run/Task to a different Dispatch",
+                        code="preflight_dispatch_conflict",
+                        data={"boundDispatchId": run.dispatch_id, "otherObservations": foreign},
+                    )
+                packet_json = store.get_packet_json(run.local_id, task_id)
+                packet = store.get_packet(run.local_id, task_id)
+                if packet.get("packetId") != packet_id:
+                    raise OrchestrateError("Supplied packet ID does not match the immutable Task packet", code="packet_identity_conflict")
+                _verify_packet_source_bytes(profile, packet)
+                native = _native_identity(
+                    client,
+                    profile=profile,
+                    run=run,
+                    task_id=task_id,
+                    dispatch_id=dispatch_id,
+                    packet_json=packet_json,
+                    packet=packet,
+                    environment=env,
+                    platform=selected_platform,
                 )
-            packet_json = store.get_packet_json(run.local_id, task_id)
-            packet = store.get_packet(run.local_id, task_id)
-            if packet.get("packetId") != packet_id:
-                raise OrchestrateError("Supplied packet ID does not match the immutable Task packet", code="packet_identity_conflict")
-            _verify_packet_source_bytes(profile, packet)
-            native = _native_identity(
-                client,
-                profile=profile,
-                run=run,
-                task_id=task_id,
-                dispatch_id=dispatch_id,
-                packet_json=packet_json,
-                packet=packet,
-                environment=env,
-                platform=selected_platform,
-            )
-            binding = store.get_worker_resource_binding(run.local_id)
-            if binding is not None and (
-                binding.dispatch_id != dispatch_id
-                or binding.resource_id != native.get("terminalResourceId")
-                or binding.terminal_handle != native.get("terminalHandle")
-                or binding.worktree_id != native.get("worktreeId")
-            ):
-                raise OrchestrateError(
-                    "Worker preflight live resource identity conflicts with its immutable controller binding",
-                    code="preflight_identity_conflict",
+                binding = store.get_worker_resource_binding(run.local_id)
+                if binding is not None and (
+                    binding.dispatch_id != dispatch_id
+                    or binding.resource_id != native.get("terminalResourceId")
+                    or binding.terminal_handle != native.get("terminalHandle")
+                    or binding.worktree_id != native.get("worktreeId")
+                ):
+                    raise OrchestrateError(
+                        "Worker preflight live resource identity conflicts with its immutable controller binding",
+                        code="preflight_identity_conflict",
+                    )
+                validation = validate_packet_sources(profile, run, packet_json)
+                observation = {
+                    "schema": PREFLIGHT_SCHEMA,
+                    "outcome": "passed",
+                    "runId": run_id,
+                    "taskId": task_id,
+                    "dispatchId": dispatch_id,
+                    "packetId": packet_id,
+                    "packetJsonSha256": validation.packet_json_sha256,
+                    "expectedSourceDigest": run.source_digest,
+                    "observedSourceDigest": validation.sources.digest,
+                    "profileDigest": profile.digest,
+                    "routingDigest": validation.routing_digest,
+                    "candidate": validation.sources.value["candidate"],
+                    "native": native,
+                    "observedAt": utc_now(),
+                    "limitations": [
+                        "This is a managed observation, not enforcement against hostile preflight bypass.",
+                        "The host-local admission/effect fence orders managed preflights and controller effects only.",
+                    ],
+                    "mismatches": [],
+                }
+                _, created = store.record_preflight(
+                    run.local_id,
+                    run_id=run_id,
+                    task_id=task_id,
+                    dispatch_id=dispatch_id,
+                    observation=observation,
                 )
-            validation = validate_packet_sources(profile, run, packet_json)
-            observation = {
-                "schema": PREFLIGHT_SCHEMA,
-                "outcome": "passed",
-                "runId": run_id,
-                "taskId": task_id,
-                "dispatchId": dispatch_id,
-                "packetId": packet_id,
-                "packetJsonSha256": validation.packet_json_sha256,
-                "expectedSourceDigest": run.source_digest,
-                "observedSourceDigest": validation.sources.digest,
-                "profileDigest": profile.digest,
-                "routingDigest": validation.routing_digest,
-                "candidate": validation.sources.value["candidate"],
-                "native": native,
-                "observedAt": utc_now(),
-                "limitations": [
-                    "This is a managed observation, not enforcement against hostile preflight bypass.",
-                    "It does not exclude concurrent external writers before or after observation.",
-                ],
-                "mismatches": [],
-            }
-            _, created = store.record_preflight(
-                run.local_id,
-                run_id=run_id,
-                task_id=task_id,
-                dispatch_id=dispatch_id,
-                observation=observation,
-            )
-            if not created:
-                raise OrchestrateError("Preflight observation already exists; no fresh editing grant was issued", code="preflight_already_recorded")
-            return {"schema": PREFLIGHT_SCHEMA, "status": "admitted", "editingGrant": "fresh", "observation": observation}
-        except (KeyError, TypeError, ValueError, OrchestrateError, OrcaCommandError) as exc:
-            code = (
-                exc.code
-                if isinstance(exc, (OrchestrateError, OrcaCommandError))
-                else "preflight_contract_invalid"
-            )
-            mismatch: dict[str, Any] = {"code": code, "message": str(exc)}
-            if isinstance(exc, OrchestrateError) and exc.data is not None:
-                mismatch["details"] = exc.data
-            rejected = {
-                "schema": PREFLIGHT_SCHEMA,
-                "outcome": "rejected",
-                "runId": run_id,
-                "taskId": task_id,
-                "dispatchId": dispatch_id,
-                "packetId": packet_id,
-                "native": native,
-                "observedAt": utc_now(),
-                "limitations": ["No managed editing admission was established."],
-                "mismatches": [mismatch],
-            }
-            store.record_preflight(
-                run.local_id,
-                run_id=run_id,
-                task_id=task_id,
-                dispatch_id=dispatch_id,
-                observation=rejected,
-            )
-            raise OrchestrateError(
-                "Worker preflight was rejected",
-                code="preflight_rejected",
-                data={"cause": code, "mismatches": rejected["mismatches"]},
-            ) from exc
+                if not created:
+                    raise OrchestrateError("Preflight observation already exists; no fresh editing grant was issued", code="preflight_already_recorded")
+                return {"schema": PREFLIGHT_SCHEMA, "status": "admitted", "editingGrant": "fresh", "observation": observation}
+            except (KeyError, TypeError, ValueError, OrchestrateError, OrcaCommandError) as exc:
+                code = (
+                    exc.code
+                    if isinstance(exc, (OrchestrateError, OrcaCommandError))
+                    else "preflight_contract_invalid"
+                )
+                mismatch: dict[str, Any] = {"code": code, "message": str(exc)}
+                if isinstance(exc, OrchestrateError) and exc.data is not None:
+                    mismatch["details"] = exc.data
+                rejected = {
+                    "schema": PREFLIGHT_SCHEMA,
+                    "outcome": "rejected",
+                    "runId": run_id,
+                    "taskId": task_id,
+                    "dispatchId": dispatch_id,
+                    "packetId": packet_id,
+                    "native": native,
+                    "observedAt": utc_now(),
+                    "limitations": ["No managed editing admission was established."],
+                    "mismatches": [mismatch],
+                }
+                store.record_preflight(
+                    run.local_id,
+                    run_id=run_id,
+                    task_id=task_id,
+                    dispatch_id=dispatch_id,
+                    observation=rejected,
+                )
+                raise OrchestrateError(
+                    "Worker preflight was rejected",
+                    code="preflight_rejected",
+                    data={"cause": code, "mismatches": rejected["mismatches"]},
+                ) from exc
 
 
 def other_dispatch_observations(

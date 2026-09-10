@@ -719,14 +719,18 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
         item["kind"] == "compatibility" and item["subject"] == INPUT_SUBMISSION_DIAGNOSTIC_SUBJECT
         for item in store.evidence(run.local_id)
     )
-    if admission in {"rejected", "conflicting"} and run.phase in {
-        "awaiting_preflight",
-        "waiting",
-        PREFLIGHT_HELD_PHASE,
-    }:
+    if admission in {"rejected", "conflicting"} and (
+        run.phase in {"awaiting_preflight", "waiting", "blocked", PREFLIGHT_HELD_PHASE}
+        or bool(pending)
+    ):
         next_obligation = (
             "the immutable worker preflight is held; inspect admissionDetail and use a separately "
             "authorized cleanup path to settle the exact bound attempt"
+        )
+    elif admission == "pending" and pending:
+        next_obligation = (
+            "the immutable worker preflight is pending; complete or recover the exact managed "
+            "preflight before answering any question"
         )
     elif pending:
         next_obligation = f"answer question {pending[0]['message_id']}"
@@ -1333,11 +1337,13 @@ def _join_admission(store: StateStore, run: RunRecord) -> tuple[RunRecord, str]:
     status = joined_preflight_status(store, run)
     if status == "admitted" and run.phase == "awaiting_preflight":
         run = store.update_run(run.local_id, phase="waiting")
-    elif status in {"rejected", "conflicting"} and run.phase in {
-        "awaiting_preflight",
-        "waiting",
-        PREFLIGHT_HELD_PHASE,
-    }:
+    elif status in {"rejected", "conflicting"} and (
+        run.phase in {"awaiting_preflight", "waiting", "blocked", PREFLIGHT_HELD_PHASE}
+        or (
+            bool(store.pending_questions(run.local_id))
+            and run.phase not in {"worker_succeeded", "worker_failed", "worker_unadmitted", "completed"}
+        )
+    ):
         if run.phase != PREFLIGHT_HELD_PHASE:
             run = store.update_run(run.local_id, phase=PREFLIGHT_HELD_PHASE)
     return run, status
@@ -1921,28 +1927,33 @@ def _supervise(client: OrcaClient, store: StateStore, run: RunRecord, *, wait_ti
             "--json",
             timeout_seconds=(window / 1000) + 30,
         )
-        delivery_id, messages = _delivery(payload)
-        if not delivery_id:
-            current, admission = _join_admission(store, current)
+        # A pending first preflight must remain able to run while check waits.
+        # Once check returns, the dedicated fence orders every admission join,
+        # local Delivery effect, native lifecycle effect, retry, and ack as one
+        # interval against any later public preflight observation.
+        with store.admission_effect_fence(current.local_id):
+            current, admission = _join_admission(store, store.get_run(current.local_id))
             if current.phase == PREFLIGHT_HELD_PHASE:
                 break
-            if (
-                current.phase == "awaiting_preflight"
-                and admission == "pending"
-                and _result(payload).get("timedOut") is True
-                and _record_input_submission_diagnostic(client, store, current)
-            ):
+            delivery_id, messages = _delivery(payload)
+            if not delivery_id:
+                if (
+                    current.phase == "awaiting_preflight"
+                    and admission == "pending"
+                    and _result(payload).get("timedOut") is True
+                    and _record_input_submission_diagnostic(client, store, current)
+                ):
+                    break
+                continue
+            store.journal_delivery(current.local_id, delivery_id, payload, messages)
+            current = store.update_run(current.local_id, delivery_id=delivery_id)
+            current, _ = _join_admission(store, current)
+            if current.phase == PREFLIGHT_HELD_PHASE:
                 break
-            continue
-        store.journal_delivery(current.local_id, delivery_id, payload, messages)
-        current = store.update_run(current.local_id, delivery_id=delivery_id)
-        current, _ = _join_admission(store, current)
-        if current.phase == PREFLIGHT_HELD_PHASE:
-            break
-        current = _process_delivery(client, store, current, delivery_id, messages)
-        if store.pending_questions(current.local_id) or current.phase == "blocked":
-            break
-        _ack_if_resolved(client, store, current)
+            current = _process_delivery(client, store, current, delivery_id, messages)
+            if store.pending_questions(current.local_id) or current.phase == "blocked":
+                break
+            _ack_if_resolved(client, store, current)
     current, _ = _join_admission(store, store.get_run(current.local_id))
     return _run_summary(store, store.get_run(current.local_id))
 
@@ -2027,19 +2038,34 @@ def resume(
                 if require_context and run.native_run_id
                 else (require_plain_controller(client, profile.root) if require_context else None)
             )
+            unsettled = store.unsettled_intentions(run.local_id)
             prepared_start = any(
                 row["operation"] == "worker-start" and row["status"] == "prepared"
-                for row in store.unsettled_intentions(run.local_id)
+                for row in unsettled
             )
+            recovering_worker_start = any(row["operation"] == "worker-start" for row in unsettled)
             if prepared_start:
                 _require_profile_selection(profile)
                 validate_packet_sources(profile, run, _ensure_packet(store, run, profile))
-            run = reconcile_intentions(client, store, run)
-            run, _ = _join_admission(store, run)
-            if run.phase == PREFLIGHT_HELD_PHASE:
-                return _run_summary(store, run)
-            run = _bind_native_run(client, store, run, identity)
-            run = _finish_prompt_stall_cleanup(client, store, run)
+            if run.dispatch_id and not recovering_worker_start:
+                # Retry/replay can itself issue native effects or apply a stored
+                # reply/ack locally. Keep that complete interval ordered against
+                # every later managed preflight observation.
+                with store.admission_effect_fence(run.local_id):
+                    run, status = _join_admission(store, store.get_run(run.local_id))
+                    if status in {"rejected", "conflicting"}:
+                        return _run_summary(store, run)
+                    run = reconcile_intentions(client, store, run)
+                    run, status = _join_admission(store, run)
+                    if status in {"rejected", "conflicting"}:
+                        return _run_summary(store, run)
+            else:
+                # worker-start recovery must not hold the fence: the public Orca
+                # call may be waiting for this exact worker's first preflight.
+                run = reconcile_intentions(client, store, run)
+                run, _ = _join_admission(store, run)
+                if run.phase == PREFLIGHT_HELD_PHASE:
+                    return _run_summary(store, run)
             if run.phase in {"preparing", "run_created", "task_created"}:
                 _require_profile_selection(profile)
                 reader = read_project(profile, run.objective)
@@ -2051,13 +2077,27 @@ def resume(
                         code="source_binding_changed",
                         data={"expected": run.source_digest, "actual": current_sources.digest},
                     )
-            if run.delivery_id:
-                run = _reprocess_bound_delivery(client, store, run)
-            if run.delivery_id and not store.pending_questions(run.local_id) and run.phase != "blocked":
-                _ack_if_resolved(client, store, run)
-                run = store.get_run(run.local_id)
-            if store.pending_questions(run.local_id) or run.phase in TERMINAL_PHASES:
-                return _run_summary(store, run)
+            if run.dispatch_id:
+                # Native binding, Delivery replay/effects, and acknowledgement
+                # form one admission-ordered interval. A conflicting preflight
+                # is either visible at this join or cannot be inserted until all
+                # of these effects have ended.
+                with store.admission_effect_fence(run.local_id):
+                    run, status = _join_admission(store, store.get_run(run.local_id))
+                    if status in {"rejected", "conflicting"}:
+                        return _run_summary(store, run)
+                    run = _bind_native_run(client, store, run, identity)
+                    run = _finish_prompt_stall_cleanup(client, store, run)
+                    if run.delivery_id:
+                        run = _reprocess_bound_delivery(client, store, run)
+                    if run.delivery_id and not store.pending_questions(run.local_id) and run.phase != "blocked":
+                        _ack_if_resolved(client, store, run)
+                        run = store.get_run(run.local_id)
+                    if store.pending_questions(run.local_id) or run.phase in TERMINAL_PHASES:
+                        return _run_summary(store, run)
+            else:
+                run = _bind_native_run(client, store, run, identity)
+                run = _finish_prompt_stall_cleanup(client, store, run)
             if run.phase == "preparing":
                 run = _create_native_run(client, store, run)
             if run.phase == "run_created":
@@ -2143,51 +2183,52 @@ def answer(
     with StateStore(profile.root) as store:
         run = store.get_run(run_id)
         with store.lock(run.local_id):
-            run, admission = _join_admission(store, store.get_run(run.local_id))
-            if admission != "admitted":
-                return _run_summary(store, run)
-            identity = (
-                require_plain_controller(
-                    client,
-                    profile.root,
-                    expected_run_id=run.native_run_id,
-                    allow_expected_unbound=True,
+            with store.admission_effect_fence(run.local_id):
+                run, admission = _join_admission(store, store.get_run(run.local_id))
+                if admission != "admitted":
+                    return _run_summary(store, run)
+                identity = (
+                    require_plain_controller(
+                        client,
+                        profile.root,
+                        expected_run_id=run.native_run_id,
+                        allow_expected_unbound=True,
+                    )
+                    if require_context and run.native_run_id
+                    else (require_plain_controller(client, profile.root) if require_context else None)
                 )
-                if require_context and run.native_run_id
-                else (require_plain_controller(client, profile.root) if require_context else None)
-            )
-            run, admission = _join_admission(store, store.get_run(run.local_id))
-            if admission != "admitted":
-                return _run_summary(store, run)
-            run = reconcile_intentions(client, store, run)
-            run, admission = _join_admission(store, run)
-            if admission != "admitted":
-                return _run_summary(store, run)
-            run = _bind_native_run(client, store, run, identity)
-            row = store.connection.execute("SELECT * FROM questions WHERE message_id = ?", (question_id,)).fetchone()
-            if row is None or row["run_local_id"] != run.local_id:
-                raise OrchestrateError("Question does not belong to the selected Run", code="question_not_found")
-            if row["status"] == "answered":
-                if row["answer"] != text:
-                    raise OrchestrateError("Question already has a different answer", code="question_already_answered")
-            else:
-                _mutation(
-                    client,
-                    store,
-                    run,
-                    "reply",
-                    [
-                        "orchestration",
+                run, admission = _join_admission(store, store.get_run(run.local_id))
+                if admission != "admitted":
+                    return _run_summary(store, run)
+                run = reconcile_intentions(client, store, run)
+                run, admission = _join_admission(store, run)
+                if admission != "admitted":
+                    return _run_summary(store, run)
+                run = _bind_native_run(client, store, run, identity)
+                row = store.connection.execute("SELECT * FROM questions WHERE message_id = ?", (question_id,)).fetchone()
+                if row is None or row["run_local_id"] != run.local_id:
+                    raise OrchestrateError("Question does not belong to the selected Run", code="question_not_found")
+                if row["status"] == "answered":
+                    if row["answer"] != text:
+                        raise OrchestrateError("Question already has a different answer", code="question_already_answered")
+                else:
+                    _mutation(
+                        client,
+                        store,
+                        run,
                         "reply",
-                        "--run",
-                        str(run.native_run_id),
-                        "--id",
-                        question_id,
-                        "--body",
-                        text,
-                    ],
-                )
-                store.answer_question(question_id, text)
-                store.mark_message(run.local_id, row["delivery_id"], question_id, "answered")
-            _ack_if_resolved(client, store, store.get_run(run.local_id))
-            return _run_summary(store, store.get_run(run.local_id))
+                        [
+                            "orchestration",
+                            "reply",
+                            "--run",
+                            str(run.native_run_id),
+                            "--id",
+                            question_id,
+                            "--body",
+                            text,
+                        ],
+                    )
+                    store.answer_question(question_id, text)
+                    store.mark_message(run.local_id, row["delivery_id"], question_id, "answered")
+                _ack_if_resolved(client, store, store.get_run(run.local_id))
+                return _run_summary(store, store.get_run(run.local_id))

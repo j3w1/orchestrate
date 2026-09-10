@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import hashlib
 import json
@@ -9,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -36,7 +38,7 @@ from orchestrate.packets import canonical_packet_json, make_packet, packet_spec
 from orchestrate.profile import setup_project
 from orchestrate.readers import read_project
 from orchestrate.sources import build_source_index
-from orchestrate.state import StateStore
+from orchestrate.state import AdmissionEffectFence, StateStore
 
 
 def git(root: Path, *arguments: str) -> bytes:
@@ -1656,6 +1658,111 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual((question["status"], question["answer"]), ("answered", "Choose A"))
             self.assertEqual(delivery["acked"], 1)
 
+    def test_concurrent_public_preflight_cannot_cross_complete_answer_effect_interval(self) -> None:
+        objective = "Fence a concurrent answer and second preflight"
+        report = self._start_pending_question(objective)
+        local_id = str(report["localRunId"])
+        before = self._answer_guard_snapshot(local_id)
+        answer_inside_fence = threading.Event()
+        release_answer = threading.Event()
+        preflight_at_fence = threading.Event()
+        preflight_thread: dict[str, int | None] = {"identity": None}
+
+        class BlockingAnswerClient(FakeClient):
+            def run_json(self, *arguments: str, **kwargs: object) -> dict[str, object]:
+                if arguments[:2] == ("orchestration", "run-use"):
+                    answer_inside_fence.set()
+                    if not release_answer.wait(5):
+                        raise AssertionError("answer effect interval was not released")
+                return super().run_json(*arguments, **kwargs)
+
+        answer_client = BlockingAnswerClient(
+            [
+                mutation("request_use", run={"id": "run_1"}),
+                {"result": {"run": {"id": "run_1"}}},
+                {"result": {"run": {"id": "run_1", "objective": objective}}},
+                mutation("request_reply", message={"id": "reply_1"}),
+                acknowledgement("delivery_q"),
+            ]
+        )
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            packet = store.get_packet(local_id, "task_1")
+        second_client = RealPreflightClient(self.root, packet, current_shape=True)
+        original_enter = AdmissionEffectFence.__enter__
+
+        def observed_enter(fence: AdmissionEffectFence) -> AdmissionEffectFence:
+            if threading.get_ident() == preflight_thread["identity"]:
+                preflight_at_fence.set()
+            return original_enter(fence)  # type: ignore[return-value]
+
+        def run_answer() -> dict[str, object]:
+            return answer(
+                self.root,
+                "run_1",
+                "question_1",
+                "Choose A",
+                client=answer_client,  # type: ignore[arg-type]
+                require_context=False,
+            )
+
+        def run_second_preflight() -> dict[str, object]:
+            preflight_thread["identity"] = threading.get_ident()
+            return worker_preflight(
+                self.root,
+                run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_2",
+                packet_id=str(packet["packetId"]),
+                client=second_client,  # type: ignore[arg-type]
+                environment={"ORCA_TERMINAL_HANDLE": "term_other"},
+                platform="win32",
+            )
+
+        with patch.object(AdmissionEffectFence, "__enter__", observed_enter), ThreadPoolExecutor(
+            max_workers=2,
+        ) as executor:
+            answer_future = executor.submit(run_answer)
+            self.assertTrue(answer_inside_fence.wait(5))
+            preflight_future = executor.submit(run_second_preflight)
+            self.assertTrue(preflight_at_fence.wait(5))
+            self.assertFalse(preflight_future.done())
+            self.assertEqual(self._answer_guard_snapshot(local_id), before)
+            release_answer.set()
+
+            answered = answer_future.result(timeout=5)
+            with self.assertRaises(OrchestrateError) as rejected:
+                preflight_future.result(timeout=5)
+
+        self.assertEqual(answered["admission"], "admitted")
+        self.assertEqual(answered["pendingQuestions"], [])
+        self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(second_client.calls, [])
+        self.assertTrue(any(call[:2] == ("orchestration", "reply") for call in answer_client.calls))
+        self.assertTrue(any("--ack" in call for call in answer_client.calls))
+        after = self._answer_guard_snapshot(local_id)
+        self.assertEqual(after["preflights"][0], before["preflights"][0])  # type: ignore[index]
+        self.assertEqual(
+            [(row[0], row[1]) for row in after["preflights"]],  # type: ignore[index]
+            [("dispatch_1", "passed"), ("dispatch_2", "rejected")],
+        )
+
+        # Once the conflicting row exists, a later public answer performs no
+        # native reply/ack and changes none of the immutable or message effects.
+        conflict_snapshot = self._answer_guard_snapshot(local_id)
+        idle = FakeClient([])
+        held = answer(
+            self.root,
+            "run_1",
+            "question_1",
+            "Choose A",
+            client=idle,  # type: ignore[arg-type]
+            require_context=False,
+        )
+        self.assertEqual(held["status"], "preflight_held")
+        self.assertEqual(held["admission"], "conflicting")
+        self.assertEqual(idle.calls, [])
+        self.assertEqual(self._answer_guard_snapshot(local_id), conflict_snapshot)
+
     def test_answer_holds_second_dispatch_observation_before_orca_or_local_effects(self) -> None:
         report = self._start_pending_question("Hold answer after a second Dispatch observation")
         local_id = str(report["localRunId"])
@@ -1733,6 +1840,104 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(before["preflights"], [("dispatch_1", "passed", "{malformed")])
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
             self.assertEqual(store.get_run(local_id).phase, "preflight_held")
+
+    def test_conflicting_blocked_question_transitions_to_preflight_hold_and_keeps_escalation(self) -> None:
+        objective = "Hold a blocked question after conflicting preflight"
+        question = lifecycle_message(
+            "question",
+            {"taskId": "task_1", "dispatchId": "dispatch_1"},
+            message_id="question_blocked",
+            body="Choose A or B",
+        )
+        escalation = lifecycle_message(
+            "escalation",
+            {"taskId": "task_1", "dispatchId": "dispatch_1"},
+            message_id="escalation_blocked",
+            subject="Blocked: preserve this evidence",
+            body="The worker is still blocked.",
+        )
+        responses = completion_responses(self.root, objective)[:4]
+        responses.extend([
+            _worker_start_with_real_preflight(self.root, current_shape=True),
+            _worker_start_readback(self.root, current_shape=True),
+            {"result": {"deliveryId": "delivery_blocked", "messages": [question, escalation]}},
+        ])
+        initial = implement(
+            self.root,
+            objective,
+            client=FakeClient(responses),  # type: ignore[arg-type]
+            wait_timeout_ms=100,
+            require_context=False,
+        )
+        local_id = str(initial["localRunId"])
+        self.assertEqual(initial["status"], "blocked")
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            packet = store.get_packet(local_id, "task_1")
+        with self.assertRaises(OrchestrateError):
+            worker_preflight(
+                self.root,
+                run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_2",
+                packet_id=str(packet["packetId"]),
+                client=RealPreflightClient(self.root, packet, current_shape=True),  # type: ignore[arg-type]
+                environment={"ORCA_TERMINAL_HANDLE": "term_other"},
+                platform="win32",
+            )
+        before = self._answer_guard_snapshot(local_id)
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            escalation_evidence = store.evidence(local_id)
+
+        idle = FakeClient([])
+        held = answer(
+            self.root,
+            "run_1",
+            "question_blocked",
+            "Choose A",
+            client=idle,  # type: ignore[arg-type]
+            require_context=False,
+        )
+
+        self.assertEqual(held["status"], "preflight_held")
+        self.assertEqual(held["admission"], "conflicting")
+        self.assertEqual(held["pendingQuestions"], ["question_blocked"])
+        self.assertIn("immutable worker preflight is held", held["nextObligation"])
+        self.assertNotIn("answer question", held["nextObligation"])
+        self.assertEqual(idle.calls, [])
+        self.assertEqual(self._answer_guard_snapshot(local_id), before)
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            self.assertEqual(store.get_run(local_id).phase, "preflight_held")
+            self.assertEqual(store.evidence(local_id), escalation_evidence)
+        self.assertTrue(any(item["kind"] == "worker-escalation" for item in escalation_evidence))
+
+    def test_pending_admission_preflight_obligation_precedes_question_instruction(self) -> None:
+        report = self._start_pending_question("Report pending admission before a question")
+        local_id = str(report["localRunId"])
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            store.connection.execute(
+                "DELETE FROM preflight_observations WHERE run_local_id = ?",
+                (local_id,),
+            )
+        before = self._answer_guard_snapshot(local_id)
+        idle = FakeClient([])
+
+        pending = answer(
+            self.root,
+            "run_1",
+            "question_1",
+            "Choose A",
+            client=idle,  # type: ignore[arg-type]
+            require_context=False,
+        )
+
+        self.assertEqual(pending["status"], "waiting")
+        self.assertEqual(pending["admission"], "pending")
+        self.assertEqual(pending["pendingQuestions"], ["question_1"])
+        self.assertIn("immutable worker preflight is pending", pending["nextObligation"])
+        self.assertIn("recover", pending["nextObligation"])
+        self.assertNotIn("answer question", pending["nextObligation"])
+        self.assertEqual(idle.calls, [])
+        self.assertEqual(self._answer_guard_snapshot(local_id), before)
 
     def test_realistic_raw_wire_question_and_escalation_are_journaled_before_effects(self) -> None:
         objective = "Hold a real FIFO Delivery"

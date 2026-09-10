@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 from orchestrate.errors import OrchestrateError
-from orchestrate.state import StateStore
+from orchestrate.state import AdmissionEffectFence, StateStore
 
 
 class StateTests(unittest.TestCase):
@@ -47,6 +50,54 @@ class StateTests(unittest.TestCase):
                         with second:
                             pass
                 self.assertEqual(caught.exception.code, "controller_contention")
+
+    def test_admission_effect_fence_wait_is_bounded_and_distinct_from_controller_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            with StateStore(Path(project_dir), home=Path(home_dir)) as store:
+                controller = store.lock("run")
+                first = store.admission_effect_fence("run")
+                bounded = AdmissionEffectFence(first.path, timeout_seconds=0.05)
+                with controller:
+                    with first:
+                        started = time.monotonic()
+                        with self.assertRaises(OrchestrateError) as caught:
+                            with bounded:
+                                pass
+                        elapsed = time.monotonic() - started
+
+                self.assertEqual(caught.exception.code, "admission_effect_contention")
+                self.assertLess(elapsed, 1.0)
+
+    def test_admission_effect_fence_is_released_when_owning_process_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            source_root = Path(__file__).resolve().parents[1] / "src"
+            script = (
+                "from pathlib import Path\n"
+                "import sys, time\n"
+                "sys.path.insert(0, sys.argv[3])\n"
+                "from orchestrate.state import StateStore\n"
+                "with StateStore(Path(sys.argv[1]), home=Path(sys.argv[2])) as store:\n"
+                "    with store.admission_effect_fence('run'):\n"
+                "        print('locked', flush=True)\n"
+                "        time.sleep(30)\n"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-I", "-c", script, project_dir, home_dir, str(source_root)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(process.stdout.readline().strip(), "locked")  # type: ignore[union-attr]
+            finally:
+                process.kill()
+                process.wait(timeout=5)
+                process.stdout.close()  # type: ignore[union-attr]
+                process.stderr.close()  # type: ignore[union-attr]
+
+            with StateStore(Path(project_dir), home=Path(home_dir)) as store:
+                with store.admission_effect_fence("run"):
+                    pass
 
     def test_delivery_is_immutable_and_journaled_before_effects(self) -> None:
         with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
