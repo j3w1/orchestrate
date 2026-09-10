@@ -97,9 +97,10 @@ def _exit_code(payload: Mapping[str, Any], *, expected_handle: str | None = None
     exit_code = wait.get("exitCode")
     cause = wait.get("exitCause")
     if (
-        not isinstance(exit_code, int)
+        type(exit_code) is not int
         or not isinstance(cause, Mapping)
         or cause.get("kind") != "exited"
+        or type(cause.get("exitCode")) is not int
         or cause.get("exitCode") != exit_code
     ):
         raise OrchestrateError("terminal exit receipts disagree", code="bootstrap_exit_unproven")
@@ -116,7 +117,12 @@ def _read_result(path: Path, expected_exit_code: int) -> str:
         ) from exc
     if not isinstance(record, dict) or record.get("schema") != BOOTSTRAP_SCHEMA:
         raise OrchestrateError("The controller result record is malformed", code="bootstrap_result_unavailable")
-    if record.get("exitCode") != expected_exit_code or not isinstance(record.get("stdout"), str):
+    if (
+        type(expected_exit_code) is not int
+        or type(record.get("exitCode")) is not int
+        or record.get("exitCode") != expected_exit_code
+        or not isinstance(record.get("stdout"), str)
+    ):
         raise OrchestrateError("Controller and terminal exit receipts disagree", code="bootstrap_result_unavailable")
     return record["stdout"]
 
@@ -364,7 +370,7 @@ def _reconcile_uncertain_close(
         ):
             raise OrchestrateError("Bootstrap create receipt omitted cleanup identity", code="bootstrap_effect_uncertain")
         expected_exit = row["exit_code"]
-        if not isinstance(expected_exit, int):
+        if type(expected_exit) is not int:
             raise OrchestrateError("Bootstrap journal omitted exact exit evidence", code="bootstrap_effect_uncertain")
         _read_result(Path(row["result_path"]), expected_exit)
         waited = _wait_for_exit(client, handle)
@@ -401,13 +407,14 @@ def _reconcile_uncertain_close(
             or inventory.get("truncated") is not False
             or not isinstance(terminals, list)
             or not all(isinstance(item, Mapping) for item in terminals)
+            or type(inventory.get("totalCount")) is not int
             or inventory.get("totalCount") != len(terminals)
             or not isinstance(layouts, list)
             or not isinstance(host_scope, Mapping)
             or host_scope.get("hostIds") != [host_id]
             or host_scope.get("omittedHostIds") != []
             or not isinstance(topology_revisions, Mapping)
-            or not isinstance(topology_revisions.get(worktree_id), int)
+            or type(topology_revisions.get(worktree_id)) is not int
         ):
             raise OrchestrateError("Terminal inventory was not complete for exact cleanup", code="bootstrap_effect_uncertain")
         if any(

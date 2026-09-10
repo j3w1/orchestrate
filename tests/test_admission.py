@@ -145,6 +145,124 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(rejected.exception.code, "preflight_rejected")
         self.assertEqual(client.calls, [])
 
+    def test_clean_committed_ce_query_drift_rejects_before_any_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git(root, "init", "-q")
+            git(root, "config", "user.email", "fixture@example.invalid")
+            git(root, "config", "user.name", "Fixture")
+            (root / "docs" / "tasks").mkdir(parents=True)
+            (root / "docs" / "context").mkdir(parents=True)
+            (root / "docs" / "project-log").mkdir(parents=True)
+            (root / "scripts" / "quality").mkdir(parents=True)
+            (root / "AGENTS.md").write_text("Bound CE instruction.\n", encoding="utf-8")
+            (root / "docs" / "tasks" / "README.md").write_text(
+                "| [CE-1234](CE-1234.md) | active |\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "tasks" / "CE-1234.md").write_text(
+                "Context packet - Must read: [packet](../context/CE-1234.md)\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "context" / "CE-1234.md").write_text("Bound context.\n", encoding="utf-8")
+            (root / "package.json").write_text(
+                json.dumps({"scripts": {"project-log:query": "node scripts/quality/project-log.mjs query"}}),
+                encoding="utf-8",
+            )
+            query_script = root / "scripts" / "quality" / "project-log.mjs"
+            query_script.write_text("// benign packet-bound query fixture\n", encoding="utf-8")
+            shard = {
+                "sequence": 1,
+                "path": "docs/project-log/shard-001.md",
+                "state": "closed",
+                "bytes": 8,
+                "sha256": "1" * 64,
+                "git_blob_sha": "1" * 40,
+                "entry_count": 1,
+                "first_heading": "Synthetic",
+                "last_heading": "Synthetic",
+                "task_ids": ["CE-1234"],
+                "legacy_start_byte": 0,
+                "legacy_end_byte_exclusive": 8,
+            }
+            (root / "docs" / "project-log" / "shard-001.md").write_text("# Entry\n", encoding="utf-8")
+            (root / "docs" / "project-log" / "manifest.json").write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "kind": "ce-systems-project-log-manifest",
+                    "agent_access": {
+                        "default_loading": "manifest-only",
+                        "closed_shards_preloaded": False,
+                        "query_command": "pnpm run project-log:query -- <term>",
+                    },
+                    "shards": [shard],
+                }),
+                encoding="utf-8",
+            )
+            git(root, "add", ".")
+            git(root, "commit", "-qm", "CE fixture")
+            profile = setup_project(root)
+            git(root, "add", ".orchestrate.json")
+            git(root, "commit", "-qm", "select fixture profile")
+            query_result = {
+                "term": "CE-1234",
+                "exact_task": "CE-1234",
+                "selected_shards": ["docs/project-log/shard-001.md"],
+                "matches": [{
+                    "path": "docs/project-log/shard-001.md",
+                    "sequence": 1,
+                    "heading": "Synthetic",
+                    "text": "sanitized synthetic match",
+                }],
+                "omitted_matches": 0,
+            }
+            with patch("orchestrate.readers._run_ce_query", return_value=query_result):
+                reader = read_project(profile, "Implement CE-1234")
+            sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+            with StateStore(root) as store:
+                run = store.create_run(
+                    objective="Implement CE-1234",
+                    profile_digest=profile.digest,
+                    source_digest=sources.digest,
+                )
+                run = store.update_run(
+                    run.local_id,
+                    native_run_id="run_1",
+                    task_id="task_1",
+                    phase="awaiting_preflight",
+                )
+                packet = make_packet(
+                    objective=run.objective,
+                    profile=profile,
+                    sources=sources,
+                    launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+                    python_executable=str(Path(sys.executable).resolve()),
+                    run_id="run_1",
+                    reader=reader,
+                )
+                store.save_packet(run.local_id, "task_1", canonical_packet_json(packet))
+
+            query_script.write_text("// changed clean query implementation\n", encoding="utf-8")
+            git(root, "add", "scripts/quality/project-log.mjs")
+            git(root, "commit", "-qm", "change query implementation")
+            client = PreflightClient(root, packet)
+            with patch("subprocess.run", side_effect=AssertionError("no subprocess is allowed")) as called:
+                with self.assertRaises(OrchestrateError) as rejected:
+                    worker_preflight(
+                        root,
+                        run_id="run_1",
+                        task_id="task_1",
+                        dispatch_id="dispatch_1",
+                        packet_id=str(packet["packetId"]),
+                        client=client,
+                        environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                        platform="win32",
+                    )
+            self.assertEqual(rejected.exception.code, "preflight_rejected")
+            self.assertEqual(rejected.exception.data, {"cause": "source_binding_changed"})
+            called.assert_not_called()
+            self.assertEqual(client.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

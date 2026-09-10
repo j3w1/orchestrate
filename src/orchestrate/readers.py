@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
@@ -27,6 +28,7 @@ CE_QUERY_PACKAGE_SCRIPT = "node scripts/quality/project-log.mjs query"
 CE_QUERY_MAX_ENTRIES = 12
 CE_QUERY_MAX_BYTES = 32768
 CE_QUERY_STDOUT_LIMIT = 65536
+CE_QUERY_SOURCES = ("package.json", CE_QUERY_SCRIPT, "docs/project-log/manifest.json")
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +173,14 @@ def _require_tracked_query_sources(root: Path, paths: list[str]) -> None:
         raise OrchestrateError("The CE query implementation or manifest is mutable", code="ce_query_source_changed")
 
 
+def _query_source_identities(profile: ProjectProfile) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for path in CE_QUERY_SOURCES:
+        raw = read_project_text(profile, path).encode("utf-8")
+        result[path] = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+    return result
+
+
 def _run_ce_query(
     profile: ProjectProfile,
     task_id: str,
@@ -178,10 +188,31 @@ def _run_ce_query(
     manifest_text: str,
     package_text: str,
     script_text: str,
+    expected_source_identities: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    paths = ["package.json", CE_QUERY_SCRIPT, "docs/project-log/manifest.json"]
+    paths = list(CE_QUERY_SOURCES)
+    captured = {
+        "package.json": package_text.encode("utf-8"),
+        CE_QUERY_SCRIPT: script_text.encode("utf-8"),
+        "docs/project-log/manifest.json": manifest_text.encode("utf-8"),
+    }
+    expected = {
+        path: {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+        for path, raw in captured.items()
+    } if expected_source_identities is None else {
+        path: dict(expected_source_identities.get(path, {}))
+        for path in paths
+    }
+    captured_identities = {
+        path: {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+        for path, raw in captured.items()
+    }
+    if captured_identities != expected:
+        raise OrchestrateError("The CE query source binding changed before execution", code="ce_query_source_changed")
     _require_tracked_query_sources(profile.root, paths)
     baseline = _git_source_state(profile.root, paths)
+    if _query_source_identities(profile) != expected:
+        raise OrchestrateError("The CE query source binding changed before execution", code="ce_query_source_changed")
     arguments = (
         "pnpm",
         "--silent",
@@ -215,9 +246,7 @@ def _run_ce_query(
         raise OrchestrateError("The CE project-log query did not return strict JSON", code="ce_query_invalid") from exc
     stable = {
         "gitState": _git_source_state(profile.root, paths) == baseline,
-        "manifest": read_project_text(profile, "docs/project-log/manifest.json") == manifest_text,
-        "package": read_project_text(profile, "package.json") == package_text,
-        "queryScript": read_project_text(profile, CE_QUERY_SCRIPT) == script_text,
+        "sourceIdentities": _query_source_identities(profile) == expected,
     }
     if not all(stable.values()):
         raise OrchestrateError(
@@ -264,7 +293,13 @@ def _validate_ce_query(result: object, task_id: str, shards: list[dict[str, Any]
     return result
 
 
-def _read_ce(profile: ProjectProfile, objective: str | None, instructions: dict[str, str], manifests: dict[str, str]) -> ReaderResult:
+def _read_ce(
+    profile: ProjectProfile,
+    objective: str | None,
+    instructions: dict[str, str],
+    manifests: dict[str, str],
+    expected_query_sources: Mapping[str, Mapping[str, Any]] | None,
+) -> ReaderResult:
     if objective is None:
         raise OrchestrateError("The CE reader requires an exact authorized CE task in the objective", code="ce_task_missing")
     task_ids = sorted(set(CE_TASK_ID.findall(objective)))
@@ -330,6 +365,7 @@ def _read_ce(profile: ProjectProfile, objective: str | None, instructions: dict[
             manifest_text=raw_manifest,
             package_text=package_text,
             script_text=script_text,
+            expected_source_identities=expected_query_sources,
         ),
         task_id,
         selected_shards,
@@ -369,7 +405,12 @@ def _read_ce(profile: ProjectProfile, objective: str | None, instructions: dict[
     )
 
 
-def read_project(profile: ProjectProfile, objective: str | None = None) -> ReaderResult:
+def read_project(
+    profile: ProjectProfile,
+    objective: str | None = None,
+    *,
+    expected_ce_query_sources: Mapping[str, Mapping[str, Any]] | None = None,
+) -> ReaderResult:
     instruction_paths = sorted({
         *profile.value["instructions"],
         *instruction_inventory(profile.root),
@@ -381,7 +422,7 @@ def read_project(profile: ProjectProfile, objective: str | None = None) -> Reade
     manifests = _configured_text(profile, "commandManifests")
     kind = profile.value["reader"]["kind"]
     if kind == "ce-gd":
-        return _read_ce(profile, objective, instructions, manifests)
+        return _read_ce(profile, objective, instructions, manifests, expected_ce_query_sources)
     if kind != "repo":
         raise OrchestrateError(f"Unsupported reader: {kind}", code="profile_reader_invalid")
     tasks = _configured_text(profile, "taskEntrypoints")

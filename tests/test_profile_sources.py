@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -461,6 +462,51 @@ class ProfileAndSourceTests(DisposableRepo):
                 )
             ],
         )
+
+    def test_ce_query_wrapper_revalidates_packet_bound_sources_before_pnpm(self) -> None:
+        profile, shards = self._write_ce_fixture([["CE-1234"]])
+        manifest_text = (self.root / "docs" / "project-log" / "manifest.json").read_text(encoding="utf-8")
+        package_text = (self.root / "package.json").read_text(encoding="utf-8")
+        script_path = self.root / "scripts" / "quality" / "project-log.mjs"
+        script_text = script_path.read_text(encoding="utf-8")
+        captured = {
+            "package.json": package_text.encode("utf-8"),
+            "scripts/quality/project-log.mjs": script_text.encode("utf-8"),
+            "docs/project-log/manifest.json": manifest_text.encode("utf-8"),
+        }
+        expected_identities = {
+            path: {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+            for path, raw in captured.items()
+        }
+        script_path.write_text("// clean post-prepass replacement\n", encoding="utf-8")
+        git(self.root, "add", "scripts/quality/project-log.mjs")
+        git(self.root, "commit", "-qm", "replace query after prepass")
+        real_run = subprocess.run
+        query_calls: list[tuple[str, ...]] = []
+
+        def synthetic_run(arguments: tuple[str, ...], **keywords: object) -> subprocess.CompletedProcess[bytes]:
+            if arguments[0] == "pnpm":
+                query_calls.append(arguments)
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    json.dumps(self._query_result(shards)).encode("utf-8"),
+                    b"",
+                )
+            return real_run(arguments, **keywords)
+
+        with patch("orchestrate.readers.subprocess.run", side_effect=synthetic_run):
+            with self.assertRaises(OrchestrateError) as changed:
+                _run_ce_query(
+                    profile,
+                    "CE-1234",
+                    manifest_text=manifest_text,
+                    package_text=package_text,
+                    script_text=script_text,
+                    expected_source_identities=expected_identities,
+                )
+        self.assertEqual(changed.exception.code, "ce_query_source_changed")
+        self.assertEqual(query_calls, [])
 
 
 if __name__ == "__main__":

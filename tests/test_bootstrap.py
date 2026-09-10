@@ -220,6 +220,37 @@ class StaleRuntimeCloseClient(ReconciledCloseClient):
         return response
 
 
+class BooleanExitCloseClient(ReconciledCloseClient):
+    def __init__(self, *, exit_code: int, receipt: bool) -> None:
+        super().__init__(exit_code=exit_code)
+        self.receipt = receipt
+
+    def run_json(self, *arguments: str, **keywords: object) -> dict[str, object]:
+        response = super().run_json(*arguments, **keywords)
+        if arguments[0:2] == ("terminal", "wait"):
+            wait = response["result"]["wait"]  # type: ignore[index]
+            wait["exitCode"] = self.receipt  # type: ignore[index]
+            wait["exitCause"]["exitCode"] = self.receipt  # type: ignore[index]
+        return response
+
+
+class BooleanInventoryCloseClient(ReconciledCloseClient):
+    def __init__(self, *, field: str, value: bool) -> None:
+        super().__init__()
+        self.field = field
+        self.value = value
+
+    def run_json(self, *arguments: str, **keywords: object) -> dict[str, object]:
+        response = super().run_json(*arguments, **keywords)
+        if arguments[0:2] == ("terminal", "list"):
+            inventory = response["result"]  # type: ignore[index]
+            if self.field == "totalCount":
+                inventory["totalCount"] = self.value  # type: ignore[index]
+            else:
+                inventory["topologyRevisions"]["repo::fixture"] = self.value  # type: ignore[index]
+        return response
+
+
 class BootstrapTests(unittest.TestCase):
     def test_payload_round_trip_preserves_spaces_unicode_and_argument_boundaries(self) -> None:
         arguments = ["implement", "fix spaced path 雪", "--project", "C:/a b/雪"]
@@ -306,6 +337,23 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaises(OrchestrateError) as mismatch:
             _exit_code(contradictory, expected_handle="term_controller")
         self.assertEqual(mismatch.exception.code, "bootstrap_exit_unproven")
+
+        for boolean in (False, True):
+            boolean_receipt = {
+                "result": {
+                    "wait": {
+                        "handle": "term_controller",
+                        "condition": "exit",
+                        "satisfied": True,
+                        "status": "exited",
+                        "exitCode": boolean,
+                        "exitCause": {"kind": "exited", "exitCode": boolean},
+                    }
+                }
+            }
+            with self.subTest(boolean_exit_code=boolean), self.assertRaises(OrchestrateError) as boolean_mismatch:
+                _exit_code(boolean_receipt, expected_handle="term_controller")
+            self.assertEqual(boolean_mismatch.exception.code, "bootstrap_exit_unproven")
 
     def test_ctrl_c_still_requires_durable_result_and_exact_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
@@ -426,6 +474,66 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(held.exception.code, "bootstrap_effect_uncertain")
             self.assertFalse(any(call[:2] == ("terminal", "close") for call in recovery.calls))
 
+    def test_uncertain_close_rejects_boolean_exit_receipts_and_durable_results(self) -> None:
+        for integer, boolean in ((0, False), (1, True)):
+            with self.subTest(receipt=boolean), tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
+                os.environ,
+                {"ORCHESTRATE_HOME": state, "ORCA_TERMINAL_HANDLE": ""},
+            ):
+                first = UncertainCloseClient(exit_code=integer)
+                with self.assertRaises(OrchestrateError):
+                    launch_controller(Path(directory), ["status"], client=first)  # type: ignore[arg-type]
+                recovery = BooleanExitCloseClient(exit_code=integer, receipt=boolean)
+                recovery.command = first.command
+                recovery.worktree_path = first.worktree_path
+                with self.assertRaises(OrchestrateError) as held:
+                    launch_controller(Path(directory), ["status"], client=recovery)  # type: ignore[arg-type]
+                self.assertEqual(held.exception.code, "bootstrap_effect_uncertain")
+                self.assertFalse(any(call[:2] == ("terminal", "close") for call in recovery.calls))
+
+            with self.subTest(durable_result=boolean), tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
+                os.environ,
+                {"ORCHESTRATE_HOME": state, "ORCA_TERMINAL_HANDLE": ""},
+            ):
+                first = UncertainCloseClient(exit_code=integer)
+                with self.assertRaises(OrchestrateError):
+                    launch_controller(Path(directory), ["status"], client=first)  # type: ignore[arg-type]
+                database = Path(state) / "bootstrap" / "state.sqlite3"
+                with closing(sqlite3.connect(database)) as connection:
+                    result_path = Path(connection.execute("SELECT result_path FROM invocations").fetchone()[0])
+                result_path.write_text(
+                    json.dumps({
+                        "schema": "orchestrate-bootstrap/v1",
+                        "exitCode": boolean,
+                        "stdout": "controller output\n",
+                    }),
+                    encoding="utf-8",
+                )
+                recovery = ReconciledCloseClient(exit_code=integer)
+                recovery.command = first.command
+                recovery.worktree_path = first.worktree_path
+                with self.assertRaises(OrchestrateError) as held:
+                    launch_controller(Path(directory), ["status"], client=recovery)  # type: ignore[arg-type]
+                self.assertEqual(held.exception.code, "bootstrap_effect_uncertain")
+                self.assertEqual(recovery.calls, [])
+
+    def test_uncertain_close_rejects_boolean_inventory_completeness(self) -> None:
+        for field, boolean in (("totalCount", True), ("topologyRevision", False), ("topologyRevision", True)):
+            with self.subTest(field=field, value=boolean), tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
+                os.environ,
+                {"ORCHESTRATE_HOME": state, "ORCA_TERMINAL_HANDLE": ""},
+            ):
+                first = UncertainCloseClient()
+                with self.assertRaises(OrchestrateError):
+                    launch_controller(Path(directory), ["status"], client=first)  # type: ignore[arg-type]
+                recovery = BooleanInventoryCloseClient(field=field, value=boolean)
+                recovery.command = first.command
+                recovery.worktree_path = first.worktree_path
+                with self.assertRaises(OrchestrateError) as held:
+                    launch_controller(Path(directory), ["status"], client=recovery)  # type: ignore[arg-type]
+                self.assertEqual(held.exception.code, "bootstrap_effect_uncertain")
+                self.assertFalse(any(call[:2] == ("terminal", "close") for call in recovery.calls))
+
     def test_cli_bootstrap_passthrough_emits_one_json_document_and_exact_exit(self) -> None:
         child = {"schema": "orchestrate-report/v1", "status": "worker_succeeded"}
 
@@ -475,6 +583,31 @@ class BootstrapTests(unittest.TestCase):
             result = main(["implement", "synthetic objective", "--json"])
         self.assertEqual(result, 23)
         self.assertEqual(json.loads(output.getvalue())["status"], "blocked")
+
+    def test_worker_unadmitted_is_nonzero_directly_and_through_bootstrap(self) -> None:
+        child = {
+            "schema": "orchestrate-report/v1",
+            "status": "worker_unadmitted",
+            "verification": "not_run",
+        }
+        direct_output = io.StringIO()
+        with patch("orchestrate.cli._execute", return_value=(child, True)), redirect_stdout(direct_output):
+            direct = main(["status", "--json"])
+        self.assertEqual(direct, 1)
+        self.assertEqual(json.loads(direct_output.getvalue()), child)
+
+        def launch(*_: object, **__: object) -> int:
+            print(json.dumps(child))
+            return direct
+
+        bootstrap_output = io.StringIO()
+        with patch("orchestrate.cli._needs_bootstrap", return_value=True), patch(
+            "orchestrate.cli.launch_controller",
+            side_effect=launch,
+        ), redirect_stdout(bootstrap_output):
+            outer = main(["implement", "synthetic objective", "--json"])
+        self.assertEqual(outer, 1)
+        self.assertEqual(json.loads(bootstrap_output.getvalue()), child)
 
 
 if __name__ == "__main__":

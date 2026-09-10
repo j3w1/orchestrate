@@ -245,12 +245,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if report.get("_bootstrapPassthrough") is True:
         exit_code = report.get("controllerExitCode")
-        return exit_code if isinstance(exit_code, int) else 1
+        return exit_code if type(exit_code) is int else 1
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n" if emit_json else _human_text(report)
-    exit_code = 0 if report.get("status") not in {"blocked", "worker_failed"} else 1
+    exit_code = 0 if report.get("status") not in {"blocked", "worker_failed", "worker_unadmitted"} else 1
     if report.get("status") == "interrupted":
         exit_code = 130
-    if isinstance(report.get("controllerExitCode"), int):
+    if type(report.get("controllerExitCode")) is int:
         exit_code = report["controllerExitCode"]
     if result_path is not None:
         result_path.parent.mkdir(parents=True, exist_ok=True)

@@ -21,7 +21,8 @@ from .packets import (
     packet_spec_from_json,
 )
 from .profile import ProjectProfile
-from .readers import ReaderResult, read_project
+from .readers import CE_QUERY_SCRIPT, ReaderResult, read_project
+from .safeio import approved_project_path, read_project_bytes
 from .sources import SourceIndex, build_source_index
 from .state import RunRecord, StateStore, utc_now
 
@@ -55,6 +56,85 @@ def _runtime_id(payload: Mapping[str, Any]) -> str:
     return runtime_id
 
 
+def _operational_profile(profile: ProjectProfile) -> dict[str, Any]:
+    return {
+        "selectedDigest": profile.digest,
+        "candidateDigest": profile.candidate_digest,
+        "selectionSource": profile.selection_source,
+        "selectionHistoryDigest": profile.selection_history_digest,
+        "candidateChanged": profile.candidate_changed,
+    }
+
+
+def _verify_packet_source_bytes(
+    profile: ProjectProfile,
+    packet: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Compare packet-bound profile/source bytes before invoking any subprocess."""
+
+    records = packet.get("sources")
+    if (
+        packet.get("profileDigest") != profile.digest
+        or packet.get("operationalProfile") != _operational_profile(profile)
+        or not isinstance(records, list)
+    ):
+        raise OrchestrateError("Bound operational profile changed", code="source_binding_changed")
+    identities: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise OrchestrateError("Worker packet source identity is malformed", code="packet_identity_conflict")
+        path = record.get("path")
+        expected_sha = record.get("sha256")
+        expected_bytes = record.get("bytes")
+        if (
+            not isinstance(path, str)
+            or not path
+            or path in identities
+            or (expected_sha is not None and not isinstance(expected_sha, str))
+            or type(expected_bytes) is not int
+            or expected_bytes < 0
+        ):
+            raise OrchestrateError("Worker packet source identity is malformed", code="packet_identity_conflict")
+        candidate = approved_project_path(profile.root, path, require_file=False)
+        if expected_sha is None:
+            if candidate.exists() or expected_bytes != 0:
+                raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed")
+            identity = {"sha256": None, "bytes": 0}
+        else:
+            try:
+                raw = read_project_bytes(profile.root, path)
+            except OrchestrateError as exc:
+                raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed") from exc
+            identity = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+            if identity != {"sha256": expected_sha, "bytes": expected_bytes}:
+                raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed")
+        identities[path] = identity
+    return identities
+
+
+def _verify_source_index(
+    profile: ProjectProfile,
+    packet: Mapping[str, Any],
+    sources: SourceIndex,
+) -> None:
+    candidate = sources.value.get("candidate")
+    if not isinstance(candidate, Mapping) or candidate.get("coverageComplete") is not True:
+        raise OrchestrateError(
+            "Dirty candidate coverage is incomplete",
+            code="candidate_coverage_incomplete",
+            data={"uncoveredChanges": candidate.get("uncoveredChanges", []) if isinstance(candidate, Mapping) else []},
+        )
+    if (
+        profile.candidate_changed
+        or packet.get("profileDigest") != profile.digest
+        or packet.get("sourceDigest") != sources.digest
+        or packet.get("operationalProfile") != sources.value.get("operationalProfile")
+        or packet.get("candidate") != sources.value.get("candidate")
+        or packet.get("sources") != sources.value.get("sources")
+    ):
+        raise OrchestrateError("Bound project sources or routing changed", code="source_binding_changed")
+
+
 def validate_packet_sources(
     profile: ProjectProfile,
     run: RunRecord,
@@ -80,24 +160,33 @@ def validate_packet_sources(
         or native_packet.get("runId") != run.native_run_id
     ):
         raise OrchestrateError("Worker packet does not bind the selected native Run", code="packet_identity_conflict")
-    reader = read_project(profile, run.objective)
+    identities = _verify_packet_source_bytes(profile, packet)
+    pre_sources = build_source_index(profile, extra_sources=set(identities))
+    _verify_source_index(profile, packet, pre_sources)
+    packet_reader = packet.get("reader")
+    if (
+        not isinstance(packet_reader, Mapping)
+        or packet_reader.get("kind") != profile.value["reader"]["kind"]
+    ):
+        raise OrchestrateError("Worker packet reader identity is malformed", code="packet_identity_conflict")
+    query_paths = {"package.json", CE_QUERY_SCRIPT, "docs/project-log/manifest.json"}
+    expected_query_sources = (
+        {path: identities[path] for path in query_paths}
+        if packet_reader.get("kind") == "ce-gd" and query_paths.issubset(identities)
+        else None
+    )
+    if packet_reader.get("kind") == "ce-gd" and expected_query_sources is None:
+        raise OrchestrateError("Worker packet omits the CE query source identity", code="packet_identity_conflict")
+    reader = read_project(
+        profile,
+        run.objective,
+        expected_ce_query_sources=expected_query_sources,
+    )
     sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
-    candidate = sources.value.get("candidate")
-    if not isinstance(candidate, Mapping) or candidate.get("coverageComplete") is not True:
-        raise OrchestrateError(
-            "Dirty candidate coverage is incomplete",
-            code="candidate_coverage_incomplete",
-            data={"uncoveredChanges": candidate.get("uncoveredChanges", []) if isinstance(candidate, Mapping) else []},
-        )
+    _verify_source_index(profile, packet, sources)
     actual_reader = {"kind": reader.kind, "routing": reader.routing}
     if (
-        profile.candidate_changed
-        or packet.get("profileDigest") != profile.digest
-        or packet.get("sourceDigest") != sources.digest
-        or packet.get("operationalProfile") != sources.value.get("operationalProfile")
-        or packet.get("candidate") != sources.value.get("candidate")
-        or packet.get("sources") != sources.value.get("sources")
-        or packet.get("reader") != actual_reader
+        packet.get("reader") != actual_reader
     ):
         raise OrchestrateError("Bound project sources or routing changed", code="source_binding_changed")
     return PacketValidation(
@@ -261,6 +350,7 @@ def worker_preflight(
             packet = store.get_packet(run.local_id, task_id)
             if packet.get("packetId") != packet_id:
                 raise OrchestrateError("Supplied packet ID does not match the immutable Task packet", code="packet_identity_conflict")
+            _verify_packet_source_bytes(profile, packet)
             native = _native_identity(
                 client,
                 profile=profile,
