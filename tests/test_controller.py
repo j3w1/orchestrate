@@ -16,8 +16,10 @@ from orchestrate.controller import (
     _finish_prompt_stall_cleanup,
     _mutation,
     _process_delivery,
+    _record_input_submission_diagnostic,
     _release_disposition,
     _request_id,
+    _run_summary,
     answer,
     implement,
     reconcile_intentions,
@@ -64,6 +66,46 @@ def mutation(request_id: str, **result: object) -> dict[str, object]:
             "mutation": {"requestId": request_id, "replayed": False},
         }
     }
+
+
+def lifecycle_message(
+    message_type: str,
+    payload: Mapping[str, object],
+    *,
+    message_id: str,
+    run_id: str = "run_1",
+    dispatch_id: str = "dispatch_1",
+    from_handle: str | None = None,
+    subject: str | None = None,
+    body: str | None = None,
+) -> dict[str, object]:
+    encoded_payload = dict(payload)
+    if message_type == "question":
+        body = "Synthetic question" if body is None else body
+        encoded_payload.setdefault("question", body)
+        encoded_payload.setdefault("options", [])
+    message: dict[str, object] = {
+        "id": message_id,
+        "run_id": run_id,
+        "delivery_contract": "current_delivery",
+        "from_handle": (
+            f"dispatch:{dispatch_id}"
+            if message_type == "question"
+            else "term_worker"
+        ) if from_handle is None else from_handle,
+        "to_handle": f"run:{run_id}",
+        "type": message_type,
+        "priority": "normal",
+        "thread_id": message_id if message_type == "question" else None,
+        "payload": json.dumps(encoded_payload, separators=(",", ":")),
+        "created_at": "2026-01-01T00:00:00Z",
+        "delivered_at": None,
+    }
+    if subject is not None:
+        message["subject"] = subject
+    if body is not None:
+        message["body"] = body
+    return message
 
 
 def request_show(
@@ -619,12 +661,12 @@ def completion_responses(root: Path, objective: str, outcome: str = "succeeded")
         "result": {
             "deliveryId": "delivery_1",
             "messages": [
-                {
-                    "id": "message_done",
-                    "type": "worker_done",
-                    "subject": "done",
-                    "payload": {"taskId": "task_1", "dispatchId": "dispatch_1", "outcome": outcome},
-                }
+                lifecycle_message(
+                    "worker_done",
+                    {"taskId": "task_1", "dispatchId": "dispatch_1", "outcome": outcome},
+                    message_id="message_done",
+                    subject="done",
+                )
             ],
         }
     }
@@ -1101,11 +1143,6 @@ class ControllerTests(unittest.TestCase):
             "worker_terminal_handle",
             "attached_terminal",
         )
-        message_template = {
-            "id": "message_done",
-            "type": "worker_done",
-            "subject": "done",
-        }
         for current_shape in (False, True):
             for outcome in ("succeeded", "failed"):
                 for field in contradiction_fields:
@@ -1151,14 +1188,18 @@ class ControllerTests(unittest.TestCase):
                                 field=field,
                             )
                             client = FakeClient([responses[0], responses[1], latest])
-                            message = {
-                                **message_template,
-                                "payload": {
+                            message = lifecycle_message(
+                                "worker_done",
+                                {
                                     "taskId": "task_1",
                                     "dispatchId": "dispatch_1",
                                     "outcome": outcome,
                                 },
-                            }
+                                message_id="message_done",
+                                subject="done",
+                            )
+                            delivery = {"result": {"deliveryId": "delivery_1", "messages": [message]}}
+                            store.journal_delivery(run.local_id, "delivery_1", delivery, [message])
 
                             with self.assertRaises(OrchestrateError) as caught:
                                 _process_delivery(
@@ -1352,12 +1393,12 @@ class ControllerTests(unittest.TestCase):
                 "result": {
                     "deliveryId": "delivery_q",
                     "messages": [
-                        {
-                            "id": "question_1",
-                            "type": "question",
-                            "body": "Choose A or B",
-                            "payload": {"taskId": "task_1", "dispatchId": "dispatch_1"},
-                        }
+                        lifecycle_message(
+                            "question",
+                            {"taskId": "task_1", "dispatchId": "dispatch_1"},
+                            message_id="question_1",
+                            body="Choose A or B",
+                        )
                     ],
                 }
             }
@@ -1384,6 +1425,319 @@ class ControllerTests(unittest.TestCase):
             require_context=False,
         )
         self.assertEqual(answered["pendingQuestions"], [])
+
+    def test_realistic_raw_wire_question_and_escalation_are_journaled_before_effects(self) -> None:
+        objective = "Hold a real FIFO Delivery"
+        question = lifecycle_message(
+            "question",
+            {
+                "taskId": "task_1",
+                "dispatchId": "dispatch_1",
+                "question": "Should I continue?",
+                "options": ["continue", "stop"],
+            },
+            message_id="question_1",
+            body="Should I continue?",
+        )
+        escalation = lifecycle_message(
+            "escalation",
+            {"taskId": "task_1", "dispatchId": "dispatch_1"},
+            message_id="escalation_1",
+            subject="Blocked: exact fixture",
+            body="The worker is blocked.",
+        )
+        delivery = {
+            "result": {
+                "deliveryId": "delivery_raw",
+                "messages": [question, escalation],
+            }
+        }
+        client = FakeClient([*completion_responses(self.root, objective)[:6], delivery])
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=100,
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["pendingQuestions"], ["question_1"])
+        self.assertFalse(any("--ack" in call for call in client.calls))
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.get_run(str(report["localRunId"]))
+            persisted = store.delivery_messages(run.local_id, "delivery_raw")
+            rows = store.messages(run.local_id, "delivery_raw")
+        self.assertEqual(persisted, [question, escalation])
+        self.assertEqual([row["effect_status"] for row in rows], ["pending-answer", "unresolved"])
+        self.assertIsInstance(persisted[0]["payload"], str)
+
+    def test_raw_lifecycle_payload_rejects_malformed_nonobject_duplicate_and_alias_shapes(self) -> None:
+        payloads = {
+            "predecoded": {"taskId": "task_1", "dispatchId": "dispatch_1"},
+            "malformed": "{",
+            "nonobject": "[]",
+            "duplicate": '{"taskId":"task_1","taskId":"task_1","dispatchId":"dispatch_1"}',
+            "mixed-alias": '{"taskId":"task_1","task_id":"task_1","dispatchId":"dispatch_1"}',
+        }
+        for label, raw_payload in payloads.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as home, StateStore(
+                self.root,
+                home=Path(home),
+            ) as store:
+                run = store.create_run(objective=label, profile_digest="p", source_digest="s")
+                run = store.update_run(
+                    run.local_id,
+                    native_run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id="dispatch_1",
+                    phase="waiting",
+                )
+                _record_fixture_binding(store, run.local_id)
+                message = lifecycle_message(
+                    "heartbeat",
+                    {"taskId": "task_1", "dispatchId": "dispatch_1"},
+                    message_id="message_bad",
+                )
+                message["payload"] = raw_payload
+                delivery = {"result": {"deliveryId": "delivery_bad", "messages": [message]}}
+                store.journal_delivery(run.local_id, "delivery_bad", delivery, [message])
+                client = FakeClient([])
+
+                with self.assertRaises(OrchestrateError) as caught:
+                    _process_delivery(
+                        client,  # type: ignore[arg-type]
+                        store,
+                        run,
+                        "delivery_bad",
+                        [message],
+                    )
+
+                self.assertEqual(caught.exception.code, "delivery_unsupported")
+                self.assertEqual(client.calls, [])
+                persisted = store.connection.execute(
+                    "SELECT acked FROM deliveries WHERE run_local_id = ? AND delivery_id = ?",
+                    (run.local_id, "delivery_bad"),
+                ).fetchone()
+                self.assertEqual(persisted["acked"], 0)
+
+    def test_raw_lifecycle_message_rejects_wrong_run_task_dispatch_and_sender(self) -> None:
+        cases = {
+            "run": lifecycle_message(
+                "heartbeat",
+                {"taskId": "task_1", "dispatchId": "dispatch_1"},
+                message_id="message_bad",
+                run_id="run_other",
+            ),
+            "task": lifecycle_message(
+                "heartbeat",
+                {"taskId": "task_other", "dispatchId": "dispatch_1"},
+                message_id="message_bad",
+            ),
+            "dispatch": lifecycle_message(
+                "heartbeat",
+                {"taskId": "task_1", "dispatchId": "dispatch_other"},
+                message_id="message_bad",
+            ),
+            "question-sender": lifecycle_message(
+                "question",
+                {"taskId": "task_1", "dispatchId": "dispatch_1"},
+                message_id="message_bad",
+                from_handle="term_worker",
+            ),
+            "terminal-sender": lifecycle_message(
+                "escalation",
+                {"taskId": "task_1", "dispatchId": "dispatch_1"},
+                message_id="message_bad",
+                from_handle="dispatch:dispatch_1",
+            ),
+        }
+        for label, message in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as home, StateStore(
+                self.root,
+                home=Path(home),
+            ) as store:
+                run = store.create_run(objective=label, profile_digest="p", source_digest="s")
+                run = store.update_run(
+                    run.local_id,
+                    native_run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id="dispatch_1",
+                    phase="waiting",
+                )
+                _record_fixture_binding(store, run.local_id)
+                delivery = {"result": {"deliveryId": "delivery_bad", "messages": [message]}}
+                store.journal_delivery(run.local_id, "delivery_bad", delivery, [message])
+                client = FakeClient([])
+
+                with self.assertRaises(OrchestrateError) as caught:
+                    _process_delivery(
+                        client,  # type: ignore[arg-type]
+                        store,
+                        run,
+                        "delivery_bad",
+                        [message],
+                    )
+
+                self.assertIn(caught.exception.code, {"delivery_binding_mismatch", "delivery_sender_untrusted"})
+                self.assertEqual(client.calls, [])
+
+    def test_delivery_effects_require_the_immutable_whole_delivery_journal(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective="journal first", profile_digest="p", source_digest="s")
+            run = store.update_run(
+                run.local_id,
+                native_run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                phase="waiting",
+            )
+            _record_fixture_binding(store, run.local_id)
+            message = lifecycle_message(
+                "heartbeat",
+                {"taskId": "task_1", "dispatchId": "dispatch_1"},
+                message_id="heartbeat_1",
+            )
+            client = FakeClient([])
+
+            with self.assertRaises(OrchestrateError) as caught:
+                _process_delivery(
+                    client,  # type: ignore[arg-type]
+                    store,
+                    run,
+                    "delivery_missing",
+                    [message],
+                )
+
+            self.assertEqual(caught.exception.code, "delivery_journal_missing")
+            self.assertIsNone(store.get_run(run.local_id).delivery_id)
+            self.assertEqual(store.evidence(run.local_id), [])
+
+    def test_mixed_fifo_stops_on_stale_row_and_keeps_the_whole_delivery_unacknowledged(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective="mixed FIFO", profile_digest="p", source_digest="s")
+            run = store.update_run(
+                run.local_id,
+                native_run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                phase="waiting",
+            )
+            _record_fixture_binding(store, run.local_id)
+            first = lifecycle_message(
+                "heartbeat",
+                {"taskId": "task_1", "dispatchId": "dispatch_1"},
+                message_id="heartbeat_1",
+            )
+            stale = lifecycle_message(
+                "escalation",
+                {"taskId": "task_other", "dispatchId": "dispatch_1"},
+                message_id="escalation_stale",
+            )
+            messages = [first, stale]
+            delivery = {"result": {"deliveryId": "delivery_mixed", "messages": messages}}
+            store.journal_delivery(run.local_id, "delivery_mixed", delivery, messages)
+            client = FakeClient([])
+
+            with self.assertRaises(OrchestrateError) as caught:
+                _process_delivery(
+                    client,  # type: ignore[arg-type]
+                    store,
+                    run,
+                    "delivery_mixed",
+                    messages,
+                )
+
+            self.assertEqual(caught.exception.code, "delivery_binding_mismatch")
+            rows = store.messages(run.local_id, "delivery_mixed")
+            self.assertEqual([row["effect_status"] for row in rows], ["processed", "observed"])
+            persisted = store.connection.execute(
+                "SELECT acked FROM deliveries WHERE run_local_id = ? AND delivery_id = ?",
+                (run.local_id, "delivery_mixed"),
+            ).fetchone()
+            self.assertEqual(persisted["acked"], 0)
+            self.assertEqual(client.calls, [])
+
+    def test_unproven_worker_turn_records_one_read_only_diagnostic_without_resending(self) -> None:
+        objective = "Diagnose accepted input without a managed preflight"
+        client = FakeClient(
+            [
+                *completion_responses(self.root, objective)[:4],
+                _worker_start(self.root),
+                _worker_start_readback(self.root),
+                {"result": {"deliveryId": None, "messages": [], "timedOut": True}},
+                _worker_start_readback(self.root),
+            ]
+        )
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=300_000,
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "awaiting_preflight")
+        self.assertIn("turn start is unproven", report["nextObligation"])
+        diagnostics = [
+            item for item in report["evidence"]
+            if item["kind"] == "compatibility" and item["subject"] == "worker input submission unproven"
+        ]
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["status"], "unresolved")
+        self.assertFalse(diagnostics[0]["payload"]["taskInputResent"])
+        self.assertEqual(sum("worker-start" in call for call in client.calls), 1)
+        self.assertEqual(sum(call[:2] == ("orchestration", "worker-show") for call in client.calls), 2)
+        self.assertEqual(sum(call[:2] == ("orchestration", "check") for call in client.calls), 1)
+        self.assertFalse(any(call[:2] == ("terminal", "send") for call in client.calls))
+
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.get_run(str(report["localRunId"]))
+            repeated = FakeClient([])
+            _record_input_submission_diagnostic(repeated, store, run)  # type: ignore[arg-type]
+            self.assertEqual(repeated.calls, [])
+            self.assertEqual(
+                sum(item["subject"] == "worker input submission unproven" for item in store.evidence(run.local_id)),
+                1,
+            )
+
+    def test_run_summary_surfaces_precise_rejected_preflight_mismatch(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective="show rejection", profile_digest="p", source_digest="s")
+            run = store.update_run(
+                run.local_id,
+                native_run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                phase="awaiting_preflight",
+            )
+            store.record_preflight(
+                run.local_id,
+                run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                observation={
+                    "schema": "orchestrate-worker-preflight/v1",
+                    "outcome": "rejected",
+                    "mismatches": [
+                        {
+                            "code": "preflight_identity_conflict",
+                            "message": "terminal.executionHostId did not prove local execution",
+                        }
+                    ],
+                },
+            )
+
+            report = _run_summary(store, run)
+
+        self.assertEqual(report["admission"], "rejected")
+        self.assertIn("immutable worker preflight was rejected", report["nextObligation"])
+        self.assertEqual(
+            report["admissionDetail"]["mismatches"][0]["code"],
+            "preflight_identity_conflict",
+        )
 
     def test_uncertain_request_replays_only_exact_native_shape(self) -> None:
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
@@ -1479,12 +1833,12 @@ class ControllerTests(unittest.TestCase):
                 dispatch_id="dispatch_1",
                 phase="waiting",
             )
-            message = {
-                "id": "message_done",
-                "type": "worker_done",
-                "subject": "done",
-                "payload": {"taskId": "task_1", "dispatchId": "dispatch_1", "outcome": "succeeded"},
-            }
+            message = lifecycle_message(
+                "worker_done",
+                {"taskId": "task_1", "dispatchId": "dispatch_1", "outcome": "succeeded"},
+                message_id="message_done",
+                subject="done",
+            )
             payload = {"result": {"deliveryId": "delivery_1", "messages": [message]}}
             store.journal_delivery(run.local_id, "delivery_1", payload, [message])
             _record_fixture_binding(store, run.local_id)
@@ -1504,12 +1858,12 @@ class ControllerTests(unittest.TestCase):
                 dispatch_id="dispatch_1",
                 phase="waiting",
             )
-            message = {
-                "id": "message_done",
-                "type": "worker_done",
-                "subject": "done",
-                "payload": {"taskId": "task_1", "dispatchId": "dispatch_1", "outcome": "succeeded"},
-            }
+            message = lifecycle_message(
+                "worker_done",
+                {"taskId": "task_1", "dispatchId": "dispatch_1", "outcome": "succeeded"},
+                message_id="message_done",
+                subject="done",
+            )
             delivery = {"result": {"deliveryId": "delivery_1", "messages": [message]}}
             store.journal_delivery(run.local_id, "delivery_1", delivery, [message])
             _record_fixture_binding(store, run.local_id)
@@ -1541,12 +1895,12 @@ class ControllerTests(unittest.TestCase):
         objective = "Complete"
         reader = read_project(profile, objective)
         sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
-        message = {
-            "id": "message_done",
-            "type": "worker_done",
-            "subject": "done",
-            "payload": {"taskId": "task_1", "dispatchId": "dispatch_1", "outcome": "succeeded"},
-        }
+        message = lifecycle_message(
+            "worker_done",
+            {"taskId": "task_1", "dispatchId": "dispatch_1", "outcome": "succeeded"},
+            message_id="message_done",
+            subject="done",
+        )
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
             run = store.create_run(objective=objective, profile_digest=profile.digest, source_digest=sources.digest)
             run = store.update_run(
@@ -1606,12 +1960,12 @@ class ControllerTests(unittest.TestCase):
                 "result": {
                     "deliveryId": "delivery_q",
                     "messages": [
-                        {
-                            "id": "question_1",
-                            "type": "question",
-                            "body": "pause",
-                            "payload": {"taskId": "task_1", "dispatchId": "dispatch_1"},
-                        }
+                        lifecycle_message(
+                            "question",
+                            {"taskId": "task_1", "dispatchId": "dispatch_1"},
+                            message_id="question_1",
+                            body="pause",
+                        )
                     ],
                 }
             }
@@ -2311,12 +2665,12 @@ class ControllerTests(unittest.TestCase):
                 "result": {
                     "deliveryId": "delivery_q",
                     "messages": [
-                        {
-                            "id": "question_1",
-                            "type": "question",
-                            "body": "Continue?",
-                            "payload": {"taskId": "task_1", "dispatchId": "dispatch_1"},
-                        }
+                        lifecycle_message(
+                            "question",
+                            {"taskId": "task_1", "dispatchId": "dispatch_1"},
+                            message_id="question_1",
+                            body="Continue?",
+                        )
                     ],
                 }
             },

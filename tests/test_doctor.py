@@ -312,13 +312,24 @@ class DoctorTests(unittest.TestCase):
     def done_message(self, *, outcome: str = "succeeded", files: list[str] | None = None) -> dict[str, Any]:
         return {
             "id": "message_done",
+            "run_id": "run_probe",
+            "delivery_contract": "current_delivery",
+            "from_handle": "term_probe",
+            "to_handle": "run:run_probe",
             "type": "worker_done",
-            "payload": {
-                "taskId": "task_probe",
-                "dispatchId": "dispatch_probe",
-                "outcome": outcome,
-                "filesModified": [] if files is None else files,
-            },
+            "priority": "normal",
+            "thread_id": None,
+            "payload": json.dumps(
+                {
+                    "taskId": "task_probe",
+                    "dispatchId": "dispatch_probe",
+                    "outcome": outcome,
+                    "filesModified": [] if files is None else files,
+                },
+                separators=(",", ":"),
+            ),
+            "created_at": "2026-01-01T00:00:00Z",
+            "delivered_at": None,
         }
 
     def test_error_report_retains_structured_recovery_data(self) -> None:
@@ -390,6 +401,11 @@ class DoctorTests(unittest.TestCase):
         release_index = next(i for i, call in enumerate(client.calls) if "worker-release" in call)
         ack_index = next(i for i, call in enumerate(client.calls) if "--ack" in call)
         self.assertLess(release_index, ack_index)
+        persisted = json.loads(
+            (Path(self.state_temp.name) / "probes" / f"{minted['probeToken']}.json").read_text()
+        )
+        self.assertEqual(persisted["state"], "delivery_observed")
+        self.assertEqual(persisted["delivery"]["result"]["deliveryId"], "delivery_probe")
         start = next(call for call in client.calls if "worker-start" in call)
         self.assertIn(f"path:{self.root.resolve()}", start)
 

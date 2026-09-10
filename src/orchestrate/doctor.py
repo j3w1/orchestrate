@@ -16,8 +16,10 @@ from .errors import OrchestrateError
 from .identity import require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError
 from .orca_compat import (
+    LifecycleMessageShapeError,
     TerminalResourceIdentity,
     WorkerShowShapeError,
+    current_lifecycle_message_payload,
     worker_execution_identity,
     worker_show_dispatch_identity,
     worker_show_identity,
@@ -299,6 +301,7 @@ def _delivery(payload: Mapping[str, Any]) -> tuple[str, list[Mapping[str, Any]]]
     messages = result.get("messages")
     if (
         not isinstance(delivery_id, str)
+        or not delivery_id
         or not isinstance(messages, list)
         or not all(isinstance(item, Mapping) for item in messages)
     ):
@@ -358,8 +361,10 @@ def _contract_step(
 def _validate_delivery_messages(
     messages: list[Mapping[str, Any]],
     *,
+    run_id: str,
     task_id: str,
     dispatch_id: str,
+    terminal_handle: str,
 ) -> tuple[str, str | None]:
     message_types = [_message_type(message) for message in messages]
     interventions = sorted({item for item in message_types if item in {"escalation", "question"}})
@@ -380,20 +385,25 @@ def _validate_delivery_messages(
             "The probe requires exactly one worker_done; "
             "the Delivery remains unacknowledged for coordinator inspection"
         )
-    for message in messages:
-        payload = message.get("payload")
-        if not isinstance(payload, Mapping):
-            raise ProbeContractError(
-                "Lifecycle mail omitted its payload; the Delivery remains unacknowledged"
+    decoded_payloads: dict[str, dict[str, Any]] = {}
+    for ordinal, message in enumerate(messages):
+        try:
+            payload = current_lifecycle_message_payload(
+                message,
+                run_id=run_id,
+                task_id=task_id,
+                dispatch_id=dispatch_id,
+                terminal_handle=terminal_handle,
             )
-        bound_task = payload.get("taskId")
-        bound_dispatch = payload.get("dispatchId")
-        if bound_task != task_id or bound_dispatch != dispatch_id:
+        except LifecycleMessageShapeError as exc:
             raise ProbeContractError(
-                "The FIFO Delivery contains mail not bound to the launched Task and Dispatch; "
-                "it remains unacknowledged for coordinator inspection"
-            )
-    done_payload = done_messages[0].get("payload")
+                f"Invalid current lifecycle wire row: {exc}; "
+                "the Delivery remains unacknowledged for coordinator inspection"
+            ) from exc
+        message_id = message.get("id")
+        decoded_payloads[message_id if isinstance(message_id, str) else f"ordinal-{ordinal}"] = payload
+    done_id = done_messages[0].get("id")
+    done_payload = decoded_payloads.get(done_id) if isinstance(done_id, str) else None
     worker_outcome = done_payload.get("outcome") if isinstance(done_payload, Mapping) else None
     if worker_outcome not in {"succeeded", "failed"}:
         raise ProbeContractError(
@@ -731,6 +741,9 @@ def run_worker_probe(client: OrcaClient, probe_token: str, *, project: Path, wai
         "--json",
         timeout_seconds=(wait_timeout_ms / 1000) + 30,
     )
+    receipt["state"] = "delivery_observed"
+    receipt["delivery"] = delivery_payload
+    _write_probe_receipt(probe_token, receipt)
     delivery_id, messages = _contract_step(
         receipts,
         "deliveryContract",
@@ -741,8 +754,10 @@ def run_worker_probe(client: OrcaClient, probe_token: str, *, project: Path, wai
         "deliveryValidation",
         lambda: _validate_delivery_messages(
             messages,
+            run_id=run_id,
             task_id=task_id,
             dispatch_id=dispatch_id,
+            terminal_handle=terminal_handle,
         ),
     )
     settled_worker = _probe_call(

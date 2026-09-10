@@ -26,7 +26,9 @@ The project keeps one small tracked file and one host-local database.
 
 `.orchestrate.json` points at instructions, task sources, command manifests, optional selected `candidateSources`, and checks. The explicitly invoked initial `orchestrate setup` discovers conventional entrypoint names, runs nothing, and records that exact profile as a host-local operational selection outside the candidate. Committing a later profile edit does not select it and cannot grant itself new sources, checks, or reader behavior; the controller holds until the operator reviews the change and uses the explicit acknowledgment option. Before dispatch, the reader inventories bounded tracked, untracked, and ignored conventional instruction files and identifies the exact non-secret bytes it consulted, including relevant staged bytes, while Git status remains an opaque candidate identity. Any dirty path outside that selected coverage produces a hold instead of being opened speculatively. The packet sent to the worker carries those bindings rather than a vague description of HEAD. Project instructions and governance still decide whether the work itself is authorized and accepted.
 
-Every Orca orchestration mutation starts as a durable intention. Exact native request receipts, Task/Run readback, requested-versus-effective launch values, worker placement, and structured release state are checked before the local state advances. Every Delivery is journaled whole before its messages have effects. Completion is accepted only for the exact Task and Dispatch, release is settled before acknowledgment, and missing request history stays uncertain.
+Every Orca orchestration mutation starts as a durable intention. Exact native request receipts, Task/Run readback, requested-versus-effective launch values, worker placement, and structured release state are checked before the local state advances. Every Delivery is journaled whole before its messages have effects. Current Orca lifecycle rows retain their raw JSON-string payloads in that journal, then undergo strict Run, Task, Dispatch, sender, and alias validation before any effect. Completion is accepted only for the exact Task and Dispatch, release is settled before acknowledgment, and missing request history stays uncertain.
+
+`worker-start` reporting `ready` at `input_accepted` proves accepted input, not a started model turn. If the managed preflight still has not appeared when foreground observation ends, orchestrate performs one exact read-only `worker-show`, records an unresolved compatibility diagnostic, and returns without resending the task text, pressing a UI key, launching a replacement, or claiming failure.
 
 Mutating commands need an ordinary Orca controller terminal. Native terminal, worktree, Dispatch, and current-Run readback distinguishes that caller from an agent; hook credentials alone are not treated as agent identity. If you start from an outside PowerShell, orchestrate opens one in the exact workspace, journals each terminal lifecycle intention, keeps the command in the foreground, forwards Ctrl-C, reproduces the child result and exit code, and closes that dedicated tab. A lost create, interrupt, or close response without a public recovery identity stays uncertain and cannot launch a replacement. It refuses to use a reasoning-agent terminal as a dispatch-depth shortcut.
 
@@ -126,6 +128,7 @@ For a copyable disposable live exercise, use [Live first-increment exercise](doc
 - Repository and CE task-registry/context/manifest-first reader boundaries.
 - Exact Git/source identities and one immutable `orchestrate-worker-packet/v3` packet per Task.
 - One immutable managed worker-preflight observation, joined to the native launch before worker claims can count.
+- Strict current-Delivery wire parsing with Dispatch-bound question senders and exact worker-terminal lifecycle senders.
 - Host-local SQLite intentions, Deliveries, questions, evidence, and OS locks.
 - A host-local operational-profile selection history that cannot live inside the project or a recognized synchronized root.
 - Deterministic Run creation, Task creation, one-worker launch, supervision, answer, release, acknowledgment, and resume.
@@ -144,6 +147,7 @@ There is no parallel task database, worktree manager, provider API, policy engin
 - **Admission is provenance, not a sandbox.** Managed workers prove exact preflight identity; hostile shell bypass and unrelated external writers remain outside this guarantee.
 - **Effects are replayed, not guessed.** Unknown external effects stop repetition.
 - **Every message counts.** FIFO Deliveries are processed in full and acknowledged as a whole.
+- **Accepted input is not invented progress.** An unproven turn start becomes a bounded diagnostic, never duplicate input.
 - **Evidence keeps its label.** Worker success, local verification, hosted proof, independent review, acceptance, merge, and release are different things.
 - **WIP is a candidate, not clutter.** Dirty status is bound opaquely; only operationally selected or reader-consulted paths are read and hashed, and uncovered paths hold dispatch.
 

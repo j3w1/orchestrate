@@ -259,14 +259,34 @@ def _native_identity(
     ]
     if platform != "win32" or command_python != expected_python or command != expected_command:
         raise OrchestrateError("Worker preflight supports only its exact controller Python on native Windows", code="preflight_host_unsupported")
-    if not isinstance(terminal, Mapping) or (
-        terminal.get("handle") != handle
-        or terminal.get("connected") is not True
-        or terminal.get("writable") is not True
-        or terminal.get("hostPlatform") != "win32"
-        or terminal.get("agentIdentity") != launch.get("agent")
-    ):
-        raise OrchestrateError("terminal show did not prove the exact worker actor", code="preflight_identity_conflict")
+    if not isinstance(terminal, Mapping):
+        raise OrchestrateError("terminal show omitted the worker terminal object", code="preflight_identity_conflict")
+    identity_mismatches: list[dict[str, Any]] = []
+    expected_terminal_fields = (
+        ("terminal.handle", handle, terminal.get("handle")),
+        ("terminal.connected", True, terminal.get("connected")),
+        ("terminal.writable", True, terminal.get("writable")),
+        ("terminal.executionHostId", "local", terminal.get("executionHostId")),
+        ("terminal.agentIdentity", launch.get("agent"), terminal.get("agentIdentity")),
+    )
+    for field, expected, actual in expected_terminal_fields:
+        if actual != expected or type(actual) is not type(expected):
+            identity_mismatches.append({"field": field, "expected": expected, "actual": actual})
+    if "hostPlatform" in terminal and terminal.get("hostPlatform") != "win32":
+        identity_mismatches.append(
+            {
+                "field": "terminal.hostPlatform",
+                "expected": "win32 when reported",
+                "actual": terminal.get("hostPlatform"),
+            }
+        )
+    if identity_mismatches:
+        fields = ", ".join(item["field"] for item in identity_mismatches)
+        raise OrchestrateError(
+            f"terminal show did not prove the exact local Windows worker actor: {fields}",
+            code="preflight_identity_conflict",
+            data={"fields": identity_mismatches},
+        )
     root = terminal.get("worktreePath")
     worktree_id = terminal.get("worktreeId")
     if (
@@ -320,7 +340,14 @@ def _native_identity(
         "actor": terminal.get("agentIdentity"),
         "terminalHandle": handle,
         "executionHostId": terminal.get("executionHostId"),
+        "controllerPlatform": platform,
         "hostPlatform": terminal.get("hostPlatform"),
+        "terminalHostPlatform": terminal.get("hostPlatform"),
+        "hostPlatformEvidence": (
+            "terminal-show"
+            if terminal.get("hostPlatform") == "win32"
+            else "native-controller-and-local-execution-host"
+        ),
         "worktreeId": worktree_id,
         "worktreeRoot": os.fspath(profile.root.resolve()),
         "launch": dict(launch),
@@ -406,6 +433,9 @@ def worker_preflight(
                 if isinstance(exc, (OrchestrateError, OrcaCommandError))
                 else "preflight_contract_invalid"
             )
+            mismatch: dict[str, Any] = {"code": code, "message": str(exc)}
+            if isinstance(exc, OrchestrateError) and exc.data is not None:
+                mismatch["details"] = exc.data
             rejected = {
                 "schema": PREFLIGHT_SCHEMA,
                 "outcome": "rejected",
@@ -416,7 +446,7 @@ def worker_preflight(
                 "native": native,
                 "observedAt": utc_now(),
                 "limitations": ["No managed editing admission was established."],
-                "mismatches": [{"code": code, "message": str(exc)}],
+                "mismatches": [mismatch],
             }
             store.record_preflight(
                 run.local_id,
@@ -425,7 +455,11 @@ def worker_preflight(
                 dispatch_id=dispatch_id,
                 observation=rejected,
             )
-            raise OrchestrateError("Worker preflight was rejected", code="preflight_rejected", data={"cause": code}) from exc
+            raise OrchestrateError(
+                "Worker preflight was rejected",
+                code="preflight_rejected",
+                data={"cause": code, "mismatches": rejected["mismatches"]},
+            ) from exc
 
 
 def joined_preflight_status(store: StateStore, run: RunRecord) -> str:

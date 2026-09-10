@@ -4,11 +4,20 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import json
 from typing import Any, Literal
 
 
 class WorkerShowShapeError(ValueError):
     """The readback is neither one exact supported shape nor a consistent alias pair."""
+
+
+class LifecycleMessageShapeError(ValueError):
+    """A current Delivery row has an unsupported shape, binding, or sender."""
+
+    def __init__(self, message: str, *, category: Literal["shape", "binding", "sender"] = "shape") -> None:
+        super().__init__(message)
+        self.category = category
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +54,99 @@ class WorkerExecutionShape:
     worker_state: str
     worker_stage: str
     last_error: str | None
+
+
+_CURRENT_LIFECYCLE_TYPES = frozenset({"heartbeat", "question", "escalation", "worker_done"})
+_MESSAGE_IDENTITY_ALIASES = frozenset({"runId", "deliveryContract", "fromHandle", "toHandle"})
+_PAYLOAD_IDENTITY_ALIASES = frozenset({"task_id", "dispatch_id", "runId", "run_id"})
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-JSON numeric constant {value}")
+
+
+def _strict_json_object(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, str):
+        raise LifecycleMessageShapeError("current lifecycle payload is not a JSON string")
+
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        decoded: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in decoded:
+                raise ValueError(f"duplicate JSON key {key}")
+            decoded[key] = value
+        return decoded
+
+    try:
+        decoded = json.loads(
+            raw,
+            object_pairs_hook=object_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise LifecycleMessageShapeError(f"current lifecycle payload is invalid JSON: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise LifecycleMessageShapeError("current lifecycle payload JSON is not an object")
+    return decoded
+
+
+def current_lifecycle_message_payload(
+    message: Mapping[str, Any],
+    *,
+    run_id: str,
+    task_id: str,
+    dispatch_id: str,
+    terminal_handle: str,
+) -> dict[str, Any]:
+    """Validate and decode the exact Orca 1.4.199 current Delivery wire row."""
+
+    message_id = message.get("id")
+    message_type = message.get("type")
+    if not isinstance(message_id, str) or not message_id:
+        raise LifecycleMessageShapeError("current lifecycle row omitted its message id")
+    if not isinstance(message_type, str) or message_type not in _CURRENT_LIFECYCLE_TYPES:
+        raise LifecycleMessageShapeError("current Delivery contains unsupported or malformed lifecycle mail")
+    present_message_aliases = sorted(_MESSAGE_IDENTITY_ALIASES.intersection(message))
+    if present_message_aliases:
+        raise LifecycleMessageShapeError(
+            f"current lifecycle row used unsupported identity aliases: {', '.join(present_message_aliases)}"
+        )
+    if message.get("delivery_contract") != "current_delivery":
+        raise LifecycleMessageShapeError("lifecycle row omitted delivery_contract=current_delivery")
+    if message.get("run_id") != run_id or message.get("to_handle") != f"run:{run_id}":
+        raise LifecycleMessageShapeError(
+            "lifecycle row is stale or belongs to another Run",
+            category="binding",
+        )
+
+    payload = _strict_json_object(message.get("payload"))
+    present_payload_aliases = sorted(_PAYLOAD_IDENTITY_ALIASES.intersection(payload))
+    if present_payload_aliases:
+        raise LifecycleMessageShapeError(
+            f"current lifecycle payload used unsupported identity aliases: {', '.join(present_payload_aliases)}"
+        )
+    if payload.get("taskId") != task_id or payload.get("dispatchId") != dispatch_id:
+        raise LifecycleMessageShapeError(
+            "lifecycle payload is stale or belongs to another Task or Dispatch",
+            category="binding",
+        )
+    if message_type == "question":
+        question = payload.get("question")
+        options = payload.get("options")
+        if not isinstance(question, str) or not question or message.get("body") != question:
+            raise LifecycleMessageShapeError(
+                "current question payload does not match its exact message body"
+            )
+        if not isinstance(options, list) or any(not isinstance(item, str) for item in options):
+            raise LifecycleMessageShapeError("current question payload has malformed options")
+
+    expected_sender = f"dispatch:{dispatch_id}" if message_type == "question" else terminal_handle
+    if message.get("from_handle") != expected_sender:
+        raise LifecycleMessageShapeError(
+            f"{message_type} sender is not the exact bound {'Dispatch' if message_type == 'question' else 'worker terminal'}",
+            category="sender",
+        )
+    return payload
 
 
 # Orca's worker stage records execution progress; terminalResource records the

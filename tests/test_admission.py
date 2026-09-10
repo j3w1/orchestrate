@@ -23,10 +23,22 @@ def git(root: Path, *arguments: str) -> None:
 
 
 class PreflightClient:
-    def __init__(self, root: Path, packet: dict[str, object], *, current_worker_shape: bool = False) -> None:
+    def __init__(
+        self,
+        root: Path,
+        packet: dict[str, object],
+        *,
+        current_worker_shape: bool = False,
+        include_host_platform: bool = True,
+        host_platform: object = "win32",
+        execution_host_id: object = "local",
+    ) -> None:
         self.root = root
         self.packet = packet
         self.current_worker_shape = current_worker_shape
+        self.include_host_platform = include_host_platform
+        self.host_platform = host_platform
+        self.execution_host_id = execution_host_id
         self.calls: list[tuple[str, ...]] = []
 
     @staticmethod
@@ -38,12 +50,15 @@ class PreflightClient:
         worktree_id = f"repo::{self.root.resolve()}"
         launch = self.packet["admission"]["launch"]  # type: ignore[index]
         if arguments[:2] == ("terminal", "show"):
-            return self._wrap({"terminal": {
+            terminal = {
                 "handle": "term_worker", "worktreeId": worktree_id,
-                "worktreePath": str(self.root.resolve()), "executionHostId": "local",
-                "hostPlatform": "win32", "agentIdentity": "codex",
+                "worktreePath": str(self.root.resolve()), "executionHostId": self.execution_host_id,
+                "agentIdentity": "codex",
                 "connected": True, "writable": True,
-            }})
+            }
+            if self.include_host_platform:
+                terminal["hostPlatform"] = self.host_platform
+            return self._wrap({"terminal": terminal})
         if arguments[:2] == ("worktree", "current"):
             return self._wrap({"worktree": {"id": worktree_id, "path": str(self.root.resolve())}})
         if arguments[:2] == ("orchestration", "worker-show"):
@@ -147,6 +162,81 @@ class AdmissionTests(unittest.TestCase):
             platform="win32",
         )
         self.assertEqual(report["status"], "admitted")
+
+    def test_orca_1_4_199_local_terminal_without_host_platform_is_admitted_on_native_windows(self) -> None:
+        report = worker_preflight(
+            self.root,
+            run_id="run_1",
+            task_id="task_1",
+            dispatch_id="dispatch_1",
+            packet_id=str(self.packet["packetId"]),
+            client=PreflightClient(
+                self.root,
+                self.packet,
+                current_worker_shape=True,
+                include_host_platform=False,
+            ),  # type: ignore[arg-type]
+            environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+            platform="win32",
+        )
+        native = report["observation"]["native"]  # type: ignore[index]
+        self.assertEqual(native["controllerPlatform"], "win32")
+        self.assertIsNone(native["terminalHostPlatform"])
+        self.assertEqual(native["hostPlatformEvidence"], "native-controller-and-local-execution-host")
+
+    def test_terminal_reported_non_windows_platform_is_rejected_precisely(self) -> None:
+        client = PreflightClient(self.root, self.packet, host_platform="linux")
+        with self.assertRaises(OrchestrateError) as rejected:
+            worker_preflight(
+                self.root,
+                run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                packet_id=str(self.packet["packetId"]),
+                client=client,  # type: ignore[arg-type]
+                environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                platform="win32",
+            )
+        self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(rejected.exception.data["cause"], "preflight_identity_conflict")  # type: ignore[index]
+        mismatch = rejected.exception.data["mismatches"][0]  # type: ignore[index]
+        self.assertEqual(mismatch["details"]["fields"][0]["field"], "terminal.hostPlatform")
+
+    def test_terminal_without_execution_host_identity_is_rejected_as_ambiguous(self) -> None:
+        client = PreflightClient(
+            self.root,
+            self.packet,
+            include_host_platform=False,
+            execution_host_id=None,
+        )
+        with self.assertRaises(OrchestrateError) as rejected:
+            worker_preflight(
+                self.root,
+                run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                packet_id=str(self.packet["packetId"]),
+                client=client,  # type: ignore[arg-type]
+                environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                platform="win32",
+            )
+        mismatch = rejected.exception.data["mismatches"][0]  # type: ignore[index]
+        self.assertEqual(mismatch["details"]["fields"][0]["field"], "terminal.executionHostId")
+
+    def test_terminal_on_a_different_execution_host_is_rejected_even_if_it_reports_windows(self) -> None:
+        client = PreflightClient(self.root, self.packet, execution_host_id="connected-host")
+        with self.assertRaises(OrchestrateError) as rejected:
+            worker_preflight(
+                self.root,
+                run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                packet_id=str(self.packet["packetId"]),
+                client=client,  # type: ignore[arg-type]
+                environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                platform="win32",
+            )
+        self.assertEqual(rejected.exception.data["cause"], "preflight_identity_conflict")  # type: ignore[index]
 
     def test_rejected_then_restored_sources_never_become_admitted(self) -> None:
         original = (self.root / "AGENTS.md").read_bytes()
@@ -287,7 +377,11 @@ class AdmissionTests(unittest.TestCase):
                         platform="win32",
                     )
             self.assertEqual(rejected.exception.code, "preflight_rejected")
-            self.assertEqual(rejected.exception.data, {"cause": "source_binding_changed"})
+            self.assertEqual(rejected.exception.data["cause"], "source_binding_changed")  # type: ignore[index]
+            self.assertEqual(
+                rejected.exception.data["mismatches"][0]["code"],  # type: ignore[index]
+                "source_binding_changed",
+            )
             called.assert_not_called()
             self.assertEqual(client.calls, [])
 

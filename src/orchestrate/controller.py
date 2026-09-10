@@ -16,8 +16,10 @@ from .errors import OrchestrateError
 from .identity import ControllerIdentity, require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError, orca_task_title
 from .orca_compat import (
+    LifecycleMessageShapeError,
     TerminalResourceIdentity,
     WorkerShowShapeError,
+    current_lifecycle_message_payload,
     worker_execution_identity,
     worker_show_dispatch_identity,
     worker_show_identity,
@@ -35,6 +37,7 @@ TERMINAL_PHASES = {"worker_succeeded", "worker_failed", "worker_unadmitted", "bl
 PROMPT_STALL_ERROR = "agent_prompt_stalled"
 PROMPT_STALL_STAGE = "dispatch_input"
 PROMPT_STALL_CLEANUP_PHASE = "launch_cleanup_pending"
+INPUT_SUBMISSION_DIAGNOSTIC_SUBJECT = "worker input submission unproven"
 
 
 def _result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -583,10 +586,39 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
 
 def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> JsonObject:
     pending = store.pending_questions(run.local_id)
+    admission = joined_preflight_status(store, run)
+    admission_detail: object = None
+    if run.task_id and run.dispatch_id:
+        try:
+            observation = store.get_preflight(run.local_id, run.task_id, run.dispatch_id)
+        except OrchestrateError as exc:
+            admission_detail = {"status": "conflicting", "code": exc.code, "message": str(exc)}
+        else:
+            if isinstance(observation, Mapping):
+                admission_detail = {
+                    "outcome": observation.get("outcome"),
+                    "mismatches": observation.get("mismatches", []),
+                    "limitations": observation.get("limitations", []),
+                    "observedAt": observation.get("observedAt"),
+                }
+    input_unproven = any(
+        item["kind"] == "compatibility" and item["subject"] == INPUT_SUBMISSION_DIAGNOSTIC_SUBJECT
+        for item in store.evidence(run.local_id)
+    )
     if pending:
         next_obligation = f"answer question {pending[0]['message_id']}"
     elif run.phase == "worker_succeeded" and run.verification_status == "pending":
         next_obligation = "independent verification and project acceptance remain unresolved"
+    elif run.phase == "awaiting_preflight" and admission == "rejected":
+        next_obligation = (
+            "the immutable worker preflight was rejected; inspect admissionDetail and settle "
+            "this attempt without issuing a fresh editing grant"
+        )
+    elif run.phase == "awaiting_preflight" and input_unproven:
+        next_obligation = (
+            "worker input was accepted but turn start is unproven; inspect the bound Dispatch "
+            "without resending task input"
+        )
     elif run.phase == "awaiting_preflight":
         next_obligation = "worker must complete the exact managed preflight before edits or checks"
     elif run.phase == "waiting":
@@ -608,7 +640,8 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
         "dispatchId": run.dispatch_id,
         "workerOutcome": run.worker_outcome,
         "verification": run.verification_status,
-        "admission": joined_preflight_status(store, run),
+        "admission": admission,
+        "admissionDetail": admission_detail,
         "pendingQuestions": [row["message_id"] for row in pending],
         "nextObligation": next_obligation,
         "live": live,
@@ -1189,7 +1222,7 @@ def _delivery(payload: Mapping[str, Any]) -> tuple[str | None, list[dict[str, An
     messages = result.get("messages")
     if delivery_id is None and messages in (None, []):
         return None, []
-    if not isinstance(delivery_id, str) or not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
+    if not isinstance(delivery_id, str) or not delivery_id or not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
         raise OrchestrateError("Orca check returned a malformed Delivery", code="orca_contract_error")
     return delivery_id, messages
 
@@ -1199,6 +1232,102 @@ def _join_admission(store: StateStore, run: RunRecord) -> tuple[RunRecord, str]:
     if status == "admitted" and run.phase == "awaiting_preflight":
         run = store.update_run(run.local_id, phase="waiting")
     return run, status
+
+
+def _record_input_submission_diagnostic(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+) -> bool:
+    """Record one read-only diagnostic when accepted input has not produced preflight."""
+
+    if any(
+        item["kind"] == "compatibility" and item["subject"] == INPUT_SUBMISSION_DIAGNOSTIC_SUBJECT
+        for item in store.evidence(run.local_id)
+    ):
+        return True
+    binding = store.get_worker_resource_binding(run.local_id)
+    if binding is None or binding.dispatch_id != run.dispatch_id:
+        return False
+
+    def persist(status: str, readback: Mapping[str, Any]) -> bool:
+        store.add_evidence(
+            run.local_id,
+            kind="compatibility",
+            status=status,
+            subject=INPUT_SUBMISSION_DIAGNOSTIC_SUBJECT,
+            payload={
+                "code": "worker_input_submission_unproven",
+                "runId": run.native_run_id,
+                "taskId": run.task_id,
+                "dispatchId": run.dispatch_id,
+                "terminalHandle": binding.terminal_handle,
+                "turnStarted": "unproven",
+                "taskInputResent": False,
+                "externalEffect": "none; worker-show readback only",
+                "workerReadback": dict(readback),
+            },
+        )
+        return True
+
+    try:
+        payload = client.run_json(
+            "orchestration",
+            "worker-show",
+            "--dispatch",
+            str(run.dispatch_id),
+            "--json",
+        )
+        result = _result(payload)
+        dispatch = result.get("dispatch")
+        worker = result.get("worker")
+        resource = result.get("terminalResource")
+        if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping) or not isinstance(resource, Mapping):
+            return persist("conflicting", {"status": "malformed"})
+        identity = worker_show_identity(dispatch, worker)
+        resource_identity = worker_terminal_resource_identity(
+            resource,
+            dispatch_id=str(run.dispatch_id),
+        )
+    except OrcaCommandError as exc:
+        return persist("unavailable", {"status": "unavailable", "code": exc.code})
+    except OrchestrateError as exc:
+        return persist("conflicting", {"status": "malformed", "code": exc.code})
+    except WorkerShowShapeError:
+        return persist("conflicting", {"status": "unsupported-identity-shape"})
+    if (
+        dispatch.get("id") != run.dispatch_id
+        or identity.dispatch.run_id != run.native_run_id
+        or identity.dispatch.task_id != run.task_id
+        or identity.dispatch_id != run.dispatch_id
+        or identity.worktree_id != binding.worktree_id
+        or identity.terminal_handle != binding.terminal_handle
+        or resource_identity.resource_id != binding.resource_id
+        or resource_identity.terminal_handle != binding.terminal_handle
+        or resource_identity.worktree_id != binding.worktree_id
+        or resource.get("ownershipState") != "owned"
+        or resource.get("releaseState") != "not_requested"
+        or dispatch.get("status") != "dispatched"
+        or worker.get("state") != "ready"
+        or worker.get("stage") != "input_accepted"
+    ):
+        return persist("conflicting", {"status": "identity-or-state-mismatch"})
+    observation = result.get("observation")
+    if isinstance(observation, Mapping) and "agentWait" in observation:
+        agent_wait: object = observation.get("agentWait")
+    elif isinstance(observation, Mapping):
+        agent_wait = "not-reported"
+    else:
+        agent_wait = "observation-unavailable"
+    return persist(
+        "unresolved",
+        {
+            "status": "matched-input-accepted",
+            "workerState": worker.get("state"),
+            "workerStage": worker.get("stage"),
+            "agentWait": agent_wait,
+        },
+    )
 
 
 def _validate_native_settlement(client: OrcaClient, run: RunRecord, outcome: str) -> None:
@@ -1487,21 +1616,67 @@ def _message_identity(message: Mapping[str, Any], ordinal: int) -> str:
     return value if isinstance(value, str) else f"ordinal-{ordinal}"
 
 
+def _require_delivery_journal(
+    store: StateStore,
+    run: RunRecord,
+    delivery_id: str,
+    messages: list[dict[str, Any]],
+) -> None:
+    row = store.connection.execute(
+        "SELECT response_json FROM deliveries WHERE run_local_id = ? AND delivery_id = ?",
+        (run.local_id, delivery_id),
+    ).fetchone()
+    if row is None:
+        raise OrchestrateError(
+            "Delivery effects require the immutable whole FIFO journal",
+            code="delivery_journal_missing",
+        )
+    try:
+        response = json.loads(row["response_json"])
+        stored_delivery_id, stored_messages = _delivery(response)
+    except (json.JSONDecodeError, TypeError, OrchestrateError) as exc:
+        raise OrchestrateError(
+            "The immutable FIFO Delivery journal is malformed",
+            code="delivery_identity_conflict",
+        ) from exc
+    if stored_delivery_id != delivery_id or stored_messages != messages:
+        raise OrchestrateError(
+            "Delivery effects do not match the immutable whole FIFO journal",
+            code="delivery_identity_conflict",
+        )
+
+
 def _process_delivery(client: OrcaClient, store: StateStore, run: RunRecord, delivery_id: str, messages: list[dict[str, Any]]) -> RunRecord:
+    _require_delivery_journal(store, run, delivery_id, messages)
     current = store.update_run(run.local_id, delivery_id=delivery_id)
     if sum(message.get("type") == "worker_done" for message in messages) > 1:
         raise OrchestrateError("Delivery contains more than one worker_done", code="delivery_unsupported")
     existing = {row["message_id"]: row["effect_status"] for row in store.messages(run.local_id, delivery_id)}
+    binding = store.get_worker_resource_binding(current.local_id)
+    if binding is None or binding.dispatch_id != current.dispatch_id:
+        raise OrchestrateError(
+            "Lifecycle mail cannot be bound to the exact worker terminal",
+            code="delivery_sender_untrusted",
+        )
     escalation_unresolved = False
     for ordinal, message in enumerate(messages):
         message_id = _message_identity(message, ordinal)
         message_type = message.get("type")
-        payload = message.get("payload")
-        if message_type in {"heartbeat", "question", "escalation", "worker_done"}:
-            if not isinstance(payload, Mapping):
-                raise OrchestrateError("Lifecycle mail omitted its payload", code="delivery_unsupported")
-            if payload.get("taskId") != current.task_id or payload.get("dispatchId") != current.dispatch_id:
-                raise OrchestrateError("Lifecycle mail is stale or belongs to another attempt", code="delivery_binding_mismatch")
+        try:
+            payload = current_lifecycle_message_payload(
+                message,
+                run_id=str(current.native_run_id),
+                task_id=str(current.task_id),
+                dispatch_id=str(current.dispatch_id),
+                terminal_handle=binding.terminal_handle,
+            )
+        except LifecycleMessageShapeError as exc:
+            code = {
+                "shape": "delivery_unsupported",
+                "binding": "delivery_binding_mismatch",
+                "sender": "delivery_sender_untrusted",
+            }[exc.category]
+            raise OrchestrateError(str(exc), code=code) from exc
         prior_status = existing.get(message_id)
         if prior_status in {"processed", "answered", "pending-answer", "unresolved"}:
             escalation_unresolved = escalation_unresolved or prior_status == "unresolved"
@@ -1520,10 +1695,8 @@ def _process_delivery(client: OrcaClient, store: StateStore, run: RunRecord, del
             store.mark_message(current.local_id, delivery_id, message_id, "unresolved")
             escalation_unresolved = True
             continue
-        if message_type != "worker_done" or not isinstance(payload, Mapping):
+        if message_type != "worker_done":
             raise OrchestrateError("Delivery contains unsupported or malformed mail", code="delivery_unsupported")
-        if payload.get("taskId") != current.task_id or payload.get("dispatchId") != current.dispatch_id:
-            raise OrchestrateError("worker_done is stale or belongs to another attempt", code="delivery_binding_mismatch")
         outcome = payload.get("outcome")
         if outcome not in {"succeeded", "failed"}:
             raise OrchestrateError("worker_done has no recognized outcome", code="delivery_unsupported")
@@ -1641,7 +1814,14 @@ def _supervise(client: OrcaClient, store: StateStore, run: RunRecord, *, wait_ti
         )
         delivery_id, messages = _delivery(payload)
         if not delivery_id:
-            current, _ = _join_admission(store, current)
+            current, admission = _join_admission(store, current)
+            if (
+                current.phase == "awaiting_preflight"
+                and admission == "pending"
+                and _result(payload).get("timedOut") is True
+                and _record_input_submission_diagnostic(client, store, current)
+            ):
+                break
             continue
         store.journal_delivery(current.local_id, delivery_id, payload, messages)
         current, _ = _join_admission(store, current)
@@ -1649,6 +1829,7 @@ def _supervise(client: OrcaClient, store: StateStore, run: RunRecord, *, wait_ti
         if store.pending_questions(current.local_id) or current.phase == "blocked":
             break
         _ack_if_resolved(client, store, current)
+    current, _ = _join_admission(store, store.get_run(current.local_id))
     return _run_summary(store, store.get_run(current.local_id))
 
 
