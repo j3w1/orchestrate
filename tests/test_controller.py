@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from orchestrate.admission import joined_preflight_status, worker_preflight
 from orchestrate.controller import (
     _ack_if_resolved,
     _finish_prompt_stall_cleanup,
@@ -162,9 +163,14 @@ def _task_readback(client: FakeClient, _: tuple[str, ...]) -> dict[str, object]:
     }
 
 
-def _worker_start(root: Path) -> OrcaJsonResponse:
-    worktree_id = f"repo::{root.resolve()}"
-    terminal_id = "term_worker"
+def _worker_start(
+    root: Path,
+    *,
+    terminal_handle: str = "term_worker",
+    worktree_id: str | None = None,
+) -> OrcaJsonResponse:
+    worktree_id = f"repo::{root.resolve()}" if worktree_id is None else worktree_id
+    terminal_id = terminal_handle
     launch = {
         "requested": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
         "effective": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
@@ -197,13 +203,16 @@ def _worker_start_readback(
     current_shape: bool = False,
     dispatch_last_failure: object = None,
     worker_last_error: object = None,
+    resource_id: str = "terminal-resource-1",
+    terminal_handle: str = "term_worker",
+    worktree_id: str | None = None,
 ) -> dict[str, object]:
-    worktree_id = f"repo::{root.resolve()}"
+    worktree_id = f"repo::{root.resolve()}" if worktree_id is None else worktree_id
     launch = {
         "requested": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
         "effective": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
     }
-    terminal_effect = {"kind": "terminal", "role": "agent", "action": "created", "id": "term_worker"}
+    terminal_effect = {"kind": "terminal", "role": "agent", "action": "created", "id": terminal_handle}
     dispatch: dict[str, object] = {
         "id": "dispatch_1",
         "status": "dispatched",
@@ -233,7 +242,7 @@ def _worker_start_readback(
         worker.update(
             dispatchId="dispatch_1",
             worktreeId=worktree_id,
-            agentTerminalHandle="term_worker",
+            agentTerminalHandle=terminal_handle,
             lastError=worker_last_error,
         )
     else:
@@ -244,7 +253,7 @@ def _worker_start_readback(
         )
         worker.update(
             worktree_id=worktree_id,
-            agent_terminal_handle="term_worker",
+            agent_terminal_handle=terminal_handle,
             last_error=worker_last_error,
         )
     return {
@@ -252,18 +261,105 @@ def _worker_start_readback(
             "dispatch": dispatch,
             "worker": worker,
             "terminalResource": {
-                "id": "terminal-resource-1",
+                "id": resource_id,
                 "ownershipState": "owned",
                 "releaseState": "not_requested",
                 "retainedReason": None,
                 "originDispatchId": "dispatch_1",
                 "ownerDispatchId": "dispatch_1",
-                "terminalHandle": "term_worker",
+                "terminalHandle": terminal_handle,
                 "worktreeId": worktree_id,
             },
         },
         "_meta": {"runtimeId": "runtime_test"},
     }
+
+
+class RealPreflightClient:
+    """Public readbacks visible to a worker before worker-start returns."""
+
+    def __init__(self, root: Path, packet: dict[str, object], *, current_shape: bool) -> None:
+        self.root = root
+        self.packet = packet
+        self.current_shape = current_shape
+        self.calls: list[tuple[str, ...]] = []
+
+    @staticmethod
+    def _wrap(result: dict[str, object]) -> dict[str, object]:
+        return {"result": result, "_meta": {"runtimeId": "runtime_test"}}
+
+    def run_json(self, *arguments: str, **_: object) -> dict[str, object]:
+        self.calls.append(arguments)
+        worktree_id = f"repo::{self.root.resolve()}"
+        if arguments[:2] == ("terminal", "show"):
+            return self._wrap({
+                "terminal": {
+                    "handle": "term_worker",
+                    "worktreeId": worktree_id,
+                    "worktreePath": str(self.root.resolve()),
+                    "executionHostId": "local",
+                    "agentIdentity": "codex",
+                    "connected": True,
+                    "writable": True,
+                    "hostPlatform": "win32",
+                }
+            })
+        if arguments[:2] == ("worktree", "current"):
+            return self._wrap({"worktree": {"id": worktree_id, "path": str(self.root.resolve())}})
+        if arguments[:2] == ("orchestration", "worker-show"):
+            return _worker_start_readback(self.root, current_shape=self.current_shape)
+        if arguments[:2] == ("orchestration", "task-list"):
+            return self._wrap({
+                "tasks": [{
+                    "id": "task_1",
+                    "run_id": "run_1",
+                    "status": "dispatched",
+                    "spec": packet_spec(self.packet),
+                }]
+            })
+        raise AssertionError(arguments)
+
+
+def _worker_start_with_real_preflight(
+    root: Path,
+    *,
+    current_shape: bool,
+    later_resource_id: str = "terminal-resource-1",
+    later_terminal_handle: str = "term_worker",
+    later_worktree_id: str | None = None,
+) -> Response:
+    def respond(_: FakeClient, __: tuple[str, ...]) -> dict[str, object]:
+        with StateStore(root) as store:
+            run = store.select_run(None)
+            packet = store.get_packet(run.local_id, str(run.task_id))
+            if store.get_worker_resource_binding(run.local_id) is not None:
+                raise AssertionError("controller binding existed before the real worker preflight")
+        preflight_client = RealPreflightClient(root, packet, current_shape=current_shape)
+        result = worker_preflight(
+            root,
+            run_id="run_1",
+            task_id="task_1",
+            dispatch_id="dispatch_1",
+            packet_id=str(packet["packetId"]),
+            client=preflight_client,  # type: ignore[arg-type]
+            environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+            platform="win32",
+        )
+        if result.get("status") != "admitted" or len(preflight_client.calls) != 4:
+            raise AssertionError("real pre-receipt worker preflight did not pass exact public readbacks")
+        with StateStore(root) as store:
+            run = store.select_run(None)
+            if store.get_worker_resource_binding(run.local_id) is not None:
+                raise AssertionError("preflight wrote the controller resource binding")
+            if joined_preflight_status(store, run) != "pending":
+                raise AssertionError("pre-receipt preflight was not a pending join")
+        return _worker_start(
+            root,
+            terminal_handle=later_terminal_handle,
+            worktree_id=later_worktree_id,
+        )
+
+    return respond
 
 
 def _prompt_stall_start(root: Path, *, include_ok: bool = False) -> OrcaJsonResponse:
@@ -2920,6 +3016,103 @@ class ControllerTests(unittest.TestCase):
             implement(self.root, objective, client=client, wait_timeout_ms=1, require_context=False)  # type: ignore[arg-type]
         self.assertEqual(caught.exception.code, "source_binding_changed")
         self.assertFalse(any(call[:2] == ("orchestration", "worker-start") for call in client.calls))
+
+    def _assert_real_pre_receipt_preflight_joins(self, *, current_shape: bool) -> None:
+        objective = "Join the real early worker preflight"
+        responses = completion_responses(self.root, objective)[:4]
+        responses.extend([
+            _worker_start_with_real_preflight(self.root, current_shape=current_shape),
+            _worker_start_readback(self.root, current_shape=current_shape),
+        ])
+        client = FakeClient(responses)
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=1,
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "waiting")
+        self.assertEqual(report["admission"], "admitted")
+        self.assertFalse(any(call[:2] == ("orchestration", "check") for call in client.calls))
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.get_run(str(report["localRunId"]))
+            observation = store.get_preflight(run.local_id, "task_1", "dispatch_1")
+            binding = store.get_worker_resource_binding(run.local_id)
+            self.assertEqual(joined_preflight_status(store, run), "admitted")
+            self.assertEqual(observation["outcome"], "passed")  # type: ignore[index]
+            self.assertEqual(observation["native"]["terminalResourceId"], binding.resource_id)  # type: ignore[index,union-attr]
+            self.assertEqual(observation["native"]["terminalHandle"], binding.terminal_handle)  # type: ignore[index,union-attr]
+            self.assertEqual(observation["native"]["worktreeId"], binding.worktree_id)  # type: ignore[index,union-attr]
+
+    def test_orca_1_4_198_real_preflight_before_controller_receipt_joins_to_admitted(self) -> None:
+        self._assert_real_pre_receipt_preflight_joins(current_shape=False)
+
+    def test_orca_1_4_199_real_preflight_before_controller_receipt_joins_to_admitted(self) -> None:
+        self._assert_real_pre_receipt_preflight_joins(current_shape=True)
+
+    def _assert_later_controller_binding_mismatch_holds(self, field: str) -> None:
+        objective = f"Hold a later {field} mismatch"
+        later = {
+            "resource_id": "terminal-resource-1",
+            "terminal_handle": "term_worker",
+            "worktree_id": f"repo::{self.root.resolve()}",
+        }
+        later[field] = f"different-{field}"
+        responses = completion_responses(self.root, objective)[:4]
+        responses.extend([
+            _worker_start_with_real_preflight(
+                self.root,
+                current_shape=True,
+                later_resource_id=later["resource_id"],
+                later_terminal_handle=later["terminal_handle"],
+                later_worktree_id=later["worktree_id"],
+            ),
+            _worker_start_readback(
+                self.root,
+                current_shape=True,
+                resource_id=later["resource_id"],
+                terminal_handle=later["terminal_handle"],
+                worktree_id=later["worktree_id"],
+            ),
+        ])
+        client = FakeClient(responses)
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=1,
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "preflight_held")
+        self.assertEqual(report["admission"], "conflicting")
+        self.assertIn("separately authorized cleanup", report["nextObligation"])
+        self.assertFalse(any(call[:2] == ("orchestration", "check") for call in client.calls))
+        self.assertFalse(any(call[:2] == ("terminal", "send") for call in client.calls))
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.get_run(str(report["localRunId"]))
+            observation = store.get_preflight(run.local_id, "task_1", "dispatch_1")
+            binding = store.get_worker_resource_binding(run.local_id)
+            native_field = {
+                "resource_id": "terminalResourceId",
+                "terminal_handle": "terminalHandle",
+                "worktree_id": "worktreeId",
+            }[field]
+            self.assertEqual(run.phase, "preflight_held")
+            self.assertNotEqual(observation["native"][native_field], getattr(binding, field))  # type: ignore[index,arg-type]
+
+    def test_later_controller_resource_id_mismatch_holds(self) -> None:
+        self._assert_later_controller_binding_mismatch_holds("resource_id")
+
+    def test_later_controller_terminal_handle_mismatch_holds(self) -> None:
+        self._assert_later_controller_binding_mismatch_holds("terminal_handle")
+
+    def test_later_controller_worktree_id_mismatch_holds(self) -> None:
+        self._assert_later_controller_binding_mismatch_holds("worktree_id")
 
     def test_admitted_output_before_launch_receipt_is_preserved_through_resume(self) -> None:
         objective = "Preserve post-admission output"

@@ -208,9 +208,6 @@ def _native_identity(
     dispatch_id: str,
     packet_json: str,
     packet: Mapping[str, Any],
-    resource_id: str,
-    resource_terminal_handle: str,
-    resource_worktree_id: str,
     environment: Mapping[str, str],
     platform: str,
 ) -> dict[str, Any]:
@@ -297,8 +294,6 @@ def _native_identity(
         not isinstance(root, str)
         or Path(root).resolve() != profile.root.resolve()
         or not isinstance(worktree_id, str)
-        or handle != resource_terminal_handle
-        or worktree_id != resource_worktree_id
         or not isinstance(worktree, Mapping)
         or worktree.get("id") != worktree_id
         or not isinstance(worktree.get("path"), str)
@@ -321,9 +316,8 @@ def _native_identity(
             run_id=str(run.native_run_id),
             task_id=task_id,
             dispatch_id=dispatch_id,
-            worktree_id=resource_worktree_id,
-            terminal_handle=resource_terminal_handle,
-            resource_id=resource_id,
+            worktree_id=worktree_id,
+            terminal_handle=handle,
         )
     except WorkerShowShapeError as exc:
         raise OrchestrateError(str(exc), code="preflight_identity_conflict") from exc
@@ -396,12 +390,6 @@ def worker_preflight(
             if packet.get("packetId") != packet_id:
                 raise OrchestrateError("Supplied packet ID does not match the immutable Task packet", code="packet_identity_conflict")
             _verify_packet_source_bytes(profile, packet)
-            binding = store.get_worker_resource_binding(run.local_id)
-            if binding is None or binding.dispatch_id != dispatch_id:
-                raise OrchestrateError(
-                    "Worker preflight omitted its immutable controller resource binding",
-                    code="preflight_identity_conflict",
-                )
             native = _native_identity(
                 client,
                 profile=profile,
@@ -410,12 +398,20 @@ def worker_preflight(
                 dispatch_id=dispatch_id,
                 packet_json=packet_json,
                 packet=packet,
-                resource_id=binding.resource_id,
-                resource_terminal_handle=binding.terminal_handle,
-                resource_worktree_id=binding.worktree_id,
                 environment=env,
                 platform=selected_platform,
             )
+            binding = store.get_worker_resource_binding(run.local_id)
+            if binding is not None and (
+                binding.dispatch_id != dispatch_id
+                or binding.resource_id != native.get("terminalResourceId")
+                or binding.terminal_handle != native.get("terminalHandle")
+                or binding.worktree_id != native.get("worktreeId")
+            ):
+                raise OrchestrateError(
+                    "Worker preflight live resource identity conflicts with its immutable controller binding",
+                    code="preflight_identity_conflict",
+                )
             validation = validate_packet_sources(profile, run, packet_json)
             observation = {
                 "schema": PREFLIGHT_SCHEMA,
