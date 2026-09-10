@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import sqlite3
 import subprocess
 import sys
@@ -13,6 +14,77 @@ from orchestrate.state import AdmissionEffectFence, StateStore
 
 
 class StateTests(unittest.TestCase):
+    @staticmethod
+    def _database_files(path: Path) -> dict[str, tuple[bool, str | None]]:
+        return {
+            suffix: (
+                candidate.exists(),
+                hashlib.sha256(candidate.read_bytes()).hexdigest() if candidate.exists() else None,
+            )
+            for suffix in ("", "-wal", "-shm")
+            for candidate in (Path(str(path) + suffix),)
+        }
+
+    def test_read_only_open_preserves_closed_database_and_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            root = Path(project_dir)
+            home = Path(home_dir)
+            with StateStore(root, home=home) as store:
+                run = store.create_run(objective="read only", profile_digest="p", source_digest="s")
+                path = store.path
+            before = self._database_files(path)
+
+            with StateStore.open_read_only(root, home=home) as store:
+                self.assertEqual(store.select_for_read(run.local_id).objective, "read only")
+                self.assertEqual(store.connection.execute("PRAGMA query_only").fetchone()[0], 1)
+
+            self.assertEqual(self._database_files(path), before)
+
+    def test_read_only_open_never_creates_a_missing_database_or_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            root = Path(project_dir)
+            home = Path(home_dir) / "unused"
+
+            with self.assertRaises(OrchestrateError) as caught:
+                StateStore.open_read_only(root, home=home)
+
+            self.assertEqual(caught.exception.code, "state_not_found")
+            self.assertFalse(home.exists())
+
+    def test_read_only_open_does_not_touch_existing_wal_or_shm_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            root = Path(project_dir)
+            home = Path(home_dir)
+            with StateStore(root, home=home) as store:
+                path = store.path
+            Path(str(path) + "-wal").write_bytes(b"historical wal bytes")
+            Path(str(path) + "-shm").write_bytes(b"historical shm bytes")
+            before = self._database_files(path)
+
+            with self.assertRaises(OrchestrateError) as caught:
+                StateStore.open_read_only(root, home=home)
+
+            self.assertEqual(caught.exception.code, "state_read_snapshot_unavailable")
+            self.assertEqual(self._database_files(path), before)
+
+    def test_read_only_open_refuses_state_that_requires_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            root = Path(project_dir)
+            home = Path(home_dir)
+            with StateStore(root, home=home) as store:
+                path = store.path
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("DROP TABLE milestone_worker_bindings")
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaises(OrchestrateError) as caught:
+                StateStore.open_read_only(root, home=home)
+
+            self.assertEqual(caught.exception.code, "state_schema_migration_required")
+
     def test_project_contained_and_recognized_synchronized_state_roots_are_rejected_before_write(self) -> None:
         with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as outside_dir:
             root = Path(project_dir)

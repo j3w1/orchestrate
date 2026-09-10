@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import hashlib
@@ -36,7 +37,7 @@ from orchestrate.cli import main as cli_main
 from orchestrate.errors import OrchestrateError
 from orchestrate.identity import require_plain_controller
 from orchestrate.orca import OrcaCommandError, OrcaCommandResult, OrcaJsonResponse
-from orchestrate.packets import canonical_packet_json, make_packet, packet_spec
+from orchestrate.packets import canonical_packet_json, expected_packet_id, make_packet, packet_spec
 from orchestrate.profile import setup_project
 from orchestrate.readers import read_project
 from orchestrate.sources import build_source_index
@@ -769,6 +770,7 @@ class MilestoneClient:
         verification_result: str = "accepted",
         review_result: str = "accepted",
         uncertain_task: str | None = None,
+        pause_after_owner: bool = False,
     ) -> None:
         self.root = root
         self.verification_result = verification_result
@@ -783,6 +785,8 @@ class MilestoneClient:
         self.next_delivery = 1
         self.current_run = "run_1"
         self.peak_active_workers = 0
+        self.pause_after_owner = pause_after_owner
+        self.deliveries_paused = False
 
     def _wrapped(self, value: dict[str, object], *, returncode: int = 0) -> OrcaJsonResponse:
         value.setdefault("_meta", {"runtimeId": "runtime_test"})
@@ -1077,14 +1081,36 @@ class MilestoneClient:
                 )
             )
         if command == ("orchestration", "check") and "--ack" in arguments:
+            if self.pause_after_owner and arguments[arguments.index("--ack") + 1] == "delivery_1":
+                self.deliveries_paused = True
             return self._wrapped(acknowledgement(arguments[arguments.index("--ack") + 1]))
         if command == ("orchestration", "check"):
+            if self.deliveries_paused:
+                return self._wrapped({"result": {"deliveryId": None, "messages": [], "timedOut": True}})
             return self._wrapped(self._delivery())
         raise AssertionError(arguments)
 
     def _objective(self) -> str:
         with StateStore(self.root) as store:
             return store.select_for_read(None).objective
+
+
+class ReportingClient:
+    """Non-mutating native readback stub for status-only tests."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def run_json(self, *arguments: str, **_: object) -> dict[str, object]:
+        self.calls.append(arguments)
+        if arguments[:2] == ("orchestration", "run-show"):
+            return {"result": {"run": {"id": arguments[arguments.index("--id") + 1]}}}
+        if arguments[:2] == ("orchestration", "task-list"):
+            return {"result": {"tasks": []}}
+        if arguments[:2] == ("orchestration", "worker-show"):
+            dispatch = arguments[arguments.index("--dispatch") + 1]
+            return {"result": {"dispatch": {"id": dispatch}}}
+        raise AssertionError(arguments)
 
 
 def settlement_responses(
@@ -1382,6 +1408,55 @@ class ControllerTests(unittest.TestCase):
             ],
         )
 
+    def test_resume_executes_valid_mixed_later_waves_under_remaining_capacity(self) -> None:
+        objective = "Resume every valid later specialist wave"
+        specialists = ("verify_a", "verify_b", "verify_c")
+        plan = self._write_milestone_plan(objective, specialist_keys=specialists)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+
+        paused = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=20,
+            require_context=False,
+        )
+
+        self.assertEqual(paused["status"], "milestone_waiting")
+        self.assertEqual(client.peak_active_workers, 2)
+        self.assertEqual(
+            [
+                call[call.index("--task") + 1]
+                for call in client.calls
+                if call[:2] == ("orchestration", "worker-start")
+            ],
+            ["task_1", "task_2", "task_3"],
+        )
+        client.deliveries_paused = False
+        client.pause_after_owner = False
+
+        resumed = resume(
+            self.root,
+            str(paused["localRunId"]),
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+
+        self.assertEqual(resumed["status"], "worker_succeeded")
+        self.assertEqual(resumed["verification"], "review_accepted")
+        self.assertEqual(client.peak_active_workers, 2)
+        self.assertEqual(
+            [
+                call[call.index("--task") + 1]
+                for call in client.calls
+                if call[:2] == ("orchestration", "worker-start")
+            ],
+            ["task_1", "task_2", "task_3", "task_4", "task_5"],
+        )
+
     def test_status_and_explain_retract_accepted_review_for_all_consulted_source_drift(self) -> None:
         objective = "Invalidate accepted review as soon as consulted source identity changes"
         plan = self._write_milestone_plan(objective)
@@ -1492,6 +1567,243 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(restored["status"], "worker_succeeded")
                 self.assertEqual(restored["verification"], "review_accepted")
                 self.assertIs(restored["sourceBinding"]["unchanged"], True)
+
+    def test_status_and_explain_reject_every_corrupt_or_unbound_candidate_packet_identity(self) -> None:
+        objective = "Reject corrupt immutable candidate packet identity"
+        plan = self._write_milestone_plan(objective)
+        accepted = implement(
+            self.root,
+            objective,
+            client=MilestoneClient(self.root),  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        local_run_id = str(accepted["localRunId"])
+        with StateStore(self.root) as store:
+            run = store.get_run(local_run_id)
+            rows = store.connection.execute(
+                """SELECT p.task_id, p.packet_json, b.task_key
+                   FROM packets p JOIN milestone_task_bindings b
+                     ON b.run_local_id = p.run_local_id AND b.task_id = p.task_id
+                   WHERE p.run_local_id = ? ORDER BY b.created_at""",
+                (run.local_id,),
+            ).fetchall()
+            originals = {row["task_id"]: row["packet_json"] for row in rows}
+            first_task, second_task = list(originals)[:2]
+            first_key = rows[0]["task_key"]
+            original_worktree = store.connection.execute(
+                """SELECT worktree_id FROM milestone_worker_bindings
+                   WHERE run_local_id = ? AND task_key = ?""",
+                (run.local_id, first_key),
+            ).fetchone()["worktree_id"]
+
+        def canonical_changed(task_id: str, change: Callable[[dict[str, object]], None]) -> str:
+            packet_value = json.loads(originals[task_id])
+            change(packet_value)
+            packet_value["packetId"] = expected_packet_id(packet_value)
+            return canonical_packet_json(packet_value)
+
+        def corrupt(kind: str) -> None:
+            with StateStore(self.root) as store:
+                if kind == "malformed_sources_and_stale_packet_id":
+                    packet_value = json.loads(originals[first_task])
+                    packet_value["sources"] = [
+                        {"path": item["path"]}
+                        for item in packet_value["sources"]
+                    ]
+                    value = canonical_packet_json(packet_value)
+                    store.connection.execute(
+                        "UPDATE packets SET packet_json = ? WHERE run_local_id = ? AND task_id = ?",
+                        (value, local_run_id, first_task),
+                    )
+                elif kind == "duplicate_source_identity":
+                    value = canonical_changed(
+                        first_task,
+                        lambda packet: packet["sources"].append(deepcopy(packet["sources"][0])),  # type: ignore[union-attr,index]
+                    )
+                    store.connection.execute(
+                        "UPDATE packets SET packet_json = ? WHERE run_local_id = ? AND task_id = ?",
+                        (value, local_run_id, first_task),
+                    )
+                elif kind == "conflicting_contract":
+                    value = canonical_changed(
+                        first_task,
+                        lambda packet: packet["milestone"].update(contractDigest="contract_sha256_conflict"),  # type: ignore[union-attr]
+                    )
+                    store.connection.execute(
+                        "UPDATE packets SET packet_json = ? WHERE run_local_id = ? AND task_id = ?",
+                        (value, local_run_id, first_task),
+                    )
+                elif kind == "duplicate_packet":
+                    store.connection.execute(
+                        "UPDATE packets SET packet_json = ? WHERE run_local_id = ? AND task_id = ?",
+                        (originals[first_task], local_run_id, second_task),
+                    )
+                elif kind == "unbound_packet_row":
+                    store.connection.execute(
+                        "INSERT INTO packets VALUES (?, 'task_unbound', ?, '2026-01-01T00:00:00Z')",
+                        (local_run_id, originals[first_task]),
+                    )
+                elif kind == "conflicting_workspace":
+                    store.connection.execute(
+                        """UPDATE milestone_worker_bindings SET worktree_id = 'worktree_conflict'
+                           WHERE run_local_id = ? AND task_key = ?""",
+                        (local_run_id, first_key),
+                    )
+                else:
+                    raise AssertionError(kind)
+
+        def restore() -> None:
+            with StateStore(self.root) as store:
+                store.connection.execute(
+                    "DELETE FROM packets WHERE run_local_id = ? AND task_id = 'task_unbound'",
+                    (local_run_id,),
+                )
+                for task_id, packet_json in originals.items():
+                    store.connection.execute(
+                        "UPDATE packets SET packet_json = ? WHERE run_local_id = ? AND task_id = ?",
+                        (packet_json, local_run_id, task_id),
+                    )
+                store.connection.execute(
+                    """UPDATE milestone_worker_bindings SET worktree_id = ?
+                       WHERE run_local_id = ? AND task_key = ?""",
+                    (original_worktree, local_run_id, first_key),
+                )
+
+        for kind in (
+            "malformed_sources_and_stale_packet_id",
+            "duplicate_source_identity",
+            "conflicting_contract",
+            "duplicate_packet",
+            "unbound_packet_row",
+            "conflicting_workspace",
+        ):
+            with self.subTest(kind=kind):
+                corrupt(kind)
+                try:
+                    reports = (
+                        status(self.root, local_run_id, client=ReportingClient()),  # type: ignore[arg-type]
+                        explain(self.root, local_run_id),
+                    )
+                    for report in reports:
+                        self.assertEqual(report["status"], "stale_review")
+                        self.assertEqual(report["verification"], "review_stale")
+                        self.assertIsNone(report["sourceBinding"]["current"])
+                        self.assertEqual(report["sourceBinding"]["error"]["code"], "packet_identity_conflict")
+                        self.assertEqual(report["staleEvidence"]["storedVerification"], "review_accepted")
+                    for command, report in (("status", reports[0]), ("explain", reports[1])):
+                        with patch("orchestrate.cli._execute", return_value=(report, True)), patch("builtins.print"):
+                            self.assertEqual(
+                                cli_main([command, "--project", str(self.root), "--run", local_run_id, "--json"]),
+                                1,
+                            )
+                finally:
+                    restore()
+
+        restored = explain(self.root, local_run_id)
+        self.assertEqual(restored["status"], "worker_succeeded")
+        self.assertEqual(restored["verification"], "review_accepted")
+        self.assertIs(restored["sourceBinding"]["unchanged"], True)
+
+    def test_accepted_review_projects_unavailable_profile_identity_as_stale_until_exact_restoration(self) -> None:
+        objective = "Project unavailable current profile identity as stale"
+        plan = self._write_milestone_plan(objective)
+        accepted = implement(
+            self.root,
+            objective,
+            client=MilestoneClient(self.root),  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        local_run_id = str(accepted["localRunId"])
+        profile_path = self.root / ".orchestrate.json"
+        original_profile = profile_path.read_bytes()
+
+        for kind in ("missing", "malformed", "unreadable", "reparse"):
+            with self.subTest(kind=kind):
+                profile_path.write_bytes(original_profile)
+                if kind == "missing":
+                    profile_path.unlink()
+                    context = nullcontext()
+                elif kind == "malformed":
+                    profile_path.write_bytes(b"{")
+                    context = nullcontext()
+                elif kind == "unreadable":
+                    context = patch("orchestrate.profile.read_project_bytes", side_effect=OSError("synthetic unreadable"))
+                else:
+                    context = patch(
+                        "orchestrate.profile.read_project_bytes",
+                        side_effect=OrchestrateError("synthetic reparse boundary", code="source_reparse_unresolved"),
+                    )
+                try:
+                    with context:
+                        reports = (
+                            status(self.root, local_run_id, client=ReportingClient()),  # type: ignore[arg-type]
+                            explain(self.root, local_run_id),
+                        )
+                    for report in reports:
+                        self.assertEqual(report["status"], "stale_review")
+                        self.assertEqual(report["verification"], "review_stale")
+                        self.assertIsNone(report["sourceBinding"]["current"])
+                        self.assertEqual(report["staleEvidence"]["reason"], "source_binding_unavailable")
+                finally:
+                    profile_path.write_bytes(original_profile)
+
+                restored = explain(self.root, local_run_id)
+                self.assertEqual(restored["status"], "worker_succeeded")
+                self.assertEqual(restored["verification"], "review_accepted")
+                self.assertIs(restored["sourceBinding"]["unchanged"], True)
+
+    def test_profile_failure_without_bound_milestone_history_remains_blocked(self) -> None:
+        with StateStore(self.root) as store:
+            run = store.create_run(objective="ordinary reporting", profile_digest="p", source_digest="s")
+        (self.root / ".orchestrate.json").unlink()
+
+        for operation in (
+            lambda: status(self.root, run.local_id, client=ReportingClient()),  # type: ignore[arg-type]
+            lambda: explain(self.root, run.local_id),
+        ):
+            with self.assertRaises(OrchestrateError) as caught:
+                operation()
+            self.assertEqual(caught.exception.code, "profile_missing")
+
+    def test_status_and_explain_leave_closed_state_database_and_sidecars_unchanged(self) -> None:
+        objective = "Report without mutating host-local state"
+        plan = self._write_milestone_plan(objective)
+        accepted = implement(
+            self.root,
+            objective,
+            client=MilestoneClient(self.root),  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        local_run_id = str(accepted["localRunId"])
+        with StateStore(self.root) as store:
+            state_path = store.path
+
+        def snapshot() -> dict[str, tuple[bool, str | None]]:
+            return {
+                suffix: (
+                    candidate.exists(),
+                    hashlib.sha256(candidate.read_bytes()).hexdigest() if candidate.exists() else None,
+                )
+                for suffix in ("", "-wal", "-shm")
+                for candidate in (Path(str(state_path) + suffix),)
+            }
+
+        before = snapshot()
+        status_report = status(self.root, local_run_id, client=ReportingClient())  # type: ignore[arg-type]
+        after_status = snapshot()
+        explain_report = explain(self.root, local_run_id)
+        after_explain = snapshot()
+
+        self.assertEqual(status_report["status"], "worker_succeeded")
+        self.assertEqual(explain_report["status"], "worker_succeeded")
+        self.assertEqual(after_status, before)
+        self.assertEqual(after_explain, before)
 
     def test_untracked_milestone_plan_has_zero_orca_effects(self) -> None:
         objective = "Reject an untracked milestone authority packet"

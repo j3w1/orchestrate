@@ -21,6 +21,7 @@ from .coordination import (
     NativeGateBinding,
     NativeTaskBinding,
     ReviewEvidence,
+    SharedContract,
     WorkerSession,
     load_milestone_plan,
     milestone_plan_relative_path,
@@ -50,7 +51,7 @@ from .packets import (
     make_packet,
     packet_spec_from_json,
 )
-from .profile import ProjectProfile
+from .profile import ProjectProfile, find_project_root
 from .readers import ReaderResult, read_project
 from .safeio import read_project_bytes
 from .sources import SourceIndex, build_source_index
@@ -2546,12 +2547,15 @@ def _process_milestone_delivery(
 
 
 def _milestone_source_binding(
-    profile: ProjectProfile,
+    profile: ProjectProfile | None,
     store: StateStore,
     run: RunRecord,
+    *,
+    profile_error: OrchestrateError | None = None,
 ) -> JsonObject:
     plan = store.connection.execute(
-        "SELECT relative_path, candidate_digest FROM milestone_plan_bindings WHERE run_local_id = ?",
+        """SELECT relative_path, plan_json, candidate_digest, contract_digest, status
+           FROM milestone_plan_bindings WHERE run_local_id = ?""",
         (run.local_id,),
     ).fetchone()
     expected = (
@@ -2559,60 +2563,201 @@ def _milestone_source_binding(
         if plan is not None and plan["candidate_digest"] is not None
         else run.source_digest
     )
-    try:
-        packet_rows = store.connection.execute(
-            "SELECT packet_json FROM packets WHERE run_local_id = ? ORDER BY created_at, task_id",
-            (run.local_id,),
-        ).fetchall()
-        if not packet_rows:
-            raise OrchestrateError(
-                "No immutable packet source inventory is available for this milestone",
-                code="packet_not_found",
-            )
-        candidate_inventories: list[frozenset[str]] = []
-        for row in packet_rows:
-            try:
-                packet_value = json.loads(row["packet_json"])
-            except json.JSONDecodeError as exc:
-                raise OrchestrateError(
-                    "A stored immutable Task packet is not valid JSON",
-                    code="packet_identity_conflict",
-                ) from exc
-            sources = packet_value.get("sources") if isinstance(packet_value, Mapping) else None
-            if not isinstance(sources, list):
-                raise OrchestrateError(
-                    "A stored immutable Task packet lost its source inventory",
-                    code="packet_identity_conflict",
-                )
-            packet_paths: set[str] = set()
-            for source in sources:
-                path = source.get("path") if isinstance(source, Mapping) else None
-                if not isinstance(path, str) or not path:
-                    raise OrchestrateError(
-                        "A stored immutable Task packet has a malformed source identity",
-                        code="packet_identity_conflict",
-                    )
-                packet_paths.add(path)
-            if packet_value.get("sourceDigest") == expected:
-                candidate_inventories.append(frozenset(packet_paths))
-        if not candidate_inventories or any(
-            inventory != candidate_inventories[0]
-            for inventory in candidate_inventories[1:]
-        ):
-            raise OrchestrateError(
-                "No single immutable packet source inventory binds the selected milestone candidate",
-                code="packet_identity_conflict",
-            )
-        bound_paths = set(candidate_inventories[0])
-        if plan is not None:
-            bound_paths.add(str(plan["relative_path"]))
-        current = build_source_index(profile, extra_sources=bound_paths)
-        candidate = current.value.get("candidate")
-        coverage = candidate.get("coverageComplete") if isinstance(candidate, Mapping) else None
+    if profile is None:
+        error = profile_error or OrchestrateError(
+            "The current project profile identity is unavailable",
+            code="profile_unreadable",
+        )
         return {
             "expected": expected,
-            "current": current.digest,
-            "unchanged": expected == current.digest if coverage is True else None,
+            "current": None,
+            "unchanged": None,
+            "coverageComplete": None,
+            "error": {"code": error.code, "message": str(error)},
+        }
+    try:
+        if plan is None or not isinstance(expected, str) or not expected:
+            raise OrchestrateError(
+                "The milestone has no exact stored candidate binding",
+                code="packet_identity_conflict",
+            )
+        try:
+            plan_value = json.loads(plan["plan_json"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise OrchestrateError(
+                "The stored milestone plan identity is malformed",
+                code="packet_identity_conflict",
+            ) from exc
+        raw_plan_tasks = plan_value.get("tasks") if isinstance(plan_value, Mapping) else None
+        if not isinstance(raw_plan_tasks, list):
+            raise OrchestrateError(
+                "The stored milestone plan Task identities are malformed",
+                code="packet_identity_conflict",
+            )
+        plan_tasks: dict[str, Mapping[str, Any]] = {}
+        owner_keys: set[str] = set()
+        for item in raw_plan_tasks:
+            key = item.get("key") if isinstance(item, Mapping) else None
+            if not isinstance(key, str) or not key or key in plan_tasks:
+                raise OrchestrateError(
+                    "The stored milestone plan Task identities are malformed",
+                    code="packet_identity_conflict",
+                )
+            plan_tasks[key] = item
+            if item.get("role") == "owner":
+                owner_keys.add(key)
+        if len(owner_keys) != 1:
+            raise OrchestrateError(
+                "The stored milestone owner identity is malformed",
+                code="packet_identity_conflict",
+            )
+
+        task_rows = store.connection.execute(
+            """SELECT b.task_key, b.task_id, b.candidate_digest, b.contract_digest, b.spec,
+                      p.packet_json,
+                      w.task_id AS worker_task_id, w.dispatch_id, w.resource_id,
+                      w.terminal_handle, w.worktree_id
+               FROM milestone_task_bindings b
+               LEFT JOIN packets p
+                 ON p.run_local_id = b.run_local_id AND p.task_id = b.task_id
+               LEFT JOIN milestone_worker_bindings w
+                 ON w.run_local_id = b.run_local_id AND w.task_key = b.task_key
+               WHERE b.run_local_id = ?
+               ORDER BY b.created_at, b.task_key""",
+            (run.local_id,),
+        ).fetchall()
+        expected_keys = set(plan_tasks) - owner_keys
+        bound_keys = {row["task_key"] for row in task_rows}
+        bound_task_ids = {row["task_id"] for row in task_rows}
+        if (
+            not task_rows
+            or len(bound_keys) != len(task_rows)
+            or len(bound_task_ids) != len(task_rows)
+            or bound_keys != expected_keys
+        ):
+            raise OrchestrateError(
+                "The immutable milestone packet rows do not exactly match the bound Task plan",
+                code="packet_identity_conflict",
+            )
+
+        packet_rows = store.connection.execute(
+            "SELECT task_id FROM packets WHERE run_local_id = ? ORDER BY created_at, task_id",
+            (run.local_id,),
+        ).fetchall()
+        allowed_packet_tasks = set(bound_task_ids)
+        if isinstance(run.task_id, str) and run.task_id:
+            allowed_packet_tasks.add(run.task_id)
+        packet_task_ids = [row["task_id"] for row in packet_rows]
+        if len(packet_task_ids) != len(set(packet_task_ids)) or any(
+            task_id not in allowed_packet_tasks for task_id in packet_task_ids
+        ):
+            raise OrchestrateError(
+                "An immutable packet row is duplicate or unbound from the milestone",
+                code="packet_identity_conflict",
+            )
+
+        packet_ids: set[str] = set()
+        identity_json: str | None = None
+        current_digest: str | None = None
+        coverage: object = None
+        for row in task_rows:
+            packet_json = row["packet_json"]
+            planned = plan_tasks[row["task_key"]]
+            if not isinstance(packet_json, str):
+                raise OrchestrateError(
+                    "A bound milestone Task has no immutable packet",
+                    code="packet_identity_conflict",
+                )
+            dispatch_id = row["dispatch_id"]
+            worker_identity = (
+                row["worker_task_id"],
+                dispatch_id,
+                row["resource_id"],
+                row["terminal_handle"],
+                row["worktree_id"],
+            )
+            if any(not isinstance(value, str) or not value for value in worker_identity):
+                raise OrchestrateError(
+                    "A bound milestone packet has no exact Task, Dispatch, or workspace identity",
+                    code="packet_identity_conflict",
+                )
+            task_run = replace(run, task_id=row["task_id"], dispatch_id=dispatch_id)
+            validation = validate_packet_sources(profile, task_run, packet_json)
+            packet_value = validation.packet
+            packet_id = packet_value.get("packetId")
+            scope = packet_value.get("scope")
+            milestone = packet_value.get("milestone")
+            contract = milestone.get("contract") if isinstance(milestone, Mapping) else None
+            if isinstance(contract, Mapping) and isinstance(plan["contract_digest"], str):
+                SharedContract(plan["contract_digest"], "settled", contract)
+            if (
+                not isinstance(packet_id, str)
+                or packet_id in packet_ids
+                or row["worker_task_id"] != row["task_id"]
+                or row["candidate_digest"] != expected
+                or row["contract_digest"] != plan["contract_digest"]
+                or row["spec"] != packet_spec_from_json(packet_json)
+                or not isinstance(scope, Mapping)
+                or scope.get("projectRoot") != "."
+                or scope.get("strategy") != "bounded-native-dag"
+                or scope.get("maxWorkers") != plan_value.get("maxWorkers")
+                or scope.get("taskKey") != row["task_key"]
+                or scope.get("taskSpec") != planned.get("spec")
+                or scope.get("role") != planned.get("role")
+                or not isinstance(milestone, Mapping)
+                or milestone.get("candidateDigest") != expected
+                or milestone.get("contractDigest") != plan["contract_digest"]
+                or packet_value.get("sourceDigest") != expected
+                or joined_preflight_status(store, task_run) != "admitted"
+            ):
+                raise OrchestrateError(
+                    "A milestone packet conflicts with its exact plan, Task, Dispatch, candidate, contract, or workspace binding",
+                    code="packet_identity_conflict",
+                )
+            observation = store.get_preflight(run.local_id, row["task_id"], dispatch_id)
+            native = observation.get("native") if isinstance(observation, Mapping) else None
+            if (
+                not isinstance(native, Mapping)
+                or native.get("worktreeId") != row["worktree_id"]
+                or native.get("worktreeRoot") != os.fspath(profile.root.resolve())
+                or observation.get("taskId") != row["task_id"]
+                or observation.get("dispatchId") != dispatch_id
+            ):
+                raise OrchestrateError(
+                    "A milestone packet conflicts with its exact admitted workspace identity",
+                    code="packet_identity_conflict",
+                )
+            packet_ids.add(packet_id)
+            packet_identity = json.dumps(
+                {
+                    "profileDigest": packet_value.get("profileDigest"),
+                    "sourceDigest": packet_value.get("sourceDigest"),
+                    "operationalProfile": packet_value.get("operationalProfile"),
+                    "candidate": packet_value.get("candidate"),
+                    "sources": packet_value.get("sources"),
+                    "reader": packet_value.get("reader"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if identity_json is not None and packet_identity != identity_json:
+                raise OrchestrateError(
+                    "The exact candidate packet identities disagree",
+                    code="packet_identity_conflict",
+                )
+            identity_json = packet_identity
+            current_digest = validation.sources.digest
+            candidate = validation.sources.value.get("candidate")
+            coverage = candidate.get("coverageComplete") if isinstance(candidate, Mapping) else None
+        if len(packet_ids) != len(task_rows) or identity_json is None:
+            raise OrchestrateError(
+                "The exact candidate packets are missing or duplicate",
+                code="packet_identity_conflict",
+            )
+        return {
+            "expected": expected,
+            "current": current_digest,
+            "unchanged": expected == current_digest if coverage is True else None,
             "coverageComplete": coverage,
         }
     except OrchestrateError as exc:
@@ -2813,11 +2958,11 @@ def _advance_milestone(
         str(run.native_run_id),
         runtime_plan,
         bindings,
+        active=active,
+        finished=finished,
         remaining_capacity=remaining_capacity,
     ):
         task = next(item for item in runtime_plan.tasks if item.key == binding.key)
-        if task.key in active or task.key in finished:
-            continue
         gate = gate_rows.get(task.key)
         if task.gate in {"verification", "review"} and (
             gate is None or gate.status != "resolved" or gate.resolution != "accepted"
@@ -3160,9 +3305,22 @@ def resume(
 
 
 def status(root: Path, run_id: str | None, *, client: OrcaClient) -> JsonObject:
-    profile = ProjectProfile.load(root, require_sources=False)
-    with StateStore(profile.root) as store:
+    project_root = find_project_root(root)
+    with StateStore.open_read_only(project_root) as store:
         run = store.select_for_read(run_id)
+        milestone_path = _milestone_plan_path(store, run)
+        profile_error: OrchestrateError | None = None
+        try:
+            profile = ProjectProfile.load(project_root, require_sources=False)
+        except OrchestrateError as exc:
+            if (
+                milestone_path is None
+                or run.phase != "worker_succeeded"
+                or run.verification_status != "review_accepted"
+            ):
+                raise
+            profile = None
+            profile_error = exc
         live: object
         if not run.native_run_id:
             live = {"status": "not-created"}
@@ -3186,22 +3344,45 @@ def status(root: Path, run_id: str | None, *, client: OrcaClient) -> JsonObject:
                 }
             except OrcaCommandError as exc:
                 live = {"status": "unavailable", "code": exc.code, "detail": str(exc)}
-        if _milestone_plan_path(store, run) is not None:
-            source_binding = _milestone_source_binding(profile, store, run)
+        if milestone_path is not None:
+            source_binding = _milestone_source_binding(
+                profile,
+                store,
+                run,
+                profile_error=profile_error,
+            )
             return _milestone_summary(store, run, live=live, source_binding=source_binding)
         return _run_summary(store, run, live=live)
 
 
 def explain(root: Path, run_id: str | None) -> JsonObject:
-    profile = ProjectProfile.load(root, require_sources=False)
-    with StateStore(profile.root) as store:
+    project_root = find_project_root(root)
+    with StateStore.open_read_only(project_root) as store:
         run = store.select_for_read(run_id)
         milestone_path = _milestone_plan_path(store, run)
+        profile_error: OrchestrateError | None = None
+        try:
+            profile = ProjectProfile.load(project_root, require_sources=False)
+        except OrchestrateError as exc:
+            if (
+                milestone_path is None
+                or run.phase != "worker_succeeded"
+                or run.verification_status != "review_accepted"
+            ):
+                raise
+            profile = None
+            profile_error = exc
         if milestone_path is not None:
-            source_binding = _milestone_source_binding(profile, store, run)
+            source_binding = _milestone_source_binding(
+                profile,
+                store,
+                run,
+                profile_error=profile_error,
+            )
             report = _milestone_summary(store, run, source_binding=source_binding)
             report["explanationSource"] = "host-local records and exact source identities; no model call"
             return report
+        assert profile is not None
         reader = read_project(profile, run.objective)
         current = _run_source_index(
             profile,

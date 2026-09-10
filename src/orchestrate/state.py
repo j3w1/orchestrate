@@ -20,6 +20,23 @@ from .errors import OrchestrateError
 
 STATE_SCHEMA = "orchestrate-state/v1"
 SYNC_STATE_COMPONENTS = {"box", "dropbox", "google drive", "googledrive", "iclouddrive", "syncthing"}
+STATE_TABLES = {
+    "meta",
+    "runs",
+    "intentions",
+    "worker_resource_bindings",
+    "packets",
+    "preflight_observations",
+    "deliveries",
+    "delivery_messages",
+    "questions",
+    "evidence",
+    "interventions",
+    "milestone_task_bindings",
+    "milestone_plan_bindings",
+    "milestone_gate_bindings",
+    "milestone_worker_bindings",
+}
 
 
 def utc_now() -> str:
@@ -227,20 +244,75 @@ class AdmissionEffectFence(RunLock):
 
 
 class StateStore(AbstractContextManager["StateStore"]):
-    def __init__(self, root: Path, *, home: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        home: Path | None = None,
+        read_only: bool = False,
+    ) -> None:
         self.root = root.resolve()
         self.home = state_home() if home is None else Path(os.path.abspath(os.fspath(home)))
         self.project_key = project_key(self.root)
-        self.directory = make_private_state_directory(
-            self.root,
-            self.home / "projects" / self.project_key,
+        target = self.home / "projects" / self.project_key
+        self.directory = (
+            require_private_state_target(self.root, target)
+            if read_only
+            else make_private_state_directory(self.root, target)
         )
         self.path = self.directory / "state.sqlite3"
-        self.connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA foreign_keys=ON")
-        self._migrate()
+        self.read_only = read_only
+        if read_only:
+            if not self.path.is_file():
+                raise OrchestrateError(
+                    "No host-local state database exists for this project",
+                    code="state_not_found",
+                )
+            sidecars = [
+                candidate.name
+                for suffix in ("-wal", "-shm")
+                for candidate in (Path(str(self.path) + suffix),)
+                if candidate.exists()
+            ]
+            if sidecars:
+                raise OrchestrateError(
+                    "Host-local state has live SQLite sidecars and cannot be opened as an immutable read-only snapshot",
+                    code="state_read_snapshot_unavailable",
+                    data={"sidecars": sidecars},
+                )
+            try:
+                try:
+                    self.connection = sqlite3.connect(
+                        self.path.resolve().as_uri() + "?mode=ro&immutable=1",
+                        uri=True,
+                        timeout=5,
+                        isolation_level=None,
+                    )
+                except sqlite3.DatabaseError as exc:
+                    raise OrchestrateError(
+                        "Host-local state database is unreadable in read-only mode",
+                        code="state_unreadable",
+                    ) from exc
+                self.connection.row_factory = sqlite3.Row
+                self.connection.execute("PRAGMA query_only=ON")
+                self._validate_read_schema()
+            except BaseException:
+                connection = getattr(self, "connection", None)
+                if connection is not None:
+                    connection.close()
+                raise
+        else:
+            self.connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+            self.connection.row_factory = sqlite3.Row
+            self.connection.execute("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA foreign_keys=ON")
+            self._migrate()
+
+    @classmethod
+    def open_read_only(cls, root: Path, *, home: Path | None = None) -> "StateStore":
+        """Open existing current-schema state without creating or changing any file."""
+
+        return cls(root, home=home, read_only=True)
 
     def __enter__(self) -> "StateStore":
         return self
@@ -446,6 +518,51 @@ class StateStore(AbstractContextManager["StateStore"]):
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema', ?)",
             (STATE_SCHEMA,),
         )
+
+    def _validate_read_schema(self) -> None:
+        """Reject state that the writable path would have to create or migrate."""
+
+        try:
+            tables = {
+                row["name"]
+                for row in self.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if not STATE_TABLES <= tables:
+                raise OrchestrateError(
+                    "Host-local state requires schema creation or migration before read-only reporting",
+                    code="state_schema_migration_required",
+                    data={"missingTables": sorted(STATE_TABLES - tables)},
+                )
+            schema = self.connection.execute(
+                "SELECT value FROM meta WHERE key = 'schema'"
+            ).fetchone()
+            if schema is None:
+                raise OrchestrateError(
+                    "Host-local state requires schema metadata migration before read-only reporting",
+                    code="state_schema_migration_required",
+                )
+            if schema["value"] != STATE_SCHEMA:
+                raise OrchestrateError(
+                    f"Unsupported host-local state schema: {schema['value']}",
+                    code="state_schema_unsupported",
+                )
+            intention_columns = {
+                row["name"]
+                for row in self.connection.execute("PRAGMA table_info(intentions)").fetchall()
+            }
+            if "returncode" not in intention_columns:
+                raise OrchestrateError(
+                    "Host-local state requires schema migration before read-only reporting",
+                    code="state_schema_migration_required",
+                    data={"table": "intentions", "missingColumns": ["returncode"]},
+                )
+        except sqlite3.DatabaseError as exc:
+            raise OrchestrateError(
+                "Host-local state cannot be read without repair or migration",
+                code="state_schema_migration_required",
+            ) from exc
 
     def lock(self, identity: str) -> RunLock:
         safe = hashlib.sha256(identity.encode("utf-8")).hexdigest()

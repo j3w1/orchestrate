@@ -244,17 +244,85 @@ class CoordinationTests(unittest.TestCase):
                     "run_1",
                     plan,
                     bindings,
+                    active=set(),
+                    finished={"owner"},
                     remaining_capacity=1,
                 )
+                for row in client.rows:
+                    if row["id"] == bindings["unit"].task_id:
+                        row["status"] = "dispatched"
+                    elif row["id"] == bindings["incident"].task_id:
+                        row["status"] = "pending"
                 at_capacity = scheduler.ready_wave(
                     "run_1",
                     plan,
                     bindings,
+                    active={"unit"},
+                    finished={"owner"},
                     remaining_capacity=0,
                 )
 
         self.assertEqual([binding.key for binding in selected], ["unit"])
         self.assertEqual(at_capacity, ())
+
+    def test_native_ready_frontier_rejects_active_and_finished_ready_contradictions(self) -> None:
+        plan = replace(milestone(), max_workers=1)
+        for contradictory_key, active, finished in (
+            ("unit", {"unit"}, {"owner"}),
+            ("unit", set(), {"owner", "unit"}),
+        ):
+            with self.subTest(contradictory_key=contradictory_key, active=active):
+                client = FakeDagClient()
+                with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+                    with StateStore(Path(project_dir), home=Path(home_dir)) as store:
+                        run = store.create_run(objective="contradictory frontier", profile_digest="p", source_digest="s")
+                        scheduler = NativeDagScheduler(client, store, run.local_id)  # type: ignore[arg-type]
+                        bindings = scheduler.create("run_1", plan)
+                        for row in client.rows:
+                            row["status"] = (
+                                "ready"
+                                if row["id"] == bindings[contradictory_key].task_id
+                                else "completed" if row["id"] == bindings["owner"].task_id else "pending"
+                            )
+
+                        with self.assertRaises(OrchestrateError) as caught:
+                            scheduler.ready_wave(
+                                "run_1",
+                                plan,
+                                bindings,
+                                active=active,
+                                finished=finished,
+                                remaining_capacity=plan.max_workers - len(active),
+                            )
+
+                self.assertEqual(caught.exception.code, "native_ready_gate_mismatch")
+
+    def test_native_ready_frontier_selects_valid_later_work_around_active_and_finished_tasks(self) -> None:
+        plan = replace(milestone(), max_workers=2)
+        client = FakeDagClient()
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            with StateStore(Path(project_dir), home=Path(home_dir)) as store:
+                run = store.create_run(objective="mixed later wave", profile_digest="p", source_digest="s")
+                scheduler = NativeDagScheduler(client, store, run.local_id)  # type: ignore[arg-type]
+                bindings = scheduler.create("run_1", plan)
+                for row in client.rows:
+                    if row["id"] == bindings["owner"].task_id:
+                        row["status"] = "completed"
+                    elif row["id"] == bindings["unit"].task_id:
+                        row["status"] = "dispatched"
+                    elif row["id"] == bindings["incident"].task_id:
+                        row["status"] = "ready"
+
+                selected = scheduler.ready_wave(
+                    "run_1",
+                    plan,
+                    bindings,
+                    active={"unit"},
+                    finished={"owner"},
+                    remaining_capacity=1,
+                )
+
+        self.assertEqual([binding.key for binding in selected], ["incident"])
 
     def test_native_gate_intentions_recover_by_exact_readback_without_duplicate_mutation(self) -> None:
         client = RecoveringGateClient()

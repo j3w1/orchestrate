@@ -64,6 +64,12 @@ def _find_repo_root(start: Path) -> Path:
     )
 
 
+def find_project_root(start: Path) -> Path:
+    """Resolve repository identity without reading or trusting its profile bytes."""
+
+    return _find_repo_root(start)
+
+
 def _git_bytes(root: Path, *arguments: str, allow_failure: bool = False) -> bytes | None:
     completed = subprocess.run(
         ("git", "-C", os.fspath(root), *arguments),

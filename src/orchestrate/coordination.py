@@ -679,16 +679,23 @@ class NativeDagScheduler:
         plan: MilestonePlan,
         bindings: Mapping[str, NativeTaskBinding],
         *,
+        active: set[str],
+        finished: set[str],
         remaining_capacity: int,
     ) -> tuple[NativeTaskBinding, ...]:
         plan.validated()
+        task_keys = {task.key for task in plan.tasks}
         if (
             type(remaining_capacity) is not int
             or remaining_capacity < 0
             or remaining_capacity > plan.max_workers
+            or not active <= task_keys
+            or not finished <= task_keys
+            or bool(active & finished)
+            or remaining_capacity != plan.max_workers - len(active)
         ):
             raise OrchestrateError(
-                "Remaining worker capacity is outside the bounded roster",
+                "Active, finished, and remaining worker capacity do not form one bounded roster",
                 code="native_ready_gate_mismatch",
             )
         response = self.client.run_json(
@@ -698,6 +705,16 @@ class NativeDagScheduler:
         if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
             raise OrchestrateError("ready Task view has an unknown native shape", code="orca_contract_error")
         by_id = {binding.task_id: binding for binding in bindings.values()}
+        ineligible_ids = {
+            bindings[key].task_id
+            for key in active | finished
+            if key in bindings
+        }
+        if len(ineligible_ids) != len(active | finished):
+            raise OrchestrateError(
+                "Active or finished work lost its exact native Task binding",
+                code="native_ready_gate_mismatch",
+            )
         ready_ids: set[str] = set()
         for row in rows:
             task_id = row.get("id")
@@ -705,6 +722,7 @@ class NativeDagScheduler:
                 not isinstance(task_id, str)
                 or task_id not in by_id
                 or task_id in ready_ids
+                or task_id in ineligible_ids
                 or row.get("status") != "ready"
             ):
                 raise OrchestrateError("ready Task view escaped the bound milestone", code="native_ready_gate_mismatch")
