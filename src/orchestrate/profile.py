@@ -113,7 +113,11 @@ def instruction_inventory(root: Path) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
-def _profile_candidate(root: Path) -> tuple[bytes, dict[str, Any]]:
+def _profile_candidate(
+    root: Path,
+    *,
+    require_sources: bool = True,
+) -> tuple[bytes, dict[str, Any]]:
     path = root / PROFILE_NAME
     if not path.is_file():
         raise OrchestrateError(
@@ -125,7 +129,7 @@ def _profile_candidate(root: Path) -> tuple[bytes, dict[str, Any]]:
         value = json.loads(raw)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OrchestrateError(f"Cannot read {path}: {exc}", code="profile_unreadable") from exc
-    return raw, validate_profile(value, root=root)
+    return raw, validate_profile(value, root=root, require_sources=require_sources)
 
 
 def _selection_path(root: Path) -> Path:
@@ -311,7 +315,12 @@ def discover_profile(root: Path) -> dict[str, Any]:
     }
 
 
-def validate_profile(value: object, *, root: Path) -> dict[str, Any]:
+def validate_profile(
+    value: object,
+    *,
+    root: Path,
+    require_sources: bool = True,
+) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("schema") != PROFILE_SCHEMA:
         raise OrchestrateError(
             f"{PROFILE_NAME} must use schema {PROFILE_SCHEMA}",
@@ -341,7 +350,7 @@ def validate_profile(value: object, *, root: Path) -> dict[str, Any]:
                 candidate = approved_project_path(
                     root,
                     entry,
-                    require_file=key != "candidateSources",
+                    require_file=require_sources and key != "candidateSources",
                 )
                 _relative(root.resolve(), candidate)
             except OrchestrateError:
@@ -372,10 +381,15 @@ class ProjectProfile:
     candidate_changed: bool
 
     @classmethod
-    def load(cls, root: Path) -> "ProjectProfile":
+    def load(
+        cls,
+        root: Path,
+        *,
+        require_sources: bool = True,
+    ) -> "ProjectProfile":
         repo = _find_repo_root(root)
         path = repo / PROFILE_NAME
-        raw, _candidate = _profile_candidate(repo)
+        raw, _candidate = _profile_candidate(repo, require_sources=require_sources)
         candidate_digest = hashlib.sha256(raw).hexdigest()
         selection, selection_history_digest = _selection_record(repo)
         matching = [
@@ -391,7 +405,7 @@ class ProjectProfile:
                 "The selected operational profile source cannot be decoded",
                 code="profile_selection_invalid",
             ) from exc
-        operational = validate_profile(selected_value, root=repo)
+        operational = validate_profile(selected_value, root=repo, require_sources=require_sources)
         return cls(
             repo,
             path,

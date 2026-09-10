@@ -2545,7 +2545,93 @@ def _process_milestone_delivery(
     return store.get_run(run.local_id)
 
 
-def _milestone_summary(store: StateStore, run: RunRecord, *, live: object = None) -> JsonObject:
+def _milestone_source_binding(
+    profile: ProjectProfile,
+    store: StateStore,
+    run: RunRecord,
+) -> JsonObject:
+    plan = store.connection.execute(
+        "SELECT relative_path, candidate_digest FROM milestone_plan_bindings WHERE run_local_id = ?",
+        (run.local_id,),
+    ).fetchone()
+    expected = (
+        plan["candidate_digest"]
+        if plan is not None and plan["candidate_digest"] is not None
+        else run.source_digest
+    )
+    try:
+        packet_rows = store.connection.execute(
+            "SELECT packet_json FROM packets WHERE run_local_id = ? ORDER BY created_at, task_id",
+            (run.local_id,),
+        ).fetchall()
+        if not packet_rows:
+            raise OrchestrateError(
+                "No immutable packet source inventory is available for this milestone",
+                code="packet_not_found",
+            )
+        candidate_inventories: list[frozenset[str]] = []
+        for row in packet_rows:
+            try:
+                packet_value = json.loads(row["packet_json"])
+            except json.JSONDecodeError as exc:
+                raise OrchestrateError(
+                    "A stored immutable Task packet is not valid JSON",
+                    code="packet_identity_conflict",
+                ) from exc
+            sources = packet_value.get("sources") if isinstance(packet_value, Mapping) else None
+            if not isinstance(sources, list):
+                raise OrchestrateError(
+                    "A stored immutable Task packet lost its source inventory",
+                    code="packet_identity_conflict",
+                )
+            packet_paths: set[str] = set()
+            for source in sources:
+                path = source.get("path") if isinstance(source, Mapping) else None
+                if not isinstance(path, str) or not path:
+                    raise OrchestrateError(
+                        "A stored immutable Task packet has a malformed source identity",
+                        code="packet_identity_conflict",
+                    )
+                packet_paths.add(path)
+            if packet_value.get("sourceDigest") == expected:
+                candidate_inventories.append(frozenset(packet_paths))
+        if not candidate_inventories or any(
+            inventory != candidate_inventories[0]
+            for inventory in candidate_inventories[1:]
+        ):
+            raise OrchestrateError(
+                "No single immutable packet source inventory binds the selected milestone candidate",
+                code="packet_identity_conflict",
+            )
+        bound_paths = set(candidate_inventories[0])
+        if plan is not None:
+            bound_paths.add(str(plan["relative_path"]))
+        current = build_source_index(profile, extra_sources=bound_paths)
+        candidate = current.value.get("candidate")
+        coverage = candidate.get("coverageComplete") if isinstance(candidate, Mapping) else None
+        return {
+            "expected": expected,
+            "current": current.digest,
+            "unchanged": expected == current.digest if coverage is True else None,
+            "coverageComplete": coverage,
+        }
+    except OrchestrateError as exc:
+        return {
+            "expected": expected,
+            "current": None,
+            "unchanged": None,
+            "coverageComplete": None,
+            "error": {"code": exc.code, "message": str(exc)},
+        }
+
+
+def _milestone_summary(
+    store: StateStore,
+    run: RunRecord,
+    *,
+    live: object = None,
+    source_binding: Mapping[str, Any] | None = None,
+) -> JsonObject:
     report = _run_summary(store, run, live=live)
     plan = store.connection.execute(
         "SELECT relative_path, plan_digest, candidate_digest, contract_digest, status FROM milestone_plan_bindings WHERE run_local_id = ?",
@@ -2575,12 +2661,43 @@ def _milestone_summary(store: StateStore, run: RunRecord, *, live: object = None
             else "pending"
         )
         task_reports.append(task_report)
+    plan_report = dict(plan) if plan is not None else None
     report["milestone"] = {
-        "plan": dict(plan) if plan is not None else None,
+        "plan": plan_report,
         "tasks": task_reports,
         "gates": [dict(row) for row in gates],
     }
-    if run.phase == "worker_succeeded" and run.verification_status == "review_accepted":
+    if source_binding is not None:
+        report["sourceBinding"] = dict(source_binding)
+    accepted_review_is_stale = (
+        run.phase == "worker_succeeded"
+        and run.verification_status == "review_accepted"
+        and source_binding is not None
+        and source_binding.get("unchanged") is not True
+    )
+    if accepted_review_is_stale:
+        stored_plan_status = plan_report.get("status") if plan_report is not None else None
+        if plan_report is not None:
+            plan_report["status"] = "review_stale"
+        if source_binding.get("coverageComplete") is False:
+            reason = "candidate_coverage_incomplete"
+        elif source_binding.get("current") is not None:
+            reason = "candidate_digest_changed"
+        else:
+            reason = "source_binding_unavailable"
+        report["status"] = "stale_review"
+        report["verification"] = "review_stale"
+        report["staleEvidence"] = {
+            "kind": "independent_review",
+            "reason": reason,
+            "storedVerification": run.verification_status,
+            "storedPlanStatus": stored_plan_status,
+            "required": "a new independent review bound to the current candidate and settled contract",
+        }
+        report["nextObligation"] = (
+            "accepted review evidence is stale; a new independent review of the current candidate is required"
+        )
+    elif run.phase == "worker_succeeded" and run.verification_status == "review_accepted":
         report["nextObligation"] = "independent review is accepted; external project acceptance remains unresolved"
     elif run.phase == "milestone_blocked":
         report["nextObligation"] = "planned verification or review did not produce accepted current evidence"
@@ -2691,7 +2808,13 @@ def _advance_milestone(
     finished = {owner.key, *(row["task_key"] for row in workers if row["outcome"] is not None)}
     gate_rows = _milestone_gate_rows(store, run)
     roster = load_role_roster()
-    for binding in scheduler.ready_wave(str(run.native_run_id), runtime_plan, bindings):
+    remaining_capacity = runtime_plan.max_workers - len(active)
+    for binding in scheduler.ready_wave(
+        str(run.native_run_id),
+        runtime_plan,
+        bindings,
+        remaining_capacity=remaining_capacity,
+    ):
         task = next(item for item in runtime_plan.tasks if item.key == binding.key)
         if task.key in active or task.key in finished:
             continue
@@ -3037,7 +3160,7 @@ def resume(
 
 
 def status(root: Path, run_id: str | None, *, client: OrcaClient) -> JsonObject:
-    profile = ProjectProfile.load(root)
+    profile = ProjectProfile.load(root, require_sources=False)
     with StateStore(profile.root) as store:
         run = store.select_for_read(run_id)
         live: object
@@ -3064,34 +3187,29 @@ def status(root: Path, run_id: str | None, *, client: OrcaClient) -> JsonObject:
             except OrcaCommandError as exc:
                 live = {"status": "unavailable", "code": exc.code, "detail": str(exc)}
         if _milestone_plan_path(store, run) is not None:
-            return _milestone_summary(store, run, live=live)
+            source_binding = _milestone_source_binding(profile, store, run)
+            return _milestone_summary(store, run, live=live, source_binding=source_binding)
         return _run_summary(store, run, live=live)
 
 
 def explain(root: Path, run_id: str | None) -> JsonObject:
-    profile = ProjectProfile.load(root)
+    profile = ProjectProfile.load(root, require_sources=False)
     with StateStore(profile.root) as store:
         run = store.select_for_read(run_id)
+        milestone_path = _milestone_plan_path(store, run)
+        if milestone_path is not None:
+            source_binding = _milestone_source_binding(profile, store, run)
+            report = _milestone_summary(store, run, source_binding=source_binding)
+            report["explanationSource"] = "host-local records and exact source identities; no model call"
+            return report
         reader = read_project(profile, run.objective)
         current = _run_source_index(
             profile,
             reader,
-            milestone_path=_milestone_plan_path(store, run),
+            milestone_path=None,
         )
-        milestone = store.connection.execute(
-            "SELECT candidate_digest FROM milestone_plan_bindings WHERE run_local_id = ?",
-            (run.local_id,),
-        ).fetchone()
-        expected_source_digest = (
-            milestone["candidate_digest"]
-            if milestone is not None and milestone["candidate_digest"] is not None
-            else run.source_digest
-        )
-        report = (
-            _milestone_summary(store, run)
-            if _milestone_plan_path(store, run) is not None
-            else _run_summary(store, run)
-        )
+        expected_source_digest = run.source_digest
+        report = _run_summary(store, run)
         report["sourceBinding"] = {
             "expected": expected_source_digest,
             "current": current.digest,

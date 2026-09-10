@@ -678,8 +678,19 @@ class NativeDagScheduler:
         run_id: str,
         plan: MilestonePlan,
         bindings: Mapping[str, NativeTaskBinding],
+        *,
+        remaining_capacity: int,
     ) -> tuple[NativeTaskBinding, ...]:
         plan.validated()
+        if (
+            type(remaining_capacity) is not int
+            or remaining_capacity < 0
+            or remaining_capacity > plan.max_workers
+        ):
+            raise OrchestrateError(
+                "Remaining worker capacity is outside the bounded roster",
+                code="native_ready_gate_mismatch",
+            )
         response = self.client.run_json(
             "orchestration", "task-list", "--run", run_id, "--ready", "--brief", "--json"
         )
@@ -687,23 +698,33 @@ class NativeDagScheduler:
         if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
             raise OrchestrateError("ready Task view has an unknown native shape", code="orca_contract_error")
         by_id = {binding.task_id: binding for binding in bindings.values()}
-        selected: list[NativeTaskBinding] = []
+        ready_ids: set[str] = set()
         for row in rows:
             task_id = row.get("id")
-            if task_id not in by_id or row.get("status") != "ready":
+            if (
+                not isinstance(task_id, str)
+                or task_id not in by_id
+                or task_id in ready_ids
+                or row.get("status") != "ready"
+            ):
                 raise OrchestrateError("ready Task view escaped the bound milestone", code="native_ready_gate_mismatch")
-            selected.append(by_id[task_id])
+            ready_ids.add(task_id)
+        frontier = tuple(
+            bindings[task.key]
+            for task in plan.tasks
+            if task.key in bindings and bindings[task.key].task_id in ready_ids
+        )
+        if len(frontier) != len(ready_ids):
+            raise OrchestrateError("ready Task view escaped the bound milestone", code="native_ready_gate_mismatch")
         if plan.contract.state != "settled" and any(
             not next(task for task in plan.tasks if task.key == binding.key).integration_owner
-            for binding in selected
+            for binding in frontier
         ):
             raise OrchestrateError(
                 "Shared contracts must settle before parallel dispatch",
                 code="shared_contract_unsettled",
             )
-        if len(selected) > plan.max_workers:
-            raise OrchestrateError("Native ready wave exceeds the bounded worker roster", code="native_ready_gate_mismatch")
-        return tuple(selected)
+        return frontier[:remaining_capacity]
 
     @staticmethod
     def _gate_question(task: MilestoneTask, plan: MilestonePlan) -> str:

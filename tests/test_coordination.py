@@ -225,6 +225,37 @@ class CoordinationTests(unittest.TestCase):
         self.assertNotIn("--deps", task_creates[0])
         self.assertEqual(json.loads(task_creates[1][task_creates[1].index("--deps") + 1]), ["task_1"])
 
+    def test_native_ready_frontier_uses_deterministic_remaining_capacity(self) -> None:
+        plan = replace(milestone(), max_workers=1)
+        client = FakeDagClient()
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            with StateStore(Path(project_dir), home=Path(home_dir)) as store:
+                run = store.create_run(objective="bounded frontier", profile_digest="p", source_digest="s")
+                scheduler = NativeDagScheduler(client, store, run.local_id)  # type: ignore[arg-type]
+                bindings = scheduler.create("run_1", plan)
+                for row in client.rows:
+                    if row["id"] == bindings["owner"].task_id:
+                        row["status"] = "completed"
+                    elif row["id"] in {bindings["unit"].task_id, bindings["incident"].task_id}:
+                        row["status"] = "ready"
+                client.rows.reverse()
+
+                selected = scheduler.ready_wave(
+                    "run_1",
+                    plan,
+                    bindings,
+                    remaining_capacity=1,
+                )
+                at_capacity = scheduler.ready_wave(
+                    "run_1",
+                    plan,
+                    bindings,
+                    remaining_capacity=0,
+                )
+
+        self.assertEqual([binding.key for binding in selected], ["unit"])
+        self.assertEqual(at_capacity, ())
+
     def test_native_gate_intentions_recover_by_exact_readback_without_duplicate_mutation(self) -> None:
         client = RecoveringGateClient()
         with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:

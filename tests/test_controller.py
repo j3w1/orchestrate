@@ -30,7 +30,9 @@ from orchestrate.controller import (
     implement,
     reconcile_intentions,
     resume,
+    status,
 )
+from orchestrate.cli import main as cli_main
 from orchestrate.errors import OrchestrateError
 from orchestrate.identity import require_plain_controller
 from orchestrate.orca import OrcaCommandError, OrcaCommandResult, OrcaJsonResponse
@@ -780,6 +782,7 @@ class MilestoneClient:
         self.next_gate = 1
         self.next_delivery = 1
         self.current_run = "run_1"
+        self.peak_active_workers = 0
 
     def _wrapped(self, value: dict[str, object], *, returncode: int = 0) -> OrcaJsonResponse:
         value.setdefault("_meta", {"runtimeId": "runtime_test"})
@@ -822,6 +825,10 @@ class MilestoneClient:
             "state": "ready",
             "released": False,
         }
+        self.peak_active_workers = max(
+            self.peak_active_workers,
+            sum(record["state"] == "ready" for record in self.workers.values()),
+        )
         response = mutation(
             f"request_start_{task_id}",
             runId="run_1",
@@ -923,27 +930,29 @@ class MilestoneClient:
         active["state"] = "succeeded"
         self.tasks[task_id]["status"] = "completed"
         payload: dict[str, object] = {"taskId": task_id, "dispatchId": dispatch_id, "outcome": "succeeded"}
-        if task_id != "task_1" and not (task_id == "task_2" and self.verification_result == "missing"):
+        if task_id != "task_1":
             with StateStore(self.root) as store:
                 run = store.select_run(None)
                 packet = store.get_packet(run.local_id, task_id)
-            result_path = Path(packet["outputs"]["milestoneResult"]["path"])
-            result_outcome = self.verification_result if task_id == "task_2" else self.review_result
-            result_path.write_text(
-                json.dumps(
-                    {
-                        "schema": "orchestrate-milestone-result/v1",
-                        "taskKey": packet["scope"]["taskKey"],
-                        "taskId": task_id,
-                        "dispatchId": dispatch_id,
-                        "candidateDigest": packet["milestone"]["candidateDigest"],
-                        "contractDigest": packet["milestone"]["contractDigest"],
-                        "outcome": result_outcome,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            payload["reportPath"] = str(result_path)
+            role = packet["scope"]["role"]
+            result_outcome = self.verification_result if role == "specialist" else self.review_result
+            if result_outcome != "missing":
+                result_path = Path(packet["outputs"]["milestoneResult"]["path"])
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "schema": "orchestrate-milestone-result/v1",
+                            "taskKey": packet["scope"]["taskKey"],
+                            "taskId": task_id,
+                            "dispatchId": dispatch_id,
+                            "candidateDigest": packet["milestone"]["candidateDigest"],
+                            "contractDigest": packet["milestone"]["contractDigest"],
+                            "outcome": result_outcome,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                payload["reportPath"] = str(result_path)
         delivery_id = f"delivery_{self.next_delivery}"
         self.next_delivery += 1
         return {
@@ -1075,7 +1084,7 @@ class MilestoneClient:
 
     def _objective(self) -> str:
         with StateStore(self.root) as store:
-            return store.select_run(None).objective
+            return store.select_for_read(None).objective
 
 
 def settlement_responses(
@@ -1232,8 +1241,24 @@ class ControllerTests(unittest.TestCase):
         self.project_temp.cleanup()
         self.state_temp.cleanup()
 
-    def _write_milestone_plan(self, objective: str) -> str:
+    def _write_milestone_plan(
+        self,
+        objective: str,
+        *,
+        specialist_keys: tuple[str, ...] = ("verify",),
+    ) -> str:
         relative = "milestone-plan.json"
+        specialist_tasks = [
+            {
+                "key": key,
+                "title": f"Verify the integrated candidate ({key})",
+                "spec": f"Read only the exact candidate and report focused verification for {key}.",
+                "role": "specialist",
+                "dependencies": ["owner"],
+                "gate": "verification",
+            }
+            for key in specialist_keys
+        ]
         (self.root / relative).write_text(
             json.dumps(
                 {
@@ -1249,20 +1274,13 @@ class ControllerTests(unittest.TestCase):
                             "dependencies": [],
                             "gate": "integration",
                         },
-                        {
-                            "key": "verify",
-                            "title": "Verify the integrated candidate",
-                            "spec": "Read only the exact candidate and report focused verification.",
-                            "role": "specialist",
-                            "dependencies": ["owner"],
-                            "gate": "verification",
-                        },
+                        *specialist_tasks,
                         {
                             "key": "review",
                             "title": "Review the verified candidate",
                             "spec": "Independently review only the exact verified candidate.",
                             "role": "reviewer",
-                            "dependencies": ["owner", "verify"],
+                            "dependencies": ["owner", *specialist_keys],
                             "gate": "review",
                         },
                     ],
@@ -1304,6 +1322,176 @@ class ControllerTests(unittest.TestCase):
             [item["admission"] for item in report["milestone"]["tasks"]],
             ["admitted", "admitted"],
         )
+
+    def test_production_controller_executes_wide_ready_frontier_in_bounded_waves(self) -> None:
+        objective = "Execute every specialist in deterministic bounded waves"
+        specialists = ("verify_a", "verify_b", "verify_c")
+        plan = self._write_milestone_plan(objective, specialist_keys=specialists)
+        client = MilestoneClient(self.root)
+
+        report = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+
+        starts = [call for call in client.calls if call[:2] == ("orchestration", "worker-start")]
+        started_task_ids = [call[call.index("--task") + 1] for call in starts]
+        self.assertEqual(started_task_ids, ["task_1", "task_2", "task_3", "task_4", "task_5"])
+        self.assertEqual(client.peak_active_workers, 2)
+        third_specialist_start = next(
+            index
+            for index, call in enumerate(client.calls)
+            if call[:2] == ("orchestration", "worker-start")
+            and call[call.index("--task") + 1] == "task_4"
+        )
+        first_specialist_ack = next(
+            index
+            for index, call in enumerate(client.calls)
+            if call[:2] == ("orchestration", "check")
+            and "--ack" in call
+            and call[call.index("--ack") + 1] == "delivery_2"
+        )
+        reviewer_start = next(
+            index
+            for index, call in enumerate(client.calls)
+            if call[:2] == ("orchestration", "worker-start")
+            and call[call.index("--task") + 1] == "task_5"
+        )
+        final_specialist_ack = next(
+            index
+            for index, call in enumerate(client.calls)
+            if call[:2] == ("orchestration", "check")
+            and "--ack" in call
+            and call[call.index("--ack") + 1] == "delivery_4"
+        )
+        self.assertGreater(third_specialist_start, first_specialist_ack)
+        self.assertGreater(reviewer_start, final_specialist_ack)
+        self.assertEqual(report["status"], "worker_succeeded")
+        self.assertEqual(report["verification"], "review_accepted")
+        self.assertEqual(
+            [(item["task_key"], item["result_outcome"]) for item in report["milestone"]["tasks"]],
+            [
+                ("verify_a", "accepted"),
+                ("verify_b", "accepted"),
+                ("verify_c", "accepted"),
+                ("review", "accepted"),
+            ],
+        )
+
+    def test_status_and_explain_retract_accepted_review_for_all_consulted_source_drift(self) -> None:
+        objective = "Invalidate accepted review as soon as consulted source identity changes"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root)
+        accepted = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        local_run_id = str(accepted["localRunId"])
+        agents_path = self.root / "AGENTS.md"
+        original_agents = agents_path.read_bytes()
+
+        def apply_drift(kind: str) -> None:
+            if kind == "unstaged":
+                agents_path.write_text("Unstaged candidate restriction.\n", encoding="utf-8")
+            elif kind == "staged":
+                agents_path.write_text("Staged candidate restriction.\n", encoding="utf-8")
+                git(self.root, "add", "AGENTS.md")
+            elif kind == "untracked":
+                nested = self.root / "nested"
+                nested.mkdir()
+                (nested / "AGENTS.md").write_text("Untracked nested restriction.\n", encoding="utf-8")
+            elif kind == "deleted":
+                agents_path.unlink()
+            elif kind == "replaced":
+                replacement = self.root / "replacement-policy.tmp"
+                replacement.write_text("Atomically replaced restriction.\n", encoding="utf-8")
+                replacement.replace(agents_path)
+            else:
+                raise AssertionError(kind)
+
+        def restore_drift(kind: str) -> None:
+            if kind == "staged":
+                git(self.root, "restore", "--staged", "--", "AGENTS.md")
+            if kind == "untracked":
+                nested_agents = self.root / "nested" / "AGENTS.md"
+                nested_agents.unlink()
+                nested_agents.parent.rmdir()
+            agents_path.write_bytes(original_agents)
+
+        for kind in ("unstaged", "staged", "untracked", "deleted", "replaced"):
+            with self.subTest(kind=kind):
+                apply_drift(kind)
+                try:
+                    status_report = status(
+                        self.root,
+                        local_run_id,
+                        client=client,  # type: ignore[arg-type]
+                    )
+                    explain_report = explain(self.root, local_run_id)
+                    for report in (status_report, explain_report):
+                        self.assertEqual(report["status"], "stale_review")
+                        self.assertEqual(report["verification"], "review_stale")
+                        self.assertNotEqual(report["milestone"]["plan"]["status"], "review_accepted")
+                        self.assertEqual(report["staleEvidence"]["storedVerification"], "review_accepted")
+                        self.assertIn("new independent review", report["nextObligation"])
+                        self.assertIsNot(report["sourceBinding"]["unchanged"], True)
+                    for command, report in (("status", status_report), ("explain", explain_report)):
+                        with patch("orchestrate.cli._execute", return_value=(report, True)), patch("builtins.print"):
+                            self.assertEqual(
+                                cli_main([command, "--project", str(self.root), "--run", local_run_id, "--json"]),
+                                1,
+                            )
+                    if kind == "unstaged":
+                        mutations_before = [
+                            call
+                            for call in client.calls
+                            if call[:2]
+                            in {
+                                ("orchestration", "gate-create"),
+                                ("orchestration", "gate-resolve"),
+                                ("orchestration", "task-create"),
+                                ("orchestration", "worker-release"),
+                                ("orchestration", "worker-start"),
+                            }
+                        ]
+                        with self.assertRaises(OrchestrateError) as stale_resume:
+                            resume(
+                                self.root,
+                                local_run_id,
+                                client=client,  # type: ignore[arg-type]
+                                milestone_plan=plan,
+                                wait_timeout_ms=100,
+                                require_context=False,
+                            )
+                        self.assertEqual(stale_resume.exception.code, "stale_review")
+                        mutations_after = [
+                            call
+                            for call in client.calls
+                            if call[:2]
+                            in {
+                                ("orchestration", "gate-create"),
+                                ("orchestration", "gate-resolve"),
+                                ("orchestration", "task-create"),
+                                ("orchestration", "worker-release"),
+                                ("orchestration", "worker-start"),
+                            }
+                        ]
+                        self.assertEqual(mutations_after, mutations_before)
+                finally:
+                    restore_drift(kind)
+
+                restored = explain(self.root, local_run_id)
+                self.assertEqual(restored["status"], "worker_succeeded")
+                self.assertEqual(restored["verification"], "review_accepted")
+                self.assertIs(restored["sourceBinding"]["unchanged"], True)
 
     def test_untracked_milestone_plan_has_zero_orca_effects(self) -> None:
         objective = "Reject an untracked milestone authority packet"

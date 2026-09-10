@@ -313,6 +313,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "milestone_blocked",
             "milestone_cleanup_pending",
             "preflight_held",
+            "stale_review",
             "worker_failed",
             "worker_unadmitted",
         }
