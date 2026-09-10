@@ -719,11 +719,7 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
         item["kind"] == "compatibility" and item["subject"] == INPUT_SUBMISSION_DIAGNOSTIC_SUBJECT
         for item in store.evidence(run.local_id)
     )
-    if pending:
-        next_obligation = f"answer question {pending[0]['message_id']}"
-    elif run.phase == "worker_succeeded" and run.verification_status == "pending":
-        next_obligation = "independent verification and project acceptance remain unresolved"
-    elif admission in {"rejected", "conflicting"} and run.phase in {
+    if admission in {"rejected", "conflicting"} and run.phase in {
         "awaiting_preflight",
         "waiting",
         PREFLIGHT_HELD_PHASE,
@@ -732,6 +728,10 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
             "the immutable worker preflight is held; inspect admissionDetail and use a separately "
             "authorized cleanup path to settle the exact bound attempt"
         )
+    elif pending:
+        next_obligation = f"answer question {pending[0]['message_id']}"
+    elif run.phase == "worker_succeeded" and run.verification_status == "pending":
+        next_obligation = "independent verification and project acceptance remain unresolved"
     elif run.phase == "awaiting_preflight" and input_unproven:
         next_obligation = (
             "worker input was accepted but turn start is unproven; inspect the bound Dispatch "
@@ -2142,18 +2142,27 @@ def answer(
     profile = ProjectProfile.load(root)
     with StateStore(profile.root) as store:
         run = store.get_run(run_id)
-        identity = (
-            require_plain_controller(
-                client,
-                profile.root,
-                expected_run_id=run.native_run_id,
-                allow_expected_unbound=True,
-            )
-            if require_context and run.native_run_id
-            else (require_plain_controller(client, profile.root) if require_context else None)
-        )
         with store.lock(run.local_id):
+            run, admission = _join_admission(store, store.get_run(run.local_id))
+            if admission != "admitted":
+                return _run_summary(store, run)
+            identity = (
+                require_plain_controller(
+                    client,
+                    profile.root,
+                    expected_run_id=run.native_run_id,
+                    allow_expected_unbound=True,
+                )
+                if require_context and run.native_run_id
+                else (require_plain_controller(client, profile.root) if require_context else None)
+            )
+            run, admission = _join_admission(store, store.get_run(run.local_id))
+            if admission != "admitted":
+                return _run_summary(store, run)
             run = reconcile_intentions(client, store, run)
+            run, admission = _join_admission(store, run)
+            if admission != "admitted":
+                return _run_summary(store, run)
             run = _bind_native_run(client, store, run, identity)
             row = store.connection.execute("SELECT * FROM questions WHERE message_id = ?", (question_id,)).fetchone()
             if row is None or row["run_local_id"] != run.local_id:

@@ -1556,9 +1556,12 @@ class ControllerTests(unittest.TestCase):
                             self.assertFalse(any(call[:2] == ("terminal", "close") for call in client.calls))
                             self.assertFalse(any("--ack" in call for call in client.calls))
 
-    def test_question_delivery_remains_unacknowledged_then_answers_exactly(self) -> None:
-        objective = "Ask when blocked"
-        responses = completion_responses(self.root, objective)[:6]
+    def _start_pending_question(self, objective: str) -> dict[str, object]:
+        responses = completion_responses(self.root, objective)[:4]
+        responses.extend([
+            _worker_start_with_real_preflight(self.root, current_shape=True),
+            _worker_start_readback(self.root, current_shape=True),
+        ])
         responses.append(
             {
                 "result": {
@@ -1576,7 +1579,49 @@ class ControllerTests(unittest.TestCase):
         )
         client = FakeClient(responses)
         report = implement(self.root, objective, client=client, wait_timeout_ms=100, require_context=False)  # type: ignore[arg-type]
+        self.assertEqual(report["status"], "waiting")
+        self.assertEqual(report["admission"], "admitted")
         self.assertEqual(report["pendingQuestions"], ["question_1"])
+        return report
+
+    def _answer_guard_snapshot(self, local_id: str) -> dict[str, object]:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            return {
+                "questions": [
+                    dict(row)
+                    for row in store.connection.execute(
+                        "SELECT * FROM questions WHERE run_local_id = ? ORDER BY message_id",
+                        (local_id,),
+                    ).fetchall()
+                ],
+                "deliveries": [
+                    dict(row)
+                    for row in store.connection.execute(
+                        "SELECT * FROM deliveries WHERE run_local_id = ? ORDER BY delivery_id",
+                        (local_id,),
+                    ).fetchall()
+                ],
+                "messages": [
+                    dict(row)
+                    for row in store.connection.execute(
+                        """SELECT * FROM delivery_messages
+                           WHERE run_local_id = ? ORDER BY delivery_id, ordinal""",
+                        (local_id,),
+                    ).fetchall()
+                ],
+                "preflights": [
+                    (row["dispatch_id"], row["outcome"], row["observation_json"])
+                    for row in store.connection.execute(
+                        """SELECT dispatch_id, outcome, observation_json FROM preflight_observations
+                           WHERE run_local_id = ? ORDER BY dispatch_id""",
+                        (local_id,),
+                    ).fetchall()
+                ],
+            }
+
+    def test_question_delivery_remains_unacknowledged_then_answers_exactly(self) -> None:
+        objective = "Ask when blocked"
+        report = self._start_pending_question(objective)
 
         answer_client = FakeClient(
             [
@@ -1595,7 +1640,99 @@ class ControllerTests(unittest.TestCase):
             client=answer_client,  # type: ignore[arg-type]
             require_context=False,
         )
+        self.assertEqual(answered["status"], "waiting")
+        self.assertEqual(answered["admission"], "admitted")
         self.assertEqual(answered["pendingQuestions"], [])
+        self.assertTrue(any(call[:2] == ("orchestration", "reply") for call in answer_client.calls))
+        self.assertTrue(any("--ack" in call for call in answer_client.calls))
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            question = store.connection.execute(
+                "SELECT status, answer FROM questions WHERE message_id = 'question_1'",
+            ).fetchone()
+            delivery = store.connection.execute(
+                "SELECT acked FROM deliveries WHERE run_local_id = ? AND delivery_id = 'delivery_q'",
+                (str(report["localRunId"]),),
+            ).fetchone()
+            self.assertEqual((question["status"], question["answer"]), ("answered", "Choose A"))
+            self.assertEqual(delivery["acked"], 1)
+
+    def test_answer_holds_second_dispatch_observation_before_orca_or_local_effects(self) -> None:
+        report = self._start_pending_question("Hold answer after a second Dispatch observation")
+        local_id = str(report["localRunId"])
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.get_run(local_id)
+            packet = store.get_packet(run.local_id, "task_1")
+
+        second_client = RealPreflightClient(self.root, packet, current_shape=True)
+        with self.assertRaises(OrchestrateError) as caught:
+            worker_preflight(
+                self.root,
+                run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_2",
+                packet_id=str(packet["packetId"]),
+                client=second_client,  # type: ignore[arg-type]
+                environment={"ORCA_TERMINAL_HANDLE": "term_other"},
+                platform="win32",
+            )
+        self.assertEqual(caught.exception.code, "preflight_rejected")
+        self.assertEqual(second_client.calls, [])
+        before = self._answer_guard_snapshot(local_id)
+        self.assertEqual(
+            [(row[0], row[1]) for row in before["preflights"]],  # type: ignore[index]
+            [("dispatch_1", "passed"), ("dispatch_2", "rejected")],
+        )
+
+        idle = FakeClient([])
+        held = answer(
+            self.root,
+            "run_1",
+            "question_1",
+            "Choose A",
+            client=idle,  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(held["status"], "preflight_held")
+        self.assertEqual(held["admission"], "conflicting")
+        self.assertEqual(held["pendingQuestions"], ["question_1"])
+        self.assertIn("separately authorized cleanup", held["nextObligation"])
+        self.assertEqual(idle.calls, [])
+        self.assertEqual(self._answer_guard_snapshot(local_id), before)
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.get_run(local_id)
+            self.assertEqual(run.phase, "preflight_held")
+            self.assertEqual(joined_preflight_status(store, run), "conflicting")
+
+    def test_answer_holds_malformed_observation_before_orca_or_local_effects(self) -> None:
+        report = self._start_pending_question("Hold answer after malformed immutable evidence")
+        local_id = str(report["localRunId"])
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            store.connection.execute(
+                """UPDATE preflight_observations SET observation_json = ?
+                   WHERE run_local_id = ? AND dispatch_id = 'dispatch_1'""",
+                ("{malformed", local_id),
+            )
+        before = self._answer_guard_snapshot(local_id)
+
+        idle = FakeClient([])
+        held = answer(
+            self.root,
+            "run_1",
+            "question_1",
+            "Choose A",
+            client=idle,  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(held["status"], "preflight_held")
+        self.assertEqual(held["admission"], "conflicting")
+        self.assertEqual(held["admissionDetail"]["code"], "preflight_identity_conflict")  # type: ignore[index]
+        self.assertEqual(held["pendingQuestions"], ["question_1"])
+        self.assertIn("separately authorized cleanup", held["nextObligation"])
+        self.assertEqual(idle.calls, [])
+        self.assertEqual(self._answer_guard_snapshot(local_id), before)
+        self.assertEqual(before["preflights"], [("dispatch_1", "passed", "{malformed")])
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            self.assertEqual(store.get_run(local_id).phase, "preflight_held")
 
     def test_realistic_raw_wire_question_and_escalation_are_journaled_before_effects(self) -> None:
         objective = "Hold a real FIFO Delivery"
