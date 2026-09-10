@@ -450,6 +450,7 @@ def _validate_release(
     run_id: str,
     task_id: str,
     dispatch_id: str,
+    worker_outcome: str,
     expected_resource: TerminalResourceIdentity,
 ) -> None:
     result = _result_object(worker_payload)
@@ -462,14 +463,24 @@ def _validate_release(
         identity = worker_show_identity(dispatch, worker)
     except WorkerShowShapeError as exc:
         raise ProbeContractError(str(exc)) from exc
+    expected_status = "completed" if worker_outcome == "succeeded" else "failed"
+    expected_failure = None if worker_outcome == "succeeded" else "worker_failed"
     if (
         dispatch.get("id") != dispatch_id
         or identity.dispatch.run_id != run_id
         or identity.dispatch.task_id != task_id
+        or dispatch.get("status") != expected_status
+        or identity.dispatch.last_failure != expected_failure
+        or worker.get("state") != worker_outcome
+        or worker.get("stage") != "released"
+        or identity.last_error != expected_failure
         or identity.dispatch_id != dispatch_id
         or identity.worktree_id != expected_resource.worktree_id
+        or identity.terminal_handle is not None
     ):
-        raise ProbeContractError("Post-release worker-show did not return the exact Dispatch")
+        raise ProbeContractError(
+            "Post-release worker-show did not preserve the exact settled worker semantics"
+        )
     if not isinstance(resource, Mapping):
         raise ProbeContractError("Post-release worker-show omitted the terminal resource")
     try:
@@ -796,6 +807,7 @@ def run_worker_probe(client: OrcaClient, probe_token: str, *, project: Path, wai
             run_id=run_id,
             task_id=task_id,
             dispatch_id=dispatch_id,
+            worker_outcome=worker_outcome,
             expected_resource=expected_resource,
         ),
     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -134,7 +135,7 @@ class DoctorTests(unittest.TestCase):
                 "taskId": "task_probe",
                 "task_id": "task_probe",
                 "status": native,
-                "lastFailure": None,
+                "lastFailure": None if outcome == "succeeded" else "worker_failed",
             }
             if current_worker_shape
             else {
@@ -442,6 +443,113 @@ class DoctorTests(unittest.TestCase):
                         wait_timeout_ms=10,
                     )  # type: ignore[arg-type]
                 self.assertFalse(any("--ack" in call for call in client.calls))
+
+    def test_active_doctor_binds_released_worker_semantics_for_both_shapes_and_outcomes(self) -> None:
+        for current_shape in (False, True):
+            for outcome in ("succeeded", "failed"):
+                with self.subTest(current_shape=current_shape, outcome=outcome):
+                    minted = self.mint_probe()
+                    receipt = json.loads(
+                        (Path(self.state_temp.name) / "probes" / f"{minted['probeToken']}.json").read_text()
+                    )
+                    client = FakeClient(
+                        self.worker_responses(
+                            receipt["objective"],
+                            [self.done_message(outcome=outcome)],
+                            outcome=outcome,
+                            current_worker_shape=current_shape,
+                        )
+                    )
+
+                    report = run_worker_probe(
+                        client,  # type: ignore[arg-type]
+                        minted["probeToken"],
+                        project=self.root,
+                        wait_timeout_ms=10,
+                    )
+
+                    expected_status = "pass" if outcome == "succeeded" else "blocked"
+                    self.assertEqual(report["status"], expected_status)
+                    self.assertEqual(report["workerOutcome"], outcome)
+                    self.assertTrue(any("worker-release" in call for call in client.calls))
+                    self.assertTrue(any("--ack" in call for call in client.calls))
+
+    def test_active_doctor_rejects_each_released_worker_semantic_contradiction(self) -> None:
+        contradiction_fields = (
+            "dispatch_status",
+            "dispatch_last_failure",
+            "worker_state",
+            "worker_stage",
+            "worker_last_error",
+            "worker_terminal_handle",
+        )
+        for current_shape in (False, True):
+            for outcome in ("succeeded", "failed"):
+                for field in contradiction_fields:
+                    with self.subTest(current_shape=current_shape, outcome=outcome, field=field):
+                        minted = self.mint_probe()
+                        receipt = json.loads(
+                            (
+                                Path(self.state_temp.name)
+                                / "probes"
+                                / f"{minted['probeToken']}.json"
+                            ).read_text()
+                        )
+                        responses = self.worker_responses(
+                            receipt["objective"],
+                            [self.done_message(outcome=outcome)],
+                            outcome=outcome,
+                            current_worker_shape=current_shape,
+                        )
+                        released_index = next(
+                            index
+                            for index, response in enumerate(responses)
+                            if isinstance(response.get("result"), dict)
+                            and isinstance(response["result"].get("terminalResource"), dict)
+                            and response["result"]["terminalResource"].get("releaseState") == "released"
+                        )
+                        released = deepcopy(responses[released_index])
+                        responses[released_index] = released
+                        dispatch = released["result"]["dispatch"]
+                        worker = released["result"]["worker"]
+                        if field == "dispatch_status":
+                            dispatch["status"] = "dispatched"
+                        elif field == "dispatch_last_failure":
+                            dispatch[
+                                "lastFailure" if current_shape else "last_failure"
+                            ] = "contradictory_failure"
+                        elif field == "worker_state":
+                            worker["state"] = "ready"
+                        elif field == "worker_stage":
+                            worker["stage"] = "input_accepted"
+                        elif field == "worker_last_error":
+                            worker[
+                                "lastError" if current_shape else "last_error"
+                            ] = "contradictory_failure"
+                        elif field == "worker_terminal_handle":
+                            worker[
+                                "agentTerminalHandle" if current_shape else "agent_terminal_handle"
+                            ] = "term_probe"
+                        client = FakeClient(responses)
+
+                        with self.assertRaises(ProbeContractError):
+                            run_worker_probe(
+                                client,  # type: ignore[arg-type]
+                                minted["probeToken"],
+                                project=self.root,
+                                wait_timeout_ms=10,
+                            )
+
+                        self.assertEqual(
+                            sum("worker-start" in call for call in client.calls),
+                            1,
+                        )
+                        self.assertEqual(
+                            sum("worker-release" in call for call in client.calls),
+                            1,
+                        )
+                        self.assertFalse(any(call[:2] == ("terminal", "close") for call in client.calls))
+                        self.assertFalse(any("--ack" in call for call in client.calls))
 
     def test_run_creation_timeout_preserves_unknown_receipt_and_prior_reads(self) -> None:
         timeout = OrcaCommandError(

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any
+from typing import Any, Literal
 
 from .config import load_owner_model
 from .admission import joined_preflight_status, validate_packet_sources
@@ -44,7 +44,7 @@ def _result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _response_returncode(payload: Mapping[str, Any]) -> int:
-    returncode = getattr(payload, "returncode", 0)
+    returncode = getattr(payload, "returncode", None)
     if isinstance(returncode, bool) or not isinstance(returncode, int):
         raise OrchestrateError("Orca response lost its subprocess exit status", code="orca_contract_error")
     return returncode
@@ -1303,6 +1303,7 @@ def _release_disposition(
     store: StateStore,
     run: RunRecord,
     *,
+    expected_semantics: Literal["succeeded", "failed", "prompt_stall"],
     require_released: bool = False,
 ) -> None:
     rows = store.connection.execute(
@@ -1410,7 +1411,7 @@ def _release_disposition(
         resource.get("releaseError") is None
         and isinstance(archive, Mapping)
     )
-    if (
+    released_resource = (
         exact_owner
         and release_state in {"released", "already_released", "release_pending"}
         and ownership == "released"
@@ -1420,18 +1421,8 @@ def _release_disposition(
         and isinstance(resource.get("releaseCompletedAt"), str)
         and archive.get("source") == "transcript"
         and archive.get("status") == "captured"
-    ):
-        return
-    if release_state == "release_pending":
-        raise OrchestrateError(
-            "Worker terminal release remains pending exact Orca recovery",
-            code="release_pending",
-            data={
-                "release": dict(release_result),
-                "terminalResource": dict(resource),
-            },
-        )
-    if (
+    )
+    retained_resource = (
         not require_released
         and exact_owner
         and release_state == "retained"
@@ -1442,8 +1433,39 @@ def _release_disposition(
         and resource.get("releaseCompletedAt") is None
         and archive.get("source") is None
         and archive.get("status") is None
-    ):
+    )
+    if released_resource or retained_resource:
+        expected_dispatch_status = "completed" if expected_semantics == "succeeded" else "failed"
+        expected_worker_state = "succeeded" if expected_semantics == "succeeded" else "failed"
+        expected_failure = (
+            None
+            if expected_semantics == "succeeded"
+            else PROMPT_STALL_ERROR
+            if expected_semantics == "prompt_stall"
+            else "worker_failed"
+        )
+        if (
+            dispatch.get("status") != expected_dispatch_status
+            or shown_identity.dispatch.last_failure != expected_failure
+            or shown_worker.get("state") != expected_worker_state
+            or shown_worker.get("stage") != "released"
+            or shown_identity.last_error != expected_failure
+            or shown_identity.terminal_handle is not None
+        ):
+            raise OrchestrateError(
+                "worker-show release readback does not preserve the exact settled worker semantics",
+                code="release_unconfirmed",
+            )
         return
+    if release_state == "release_pending":
+        raise OrchestrateError(
+            "Worker terminal release remains pending exact Orca recovery",
+            code="release_pending",
+            data={
+                "release": dict(release_result),
+                "terminalResource": dict(resource),
+            },
+        )
     raise OrchestrateError(
         "Worker terminal release is not in a confirmed terminal disposition",
         code="release_unconfirmed",
@@ -1454,7 +1476,13 @@ def _release_disposition(
 def _finish_prompt_stall_cleanup(client: OrcaClient, store: StateStore, run: RunRecord) -> RunRecord:
     if run.phase != PROMPT_STALL_CLEANUP_PHASE:
         return run
-    _release_disposition(client, store, run, require_released=True)
+    _release_disposition(
+        client,
+        store,
+        run,
+        expected_semantics="prompt_stall",
+        require_released=True,
+    )
     return store.update_run(
         run.local_id,
         phase="worker_failed",
@@ -1510,7 +1538,7 @@ def _process_delivery(client: OrcaClient, store: StateStore, run: RunRecord, del
             raise OrchestrateError("worker_done has no recognized outcome", code="delivery_unsupported")
         current, admission = _join_admission(store, current)
         _validate_native_settlement(client, current, outcome)
-        _release_disposition(client, store, current)
+        _release_disposition(client, store, current, expected_semantics=outcome)
         current = store.finalize_worker_message(
             run_local_id=current.local_id,
             delivery_id=delivery_id,

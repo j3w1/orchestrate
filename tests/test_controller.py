@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from orchestrate.controller import (
+    _finish_prompt_stall_cleanup,
     _mutation,
     _process_delivery,
     _release_disposition,
@@ -39,8 +41,9 @@ Response = dict[str, object] | Callable[["FakeClient", tuple[str, ...]], dict[st
 
 
 class FakeClient:
-    def __init__(self, responses: list[Response]) -> None:
+    def __init__(self, responses: list[Response], *, default_returncode: int | None = 0) -> None:
         self.responses = responses
+        self.default_returncode = default_returncode
         self.calls: list[tuple[str, ...]] = []
 
     def run_json(self, *arguments: str, **_: object) -> dict[str, object]:
@@ -48,7 +51,10 @@ class FakeClient:
         if not self.responses:
             raise AssertionError(f"Unexpected Orca call: {arguments}")
         response = self.responses.pop(0)
-        return response(self, arguments) if callable(response) else response
+        resolved = response(self, arguments) if callable(response) else response
+        if isinstance(resolved, OrcaJsonResponse) or self.default_returncode is None:
+            return resolved
+        return OrcaJsonResponse(resolved, returncode=self.default_returncode)
 
 
 def mutation(request_id: str, **result: object) -> dict[str, object]:
@@ -97,7 +103,7 @@ def _task_readback(client: FakeClient, _: tuple[str, ...]) -> dict[str, object]:
     }
 
 
-def _worker_start(root: Path) -> dict[str, object]:
+def _worker_start(root: Path) -> OrcaJsonResponse:
     worktree_id = f"repo::{root.resolve()}"
     terminal_id = "term_worker"
     launch = {
@@ -123,7 +129,7 @@ def _worker_start(root: Path) -> dict[str, object]:
         residualResources=[terminal_effect],
     )
     response["_meta"] = {"runtimeId": "runtime_test"}
-    return response
+    return OrcaJsonResponse(response, returncode=0)
 
 
 def _worker_start_readback(root: Path) -> dict[str, object]:
@@ -377,6 +383,35 @@ def _released_resource(
         "releaseError": None,
         "archive": {"source": "transcript", "status": "captured"},
     }
+
+
+def _contradict_release_semantics(
+    payload: dict[str, object],
+    *,
+    current_shape: bool,
+    field: str,
+    original_terminal: str = "term_worker",
+) -> None:
+    result = payload["result"]
+    assert isinstance(result, dict)
+    dispatch = result["dispatch"]
+    worker = result["worker"]
+    assert isinstance(dispatch, dict)
+    assert isinstance(worker, dict)
+    if field == "dispatch_status":
+        dispatch["status"] = "dispatched"
+    elif field == "dispatch_last_failure":
+        dispatch["lastFailure" if current_shape else "last_failure"] = "contradictory_failure"
+    elif field == "worker_state":
+        worker["state"] = "ready"
+    elif field == "worker_stage":
+        worker["stage"] = "input_accepted"
+    elif field == "worker_last_error":
+        worker["lastError" if current_shape else "last_error"] = "contradictory_failure"
+    elif field == "worker_terminal_handle":
+        worker["agentTerminalHandle" if current_shape else "agent_terminal_handle"] = original_terminal
+    else:  # pragma: no cover - test helper guard
+        raise AssertionError(f"Unknown semantic contradiction: {field}")
 
 
 def _record_fixture_binding(
@@ -778,7 +813,12 @@ class ControllerTests(unittest.TestCase):
                 ),
             ]
             with self.assertRaises(OrchestrateError) as caught:
-                _release_disposition(FakeClient(responses), store, run)  # type: ignore[arg-type]
+                _release_disposition(
+                    FakeClient(responses),
+                    store,
+                    run,
+                    expected_semantics="succeeded",
+                )  # type: ignore[arg-type]
         self.assertEqual(caught.exception.code, "release_unconfirmed")
 
     def test_exact_user_takeover_is_preserved_but_unproven_external_shape_holds(self) -> None:
@@ -828,6 +868,7 @@ class ControllerTests(unittest.TestCase):
                 ),
                 store,
                 run,
+                expected_semantics="succeeded",
             )  # type: ignore[arg-type]
             with self.assertRaises(OrchestrateError) as prompt_stall_hold:
                 _release_disposition(
@@ -843,6 +884,7 @@ class ControllerTests(unittest.TestCase):
                     ),
                     store,
                     run,
+                    expected_semantics="succeeded",
                     require_released=True,
                 )  # type: ignore[arg-type]
             self.assertEqual(prompt_stall_hold.exception.code, "release_unconfirmed")
@@ -889,6 +931,7 @@ class ControllerTests(unittest.TestCase):
                     ),
                     store,
                     run,
+                    expected_semantics="succeeded",
                 )  # type: ignore[arg-type]
             self.assertEqual(caught.exception.code, "release_unconfirmed")
 
@@ -932,6 +975,7 @@ class ControllerTests(unittest.TestCase):
                             ),
                             store,
                             run,
+                            expected_semantics="failed",
                             require_released=True,
                         )  # type: ignore[arg-type]
 
@@ -979,9 +1023,261 @@ class ControllerTests(unittest.TestCase):
                             ),
                             store,
                             run,
+                            expected_semantics="failed",
                             require_released=True,
                         )  # type: ignore[arg-type]
                     self.assertEqual(caught.exception.code, "release_unconfirmed")
+
+    def test_ordinary_post_release_semantics_reject_each_contradiction_for_both_shapes(self) -> None:
+        contradiction_fields = (
+            "dispatch_status",
+            "dispatch_last_failure",
+            "worker_state",
+            "worker_stage",
+            "worker_last_error",
+            "worker_terminal_handle",
+        )
+        message_template = {
+            "id": "message_done",
+            "type": "worker_done",
+            "subject": "done",
+        }
+        for current_shape in (False, True):
+            for outcome in ("succeeded", "failed"):
+                for field in contradiction_fields:
+                    with self.subTest(current_shape=current_shape, outcome=outcome, field=field):
+                        with tempfile.TemporaryDirectory() as home, StateStore(
+                            self.root,
+                            home=Path(home),
+                        ) as store:
+                            run = store.create_run(
+                                objective=f"ordinary-{current_shape}-{outcome}-{field}",
+                                profile_digest="p",
+                                source_digest="s",
+                            )
+                            run = store.update_run(
+                                run.local_id,
+                                native_run_id="run_1",
+                                task_id="task_1",
+                                dispatch_id="dispatch_1",
+                                phase="waiting",
+                            )
+                            _record_fixture_binding(store, run.local_id)
+                            release = store.prepare_intention(
+                                run.local_id,
+                                "worker-release",
+                                ["orchestration", "worker-release", "--dispatch", "dispatch_1"],
+                            )
+                            store.mark_intention(
+                                release,
+                                "applied",
+                                request_id="request_release",
+                                response=mutation(
+                                    "request_release",
+                                    dispatchId="dispatch_1",
+                                    state="released",
+                                ),
+                            )
+                            responses = settlement_responses(outcome, current_shape=current_shape)
+                            latest = deepcopy(responses[3])
+                            assert isinstance(latest, dict)
+                            _contradict_release_semantics(
+                                latest,
+                                current_shape=current_shape,
+                                field=field,
+                            )
+                            client = FakeClient([responses[0], responses[1], latest])
+                            message = {
+                                **message_template,
+                                "payload": {
+                                    "taskId": "task_1",
+                                    "dispatchId": "dispatch_1",
+                                    "outcome": outcome,
+                                },
+                            }
+
+                            with self.assertRaises(OrchestrateError) as caught:
+                                _process_delivery(
+                                    client,  # type: ignore[arg-type]
+                                    store,
+                                    run,
+                                    "delivery_1",
+                                    [message],
+                                )
+
+                            self.assertEqual(caught.exception.code, "release_unconfirmed")
+                            persisted = store.get_run(run.local_id)
+                            self.assertEqual(persisted.phase, "waiting")
+                            self.assertIsNone(persisted.worker_outcome)
+                            self.assertFalse(any("worker-start" in call for call in client.calls))
+                            self.assertFalse(any("worker-release" in call for call in client.calls))
+                            self.assertFalse(any(call[:2] == ("terminal", "close") for call in client.calls))
+                            self.assertFalse(any("--ack" in call for call in client.calls))
+
+    def test_prompt_stall_release_pending_converges_with_exact_semantics_for_both_shapes(self) -> None:
+        worktree_id = f"repo::{self.root.resolve()}"
+        for current_shape in (False, True):
+            for recovery_mode in ("same_runtime", "restart"):
+                with self.subTest(current_shape=current_shape, recovery_mode=recovery_mode):
+                    with tempfile.TemporaryDirectory() as home, StateStore(
+                        self.root,
+                        home=Path(home),
+                    ) as store:
+                        run = store.create_run(
+                            objective=f"prompt-stall-{current_shape}-{recovery_mode}",
+                            profile_digest="p",
+                            source_digest="s",
+                        )
+                        run = store.update_run(
+                            run.local_id,
+                            native_run_id="run_1",
+                            task_id="task_1",
+                            dispatch_id="dispatch_1",
+                            phase="launch_cleanup_pending",
+                        )
+                        _record_fixture_binding(
+                            store,
+                            run.local_id,
+                            worktree_id=worktree_id,
+                        )
+                        release_response = mutation(
+                            "request_release_pending",
+                            dispatchId="dispatch_1",
+                            state="release_pending",
+                            processAction="none",
+                            recovery="Retry after endpoint recovery without another coordinator decision.",
+                        )
+                        responses: list[Response]
+                        if recovery_mode == "restart":
+                            release = store.prepare_intention(
+                                run.local_id,
+                                "worker-release",
+                                ["orchestration", "worker-release", "--dispatch", "dispatch_1"],
+                            )
+                            store.mark_intention(
+                                release,
+                                "applied",
+                                request_id="request_release_pending",
+                                response=release_response,
+                            )
+                            responses = [_released_prompt_stall_readback(self.root, current_shape=current_shape)]
+                        else:
+                            responses = [
+                                release_response,
+                                _released_prompt_stall_readback(self.root, current_shape=current_shape),
+                            ]
+                        client = FakeClient(responses)
+
+                        finished = _finish_prompt_stall_cleanup(
+                            client,  # type: ignore[arg-type]
+                            store,
+                            run,
+                        )
+
+                        self.assertEqual(finished.phase, "worker_failed")
+                        expected_release_calls = 0 if recovery_mode == "restart" else 1
+                        self.assertEqual(
+                            sum(call[:2] == ("orchestration", "worker-release") for call in client.calls),
+                            expected_release_calls,
+                        )
+                        self.assertFalse(any("worker-start" in call for call in client.calls))
+                        self.assertFalse(any(call[:2] == ("terminal", "close") for call in client.calls))
+
+    def test_prompt_stall_release_pending_rejects_each_semantic_contradiction_without_replay(self) -> None:
+        contradiction_fields = (
+            "dispatch_status",
+            "dispatch_last_failure",
+            "worker_state",
+            "worker_stage",
+            "worker_last_error",
+            "worker_terminal_handle",
+        )
+        worktree_id = f"repo::{self.root.resolve()}"
+        for current_shape in (False, True):
+            for recovery_mode in ("same_runtime", "restart"):
+                for field in contradiction_fields:
+                    with self.subTest(
+                        current_shape=current_shape,
+                        recovery_mode=recovery_mode,
+                        field=field,
+                    ):
+                        with tempfile.TemporaryDirectory() as home, StateStore(
+                            self.root,
+                            home=Path(home),
+                        ) as store:
+                            run = store.create_run(
+                                objective=f"prompt-stall-{current_shape}-{recovery_mode}-{field}",
+                                profile_digest="p",
+                                source_digest="s",
+                            )
+                            run = store.update_run(
+                                run.local_id,
+                                native_run_id="run_1",
+                                task_id="task_1",
+                                dispatch_id="dispatch_1",
+                                phase="launch_cleanup_pending",
+                            )
+                            _record_fixture_binding(
+                                store,
+                                run.local_id,
+                                worktree_id=worktree_id,
+                            )
+                            release_response = mutation(
+                                "request_release_pending",
+                                dispatchId="dispatch_1",
+                                state="release_pending",
+                                processAction="none",
+                                recovery="Retry after endpoint recovery without another coordinator decision.",
+                            )
+                            latest = _released_prompt_stall_readback(
+                                self.root,
+                                current_shape=current_shape,
+                            )
+                            _contradict_release_semantics(
+                                latest,
+                                current_shape=current_shape,
+                                field=field,
+                            )
+                            responses: list[Response]
+                            if recovery_mode == "restart":
+                                release = store.prepare_intention(
+                                    run.local_id,
+                                    "worker-release",
+                                    ["orchestration", "worker-release", "--dispatch", "dispatch_1"],
+                                )
+                                store.mark_intention(
+                                    release,
+                                    "applied",
+                                    request_id="request_release_pending",
+                                    response=release_response,
+                                )
+                                responses = [latest]
+                            else:
+                                responses = [release_response, latest]
+                            client = FakeClient(responses)
+
+                            with self.assertRaises(OrchestrateError) as caught:
+                                _finish_prompt_stall_cleanup(
+                                    client,  # type: ignore[arg-type]
+                                    store,
+                                    run,
+                                )
+
+                            self.assertEqual(caught.exception.code, "release_unconfirmed")
+                            persisted = store.get_run(run.local_id)
+                            self.assertEqual(persisted.phase, "launch_cleanup_pending")
+                            self.assertIsNone(persisted.worker_outcome)
+                            expected_release_calls = 0 if recovery_mode == "restart" else 1
+                            self.assertEqual(
+                                sum(
+                                    call[:2] == ("orchestration", "worker-release")
+                                    for call in client.calls
+                                ),
+                                expected_release_calls,
+                            )
+                            self.assertFalse(any("worker-start" in call for call in client.calls))
+                            self.assertFalse(any(call[:2] == ("terminal", "close") for call in client.calls))
+                            self.assertFalse(any("--ack" in call for call in client.calls))
 
     def test_question_delivery_remains_unacknowledged_then_answers_exactly(self) -> None:
         objective = "Ask when blocked"
@@ -1426,6 +1722,29 @@ class ControllerTests(unittest.TestCase):
                         reconcile_intentions(FakeClient([]), store, run)  # type: ignore[arg-type]
                     self.assertEqual(recovered.exception.code, "worker_start_exit_mismatch")
                     self.assertEqual(store.get_run(run.local_id).phase, "task_created")
+
+    def test_worker_start_client_seam_without_returncode_fails_closed(self) -> None:
+        objective = "Reject a worker-start response without process status"
+        response_without_returncode = dict(_worker_start(self.root))
+        client = FakeClient(
+            [
+                *completion_responses(self.root, objective)[:4],
+                response_without_returncode,
+            ],
+            default_returncode=None,
+        )
+
+        with self.assertRaises(OrchestrateError) as caught:
+            implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=1,
+                require_context=False,
+            )
+
+        self.assertEqual(caught.exception.code, "orca_contract_error")
+        self.assertFalse(any(call[:2] == ("orchestration", "worker-show") for call in client.calls))
 
     def test_prompt_stall_binds_failed_dispatch_and_releases_terminal_before_return(self) -> None:
         objective = "Contain a stalled prompt"
