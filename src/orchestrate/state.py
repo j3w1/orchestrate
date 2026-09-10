@@ -369,6 +369,29 @@ class StateStore(AbstractContextManager["StateStore"]):
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS interventions (
+                run_local_id TEXT NOT NULL REFERENCES runs(local_id),
+                task_key TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                correction_key TEXT NOT NULL,
+                evidence_digest TEXT NOT NULL,
+                correction_count INTEGER NOT NULL,
+                diagnosis_status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_local_id, task_key)
+            );
+            CREATE TABLE IF NOT EXISTS milestone_task_bindings (
+                run_local_id TEXT NOT NULL REFERENCES runs(local_id),
+                task_key TEXT NOT NULL,
+                task_id TEXT NOT NULL UNIQUE,
+                candidate_digest TEXT NOT NULL,
+                contract_digest TEXT NOT NULL,
+                spec TEXT NOT NULL,
+                dependencies_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (run_local_id, task_key)
+            );
             """
         )
         intention_columns = {

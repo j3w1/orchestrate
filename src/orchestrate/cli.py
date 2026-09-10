@@ -16,6 +16,7 @@ from .errors import OrchestrateError
 from .orca import OrcaClient, OrcaCommandError
 from .profile import setup_project
 from .state import StateStore
+from .wsl import WslInvocation, receive_on_windows, windows_unc_path
 
 
 def _project_argument(parser: argparse.ArgumentParser) -> None:
@@ -82,6 +83,9 @@ def build_parser() -> argparse.ArgumentParser:
     inner = subparsers.add_parser("_controller", help=argparse.SUPPRESS)
     inner.add_argument("--payload", required=True)
     inner.add_argument("--result-path")
+
+    wsl_forward = subparsers.add_parser("_wsl-forward", help=argparse.SUPPRESS)
+    wsl_forward.add_argument("--payload", required=True)
 
     doctor = subparsers.add_parser("doctor", help="check the public Orca CLI contract")
     doctor.add_argument("--json", action="store_true", help="emit one JSON document")
@@ -218,9 +222,49 @@ def _execute(args: argparse.Namespace, raw_argv: list[str]) -> tuple[dict[str, A
     raise AssertionError(f"unhandled command: {args.command}")
 
 
+def _forwarded_wsl_main(invocation: WslInvocation) -> int:
+    """Enter the canonical Windows CLI with explicit transported WSL context."""
+
+    if invocation.argv[0] in {"_wsl-forward", "_controller", "bootstrap"}:
+        raise OrchestrateError("WSL forwarding cannot invoke an internal controller command", code="wsl_context_invalid")
+    forwarded = list(invocation.argv)
+    if "--project" in forwarded:
+        index = forwarded.index("--project")
+        if index + 1 >= len(forwarded):
+            raise OrchestrateError("Forwarded --project omitted its path", code="wsl_context_invalid")
+        project = forwarded[index + 1]
+        if project.startswith("/"):
+            forwarded[index + 1] = windows_unc_path(invocation, project)
+    previous_cwd = Path.cwd()
+    previous_distro = os.environ.get("ORCHESTRATE_WSL_DISTRO")
+    previous_linux_cwd = os.environ.get("ORCHESTRATE_WSL_CWD")
+    try:
+        os.environ["ORCHESTRATE_WSL_DISTRO"] = invocation.distro
+        os.environ["ORCHESTRATE_WSL_CWD"] = invocation.linux_cwd
+        os.chdir(windows_unc_path(invocation))
+        return main(forwarded)
+    finally:
+        os.chdir(previous_cwd)
+        if previous_distro is None:
+            os.environ.pop("ORCHESTRATE_WSL_DISTRO", None)
+        else:
+            os.environ["ORCHESTRATE_WSL_DISTRO"] = previous_distro
+        if previous_linux_cwd is None:
+            os.environ.pop("ORCHESTRATE_WSL_CWD", None)
+        else:
+            os.environ["ORCHESTRATE_WSL_CWD"] = previous_linux_cwd
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw = list(argv) if argv is not None else list(os.sys.argv[1:])
     args = build_parser().parse_args(raw)
+    if args.command == "_wsl-forward":
+        try:
+            return receive_on_windows(args.payload, _forwarded_wsl_main)
+        except OrchestrateError as exc:
+            report = _error(exc)
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 1
     result_path: Path | None = None
     if args.command == "_controller":
         result_path = Path(args.result_path).resolve() if args.result_path else None

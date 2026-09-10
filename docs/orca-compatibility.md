@@ -70,7 +70,8 @@ Observed structured release readbacks establish owned-and-released and retained 
 | First-increment Python state machine | Corrected compatibility paths pass synthetic subprocess/native fixtures; candidate live rerun NOT_RUN by implementation worker |
 | Windows terminal exit receipt | Verified by parent-owned disposable probe |
 | WSL CLI bridge status | Read-only verified after official bridge registration |
-| WSL worker lifecycle and forwarding shim | NOT_RUN; later increment |
+| WSL launcher transport (distro/cwd/Unicode argv/exit/state-owner boundary) | Verified with local synthetic subprocess fixtures |
+| WSL worker lifecycle, placement, and live `release_unknown` recovery | NOT_RUN |
 | Hosted CI, provider behavior, independent candidate acceptance, release | NOT_RUN |
 
 ## Contained no-edit probe

@@ -1,6 +1,6 @@
-# First-increment contracts and recovery
+# Execution contracts and recovery
 
-This document describes the implemented single-worker increment. Orca remains authoritative for Runs, Tasks, Dispatches, workers, messages, and terminal ownership. The local database is an effects journal and evidence index, not a task scheduler.
+This document describes the implemented single-owner controller and the second-increment bounded coordination contracts. Orca remains authoritative for Runs, Tasks, Dispatches, dependencies, gates, workers, messages, and terminal ownership. The local database is an effects journal and evidence index, not a task scheduler.
 
 ## Project and source binding
 
@@ -62,14 +62,55 @@ The bounded `agent_prompt_stalled` recovery is stricter because Orca has already
 
 Source changes or incomplete selected candidate coverage before a genuinely new worker launch stop the state machine. Once launch may have occurred, recovery reconciles that exact intention and admission without rereading output into a fresh grant or issuing a duplicate launch. Omitted Run IDs are accepted only when selection is unambiguous.
 
+## Bounded native DAGs and review gates
+
+The second-increment coordination layer is a projection onto Orca-native Tasks, dependencies, ready views, Dispatches, and gates; it is not another task database. A `MilestonePlan` is bounded to twelve Tasks and a configured worker wave, requires one root Task that is both implementation and integration owner, and rejects additional Tasks unless each produces an independently useful output. Only that owner may write the shared contract. A specialist, verifier, or reviewer cannot be used as a second overlapping writer.
+
+The shared-contract value is canonical JSON with an immutable digest. While it is draft, only the serialized integration-owner Task can be created or selected; completing that Task without settling the contract yields no parallel ready wave. The snapshot must be explicitly settled before specialist/reviewer Task creation or parallel dispatch, and every Task spec is bound to the same contract and candidate digests. Task creation then proceeds in topological order. Dependency keys are serialized to exact native Task IDs with `task-create --deps`; one final `task-list` readback must retain Run, spec, dependency, and `ready`/`pending` gate state. `task-list --ready --brief` may select only bound Tasks and never more than the plan's worker limit. Integration, verification, and review remain separate gates; a worker success does not synthesize a verification result.
+
+Independent review evidence records both the candidate and shared-contract digest. Either changing invalidates the evidence categorically as `stale_review`; the caller must schedule a new review for the new candidate rather than relabel the old result. The default `implement` command remains single-owner-first. The coordination layer accepts an already-authorized bounded milestone plan; it does not invent decomposition from objective prose or add workers merely to occupy available slots.
+
+## Role roster and effective launches
+
+The role roster lives only in the host-local `orchestrate-user-config/v1` file. It has exactly `owner`, `specialist`, and `reviewer` slots. The reviewed defaults are Codex `gpt-5.6-sol` at high effort for owner/specialist and xhigh for the independent reviewer. A slot may instead name `claude` only with an explicit user-provided provider model ID; no provider lookup or availability guess occurs. Effort is optional for a configured provider ID and is never sent alone.
+
+```json
+{
+  "schema": "orchestrate-user-config/v1",
+  "roles": {
+    "owner": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+    "specialist": {"agent": "claude", "model": "user-configured-provider-id"},
+    "reviewer": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "xhigh"}
+  }
+}
+```
+
+Each worker start constructs arguments only from the selected role and then compares the complete requested selection with Orca's effective launch receipt. Missing effective capability is `worker_launch_unsupported`; substitution is `worker_launch_mismatch`. Neither configured nor requested values are execution evidence by themselves.
+
+## Session ownership and uncertain WSL release
+
+Every accepted settled worker gets exactly one next session action before acknowledgement. Immediate follow-up work may reuse the same proven agent terminal only by the exact captured handle and only for the same agent. Otherwise cleanup is `worker-release --dispatch <exact-id>`. Session readback binds Dispatch, Task, worktree, terminal handle, and immutable resource ID across the worker and terminal-resource shapes.
+
+`released` and `already_released` settle cleanup; explicit user retention remains distinct. `release_pending` and `release_unknown` are uncertainty, including the observed WSL shape. They must say `processAction=none` and carry a literal non-empty recovery description or argument array. orchestrate preserves that recovery action and records `repeat_release=false`: no terminal close, locally reconstructed command, path re-resolution, or unchanged release retry is authorized.
+
+## Intervention record
+
+A repeated correction is keyed to its Task and proposed correction. Its durable record contains the current obligation, concrete failing example, hypothesis, last meaningful evidence, and next discriminating check; an incomplete record is rejected. A first correction or a correction supported by a different evidence digest may proceed. The same correction against the same evidence consumes exactly one bounded diagnosis. If that diagnosis produces genuinely new evidence, one correction may proceed; otherwise the state becomes an unresolved decision and further identical correction or diagnosis requests remain held.
+
+## WSL forwarding boundary
+
+The `orchestrate-wsl` entry point is transport, not a Linux controller. It requires a real `WSL_DISTRO_NAME` and one host-local `ORCHESTRATE_WINDOWS_COMMAND_JSON` argument array, then encodes schema, distro, absolute Linux cwd, and argv as canonical UTF-8 JSON inside a bounded base64url token. It launches that exact Windows command without a shell, inherits standard streams, and returns the exact Windows exit code. Empty argv, NULs, relative/traversing cwd, malformed/oversized/non-canonical payloads, a non-WSL sender, or a non-Windows receiver fail closed.
+
+The Windows receiver reconstructs only the explicit `\\wsl.localhost\<distro>\...` path, marks the forwarded context, and enters the canonical Windows CLI. Therefore Windows `LOCALAPPDATA` remains the sole default state owner; the Linux launcher never imports or opens `StateStore`. Distro/cwd transport is not worker placement. Orca must still select and prove the WSL execution host and owns all worker commands, terminals, and release recovery. No live WSL lifecycle was exercised for this candidate.
+
 ## Ordinary-terminal bootstrap
 
 When invoked outside Orca, mutating commands create one focused ordinary Orca terminal in the exact project worktree. An existing caller is accepted only after exact `terminal show`, `worktree current`, `worker-list`, and `run-current` readback proves an ordinary terminal in the requested worktree with no active or context-only Dispatch; hook credentials alone do not indicate an agent. The inner Python process owns Run authority.
 
 The outer launcher uses the controller package's exact interpreter with isolated mode (`-I`) so a project `orchestrate.py`, `PYTHONPATH`, or user site cannot replace the helper. It durably journals its exact arguments and result path before terminal creation, then separately journals create, interrupt, exit, close, and report phases. Orca 1.4.198 terminal create/send/close responses do not expose a mutation request identity, so create uncertainty still holds and no uncertain mutation is repeated. An uncertain close may reconcile read-only only when the same runtime proves the exact handle exited with the stored exit code, the durable child result agrees, historical `terminal show` matches the stored handle/tab/incarnation/workspace/execution host and is disconnected/non-writable, and a complete exact-worktree inventory proves both terminal and tab absent. The create receipt must prove the local `win32` host platform; Orca 1.4.198 omits `hostPlatform` from historical `terminal show`, so that readback may omit the field but must echo the exact created platform if the field is present. Exit codes, inventory counts, and topology revisions used for that proof must be JSON integers; booleans are rejected even though Python otherwise treats them as integer-shaped values. Incomplete inventory, unknown layouts, runtime or identity drift, and missing child results hold. The failed close attempt remains historical evidence; reconciliation records a distinct observed-exited-and-absent disposition and never infers that close did not occur.
 
-The bootstrap refuses to run from a reasoning-agent terminal, so a dispatched worker cannot use it to route around Orca's dispatch-depth rules. WSL forwarding and a WSL-native worker lifecycle remain outside this first increment.
+The bootstrap refuses to run from a reasoning-agent terminal, so a dispatched worker cannot use it to route around Orca's dispatch-depth rules. The transport-only WSL forwarding boundary is separate from bootstrap; a WSL-native worker lifecycle remains a live gate.
 
 ## Verification boundaries
 
-The unit and incident suite uses disposable Git repositories and synthetic public-command responses. Windows and Linux CI build a wheel, install it into an isolated environment, and run command smoke checks. Live Orca, model/provider, WSL worker, hosted CI, independent review, external acceptance, merge, release, and publication remain separate evidence unless explicitly exercised.
+The unit and incident suite uses disposable Git repositories and synthetic public-command responses. Windows and Linux CI build a wheel, install it into an isolated environment, and run command smoke checks. Multi-worker native-DAG, release-uncertainty, role, intervention, and WSL transport contracts are synthetic/local until separately exercised. Live Orca multi-worker/WSL execution, model/provider behavior, hosted CI, independent review, external acceptance, merge, release, and publication remain separate evidence unless explicitly exercised.

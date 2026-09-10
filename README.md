@@ -2,9 +2,9 @@
 
 orchestrate gives governed software work a small, restartable controller without giving it a second scheduler.
 
-You describe one authorized objective. orchestrate reads the project entrypoints, binds the exact working candidate, prepares a compact packet, and asks Orca to run one implementation owner. Orca still owns the Run, Task, Dispatch, worker, terminal, and mailbox. Your project still owns its checks, review, acceptance, merge, and release.
+You describe one authorized objective. orchestrate reads the project entrypoints, binds the exact working candidate, prepares compact packets, and starts with one implementation owner. When a bounded milestone has genuinely independent follow-up work, its coordination layer creates Orca-native dependencies and gates instead of building a second scheduler. Orca still owns the Run, Tasks, Dispatches, workers, terminals, and mailbox. Your project still owns its checks, review, acceptance, merge, and release.
 
-The first increment is deliberately single-worker. It is enough to execute real work and survive a controller interruption, while keeping every larger claim honest.
+The default command path remains deliberately single-owner-first. The second increment adds the reusable native-DAG, role, session, intervention, and WSL forwarding boundaries needed for bounded specialist and review waves without turning parallelism into a default.
 
 ## Table of Contents
 
@@ -27,6 +27,10 @@ The project keeps one small tracked file and one host-local database.
 `.orchestrate.json` points at instructions, task sources, command manifests, optional selected `candidateSources`, and checks. The explicitly invoked initial `orchestrate setup` discovers conventional entrypoint names, runs nothing, and records that exact profile as a host-local operational selection outside the candidate. Committing a later profile edit does not select it and cannot grant itself new sources, checks, or reader behavior; the controller holds until the operator reviews the change and uses the explicit acknowledgment option. Before dispatch, the reader inventories bounded tracked, untracked, and ignored conventional instruction files and identifies the exact non-secret bytes it consulted, including relevant staged bytes, while Git status remains an opaque candidate identity. Any dirty path outside that selected coverage produces a hold instead of being opened speculatively. The packet sent to the worker carries those bindings rather than a vague description of HEAD. Project instructions and governance still decide whether the work itself is authorized and accepted.
 
 Every Orca orchestration mutation starts as a durable intention. Exact native request receipts, Task/Run readback, requested-versus-effective launch values, worker placement, and structured release state are checked before the local state advances. A dedicated host-local admission/effect fence orders managed worker-preflight evidence against reply, Delivery, retry, release, and acknowledgement intervals without blocking the first preflight behind the controller's broader Run lock. Every Delivery is journaled whole before its messages have effects. Current Orca lifecycle rows retain their raw JSON-string payloads in that journal, then undergo strict Run, Task, Dispatch, sender, and alias validation before any effect. Completion is accepted only for the exact Task and Dispatch, release is settled before acknowledgment, and missing request history stays uncertain.
+
+Bounded multi-worker plans have exactly one implementation/integration owner. A draft shared contract admits only that serialized owner wave; the snapshot must be settled and bound before specialist Tasks or parallel dispatch. Only the owner may write the contract. Specialist Tasks must be independently useful, verification and review stay dependent gates, and an accepted review becomes stale as soon as either the candidate or contract digest changes. Settled terminals have one explicit next action: immediate same-agent reuse by exact handle, or Orca-native release by exact Dispatch. `release_pending` and the observed WSL `release_unknown` shape preserve Orca's literal recovery action and prohibit an unchanged second release.
+
+The host-local role roster has owner, specialist, and independent-reviewer slots. Defaults remain Codex/Sol; an optional Claude slot must carry a user-supplied provider model ID. The tool never probes provider APIs or guesses that a configured model exists—each launch still has to prove that Orca's requested and effective values are identical.
 
 `worker-start` reporting `ready` at `input_accepted` proves accepted input, not a started model turn. If the managed preflight still has not appeared when foreground observation ends, orchestrate performs one exact read-only `worker-show`, records an unresolved compatibility diagnostic, and returns without resending the task text, pressing a UI key, launching a replacement, or claiming failure.
 
@@ -74,7 +78,14 @@ The package never edits `AGENTS.md`, user prompts, or another agent's configurat
 
 Unit, incident, wheel-build, and isolated-install checks run on Linux CI. The Orca CLI resolver uses `ORCA_CLI_COMMAND` in a managed forwarded session, `orca-dev` in a dev checkout, `orca-ide` on Linux outside Orca, and `orca` on packaged Windows.
 
-The canonical Windows controller and a real WSL-native worker lifecycle are not certified by this first increment. Do not turn Linux CI into a WSL/provider claim. The planned WSL launcher remains a later increment.
+`orchestrate-wsl` is a transport-only launcher. Configure its one machine-local pointer as a JSON argument array naming the reviewed Windows entry point, then pass ordinary CLI arguments:
+
+```bash
+export ORCHESTRATE_WINDOWS_COMMAND_JSON='["/mnt/c/path/to/windows/.venv/Scripts/orchestrate.exe"]'
+orchestrate-wsl status --json
+```
+
+It forwards the exact `WSL_DISTRO_NAME`, absolute Linux working directory, Unicode-safe argument array, inherited streams, and exit code to the Windows receiver. It creates no Linux state directory; the Windows process remains the only state owner. The payload does not choose a worker host, translate an Orca recovery command, or replace Orca placement and lifecycle. A real Windows-coordinated WSL worker lifecycle is still `NOT_RUN` for this candidate, so Linux unit or CI success is not a WSL/provider claim.
 
 ## The Basic Workflow
 
@@ -132,10 +143,17 @@ For a copyable disposable live exercise, use [Live first-increment exercise](doc
 - Host-local SQLite intentions, Deliveries, questions, evidence, controller locks, and a separate admission/effect fence.
 - A host-local operational-profile selection history that cannot live inside the project or a recognized synchronized root.
 - Deterministic Run creation, Task creation, one-worker launch, supervision, answer, release, acknowledgment, and resume.
+- A bounded native-DAG layer for one integration owner, settled shared contracts, independent specialists, dependent verification/review gates, and stale-review invalidation.
+- Host-local owner/specialist/reviewer launch choices with explicit Claude provider IDs and requested/effective receipt validation.
+- Exact-terminal reuse or Dispatch release decisions, including fail-closed `release_unknown` containment.
+- Durable intervention records and one bounded diagnosis before an unchanged correction can repeat without new evidence.
+- A state-free `orchestrate-wsl` argument/exit forwarding boundary to the canonical Windows installation.
 - Non-consuming `status`, model-free `explain`, and exact `packet` output.
 - A focused ordinary-terminal bootstrap with durable result, exit, and exact uncertain-close reconciliation receipts.
 - Passive compatibility diagnostics and a separately contained no-edit active probe.
 - Windows/Linux unit, incident, build, and install-smoke CI.
+
+Detailed role, dependency, review-invalidation, intervention, and uncertain-release shapes live in [Execution contracts and recovery](docs/contracts-and-recovery.md).
 
 There is no parallel task database, worktree manager, provider API, policy engine, automatic retry campaign, dashboard, PyPI release, or governance replacement.
 
@@ -155,7 +173,7 @@ There is no parallel task database, worktree manager, provider API, policy engin
 
 Read [AGENTS.md](AGENTS.md) and the [approved implementation plan](docs/implementation-plan.md) before changing code. The tracked plan remains until final project completion.
 
-Run the first-increment gates with Python 3.13:
+Run the repository gates with Python 3.13:
 
 ```powershell
 $env:PYTHONPATH = (Resolve-Path .\src).Path
