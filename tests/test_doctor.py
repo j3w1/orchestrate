@@ -303,6 +303,8 @@ class DoctorTests(unittest.TestCase):
             {
                 "ok": True,
                 "result": {
+                    "acknowledged": "delivery_probe",
+                    "deliveryId": None,
                     "messages": [],
                     "mutation": {"requestId": "request_ack", "replayed": False},
                 },
@@ -408,6 +410,99 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(persisted["delivery"]["result"]["deliveryId"], "delivery_probe")
         start = next(call for call in client.calls if "worker-start" in call)
         self.assertIn(f"path:{self.root.resolve()}", start)
+
+    def test_active_doctor_rejects_both_versioned_input_accepted_contradictions(self) -> None:
+        for current_shape in (False, True):
+            for field in (
+                "dispatch_last_failure",
+                "worker_last_error",
+                "resource_ownership",
+                "resource_release",
+            ):
+                with self.subTest(current_shape=current_shape, field=field):
+                    minted = self.mint_probe()
+                    receipt = json.loads(
+                        (Path(self.state_temp.name) / "probes" / f"{minted['probeToken']}.json").read_text()
+                    )
+                    responses = self.worker_responses(
+                        receipt["objective"],
+                        [self.done_message()],
+                        current_worker_shape=current_shape,
+                    )
+                    started_index = next(
+                        index
+                        for index, response in enumerate(responses)
+                        if isinstance(response.get("result"), dict)
+                        and isinstance(response["result"].get("terminalResource"), dict)
+                        and response["result"]["terminalResource"].get("releaseState") == "not_requested"
+                    )
+                    started = deepcopy(responses[started_index])
+                    responses[started_index] = started
+                    started_result = started["result"]
+                    if field == "dispatch_last_failure":
+                        started_result["dispatch"][  # type: ignore[index]
+                            "lastFailure" if current_shape else "last_failure"
+                        ] = "contradiction"
+                    elif field == "worker_last_error":
+                        started_result["worker"][  # type: ignore[index]
+                            "lastError" if current_shape else "last_error"
+                        ] = "contradiction"
+                    elif field == "resource_ownership":
+                        started_result["terminalResource"]["ownershipState"] = "user_owned"  # type: ignore[index]
+                    else:
+                        started_result["terminalResource"]["releaseState"] = "releasing"  # type: ignore[index]
+                    client = FakeClient(responses)
+
+                    with self.assertRaises(ProbeContractError):
+                        run_worker_probe(
+                            client,  # type: ignore[arg-type]
+                            minted["probeToken"],
+                            project=self.root,
+                            wait_timeout_ms=10,
+                        )
+
+                    self.assertEqual(sum("worker-start" in call for call in client.calls), 1)
+                    self.assertFalse(any("worker-release" in call for call in client.calls))
+                    self.assertFalse(any("--ack" in call for call in client.calls))
+
+    def test_active_doctor_requires_exact_delivery_acknowledgement(self) -> None:
+        cases: dict[str, object] = {
+            "missing": "missing",
+            "null": None,
+            "wrong": "delivery_other",
+            "conflicting": "conflicting",
+            "malformed": {"id": "delivery_probe"},
+        }
+        for label, acknowledged in cases.items():
+            with self.subTest(label=label):
+                minted = self.mint_probe()
+                receipt = json.loads(
+                    (Path(self.state_temp.name) / "probes" / f"{minted['probeToken']}.json").read_text()
+                )
+                responses = self.worker_responses(receipt["objective"], [self.done_message()])
+                ack = deepcopy(responses[-1])
+                responses[-1] = ack
+                result = ack["result"]
+                if label == "missing":
+                    result.pop("acknowledged")  # type: ignore[union-attr]
+                elif label == "conflicting":
+                    result["acknowledged"] = "delivery_probe"  # type: ignore[index]
+                    result["acknowledgedDeliveryId"] = "delivery_other"  # type: ignore[index]
+                else:
+                    result["acknowledged"] = acknowledged  # type: ignore[index]
+                client = FakeClient(responses)
+
+                with self.assertRaises(ProbeContractError) as caught:
+                    run_worker_probe(
+                        client,  # type: ignore[arg-type]
+                        minted["probeToken"],
+                        project=self.root,
+                        wait_timeout_ms=10,
+                    )
+
+                self.assertIn("ack", caught.exception.data["stage"].lower())  # type: ignore[index]
+                self.assertTrue(any("worker-release" in call for call in client.calls))
+                self.assertTrue(any("--ack" in call for call in client.calls))
 
     def test_nonempty_files_modified_releases_and_acks_but_blocks_pass(self) -> None:
         minted = self.mint_probe()

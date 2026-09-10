@@ -20,6 +20,10 @@ class LifecycleMessageShapeError(ValueError):
         self.category = category
 
 
+class DeliveryAcknowledgementShapeError(ValueError):
+    """An ack receipt does not positively identify the requested Delivery."""
+
+
 @dataclass(frozen=True, slots=True)
 class DispatchIdentity:
     version: str
@@ -44,6 +48,12 @@ class TerminalResourceIdentity:
     worktree_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class AcceptedWorkerReadback:
+    worker: WorkerIdentity
+    resource: TerminalResourceIdentity
+
+
 WorkerExecutionSemantics = Literal["succeeded", "failed", "prompt_stall"]
 
 
@@ -56,9 +66,28 @@ class WorkerExecutionShape:
     last_error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class WorkerInputAcceptedShape:
+    dispatch_status: str
+    last_failure: None
+    worker_state: str
+    worker_stage: str
+    last_error: None
+
+
 _CURRENT_LIFECYCLE_TYPES = frozenset({"heartbeat", "question", "escalation", "worker_done"})
 _MESSAGE_IDENTITY_ALIASES = frozenset({"runId", "deliveryContract", "fromHandle", "toHandle"})
 _PAYLOAD_IDENTITY_ALIASES = frozenset({"task_id", "dispatch_id", "runId", "run_id"})
+_ACKNOWLEDGEMENT_ALIASES = frozenset(
+    {
+        "acknowledgedDelivery",
+        "acknowledgedDeliveryId",
+        "acknowledgedId",
+        "acknowledged_delivery",
+        "acknowledged_delivery_id",
+        "acknowledged_id",
+    }
+)
 
 
 def _reject_json_constant(value: str) -> None:
@@ -178,6 +207,11 @@ _WORKER_EXECUTION_SHAPES: dict[str, dict[WorkerExecutionSemantics, WorkerExecuti
     },
 }
 
+_WORKER_INPUT_ACCEPTED_SHAPES = {
+    "1.4.198": WorkerInputAcceptedShape("dispatched", None, "ready", "input_accepted", None),
+    "1.4.199": WorkerInputAcceptedShape("dispatched", None, "ready", "input_accepted", None),
+}
+
 
 def worker_show_dispatch_identity(dispatch: Mapping[str, Any]) -> DispatchIdentity:
     """Read only the two version-matched Dispatch identity encodings."""
@@ -241,6 +275,98 @@ def worker_show_identity(
         terminal_handle=worker["agent_terminal_handle"],
         last_error=worker["last_error"],
     )
+
+
+def worker_input_accepted_readback(
+    dispatch: Mapping[str, Any],
+    worker: Mapping[str, Any],
+    resource: Mapping[str, Any],
+    *,
+    run_id: str,
+    task_id: str,
+    dispatch_id: str,
+    worktree_id: str,
+    terminal_handle: str,
+    resource_id: str | None = None,
+    require_owned_resource: bool = True,
+) -> AcceptedWorkerReadback:
+    """Validate one exact version-bound ready/input_accepted worker and resource."""
+
+    identity = worker_show_identity(dispatch, worker)
+    expected = _WORKER_INPUT_ACCEPTED_SHAPES[identity.dispatch.version]
+    if (
+        dispatch.get("id") != dispatch_id
+        or identity.dispatch.run_id != run_id
+        or identity.dispatch.task_id != task_id
+        or dispatch.get("status") != expected.dispatch_status
+        or identity.dispatch.last_failure is not expected.last_failure
+        or worker.get("state") != expected.worker_state
+        or worker.get("stage") != expected.worker_stage
+        or identity.dispatch_id != dispatch_id
+        or identity.worktree_id != worktree_id
+        or identity.terminal_handle != terminal_handle
+        or identity.last_error is not expected.last_error
+    ):
+        raise WorkerShowShapeError(
+            f"Orca {identity.dispatch.version} worker does not match exact input_accepted semantics"
+        )
+    resource_identity = worker_terminal_resource_identity(resource, dispatch_id=dispatch_id)
+    if (
+        resource_identity.worktree_id != worktree_id
+        or resource_identity.terminal_handle != terminal_handle
+        or (resource_id is not None and resource_identity.resource_id != resource_id)
+        or (
+            require_owned_resource
+            and (
+                resource.get("ownershipState") != "owned"
+                or resource.get("releaseState") != "not_requested"
+                or resource.get("retainedReason") is not None
+            )
+        )
+    ):
+        raise WorkerShowShapeError(
+            f"Orca {identity.dispatch.version} input_accepted terminal resource is contradictory"
+        )
+    return AcceptedWorkerReadback(worker=identity, resource=resource_identity)
+
+
+def exact_delivery_acknowledgement(
+    result: Mapping[str, Any],
+    *,
+    delivery_id: str,
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """Validate an ack identity while keeping any next FIFO Delivery distinct."""
+
+    aliases = sorted(_ACKNOWLEDGEMENT_ALIASES.intersection(result))
+    if aliases:
+        raise DeliveryAcknowledgementShapeError(
+            f"ack response used competing acknowledgement identities: {', '.join(aliases)}"
+        )
+    acknowledged = result.get("acknowledged")
+    if not isinstance(acknowledged, str) or not acknowledged:
+        raise DeliveryAcknowledgementShapeError(
+            "ack response omitted its non-empty acknowledged Delivery identity"
+        )
+    if acknowledged != delivery_id:
+        raise DeliveryAcknowledgementShapeError(
+            "ack response acknowledged a different Delivery"
+        )
+
+    next_delivery_id = result.get("deliveryId")
+    messages = result.get("messages")
+    if next_delivery_id is None and messages in (None, []):
+        return None, []
+    if (
+        not isinstance(next_delivery_id, str)
+        or not next_delivery_id
+        or next_delivery_id == acknowledged
+        or not isinstance(messages, list)
+        or not all(isinstance(message, dict) for message in messages)
+    ):
+        raise DeliveryAcknowledgementShapeError(
+            "ack response returned a malformed or conflicting next FIFO Delivery"
+        )
+    return next_delivery_id, messages
 
 
 def worker_execution_identity(

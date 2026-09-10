@@ -32,6 +32,8 @@ class PreflightClient:
         include_host_platform: bool = True,
         host_platform: object = "win32",
         execution_host_id: object = "local",
+        dispatch_last_failure: object = None,
+        worker_last_error: object = None,
     ) -> None:
         self.root = root
         self.packet = packet
@@ -39,6 +41,8 @@ class PreflightClient:
         self.include_host_platform = include_host_platform
         self.host_platform = host_platform
         self.execution_host_id = execution_host_id
+        self.dispatch_last_failure = dispatch_last_failure
+        self.worker_last_error = worker_last_error
         self.calls: list[tuple[str, ...]] = []
 
     @staticmethod
@@ -71,21 +75,40 @@ class PreflightClient:
                 },
             }
             if self.current_worker_shape:
-                dispatch.update(runId="run_1", taskId="task_1", task_id="task_1", lastFailure=None)
+                dispatch.update(
+                    runId="run_1",
+                    taskId="task_1",
+                    task_id="task_1",
+                    lastFailure=self.dispatch_last_failure,
+                )
                 worker.update(
                     dispatchId="dispatch_1", worktreeId=worktree_id,
-                    agentTerminalHandle="term_worker", lastError=None,
+                    agentTerminalHandle="term_worker", lastError=self.worker_last_error,
                 )
             else:
-                dispatch.update(run_id="run_1", task_id="task_1", last_failure=None)
+                dispatch.update(
+                    run_id="run_1",
+                    task_id="task_1",
+                    last_failure=self.dispatch_last_failure,
+                )
                 worker.update(
                     worktree_id=worktree_id,
                     agent_terminal_handle="term_worker",
-                    last_error=None,
+                    last_error=self.worker_last_error,
                 )
             return self._wrap({
                 "dispatch": dispatch,
                 "worker": worker,
+                "terminalResource": {
+                    "id": "terminal-resource-1",
+                    "ownershipState": "owned",
+                    "releaseState": "not_requested",
+                    "retainedReason": None,
+                    "originDispatchId": "dispatch_1",
+                    "ownerDispatchId": "dispatch_1",
+                    "terminalHandle": "term_worker",
+                    "worktreeId": worktree_id,
+                },
             })
         if arguments[:2] == ("orchestration", "task-list"):
             return self._wrap({"tasks": [{
@@ -125,6 +148,14 @@ class AdmissionTests(unittest.TestCase):
                 reader=reader,
             )
             store.save_packet(run.local_id, "task_1", canonical_packet_json(self.packet))
+            store.record_worker_resource_binding(
+                run.local_id,
+                dispatch_id="dispatch_1",
+                resource_id="terminal-resource-1",
+                terminal_handle="term_worker",
+                worktree_id=f"repo::{self.root.resolve()}",
+                readback={"fixture": "validated-start-readback"},
+            )
 
     def tearDown(self) -> None:
         self.environment.stop()
@@ -183,6 +214,57 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(native["controllerPlatform"], "win32")
         self.assertIsNone(native["terminalHostPlatform"])
         self.assertEqual(native["hostPlatformEvidence"], "native-controller-and-local-execution-host")
+
+    def _assert_ready_contradiction_rejected(
+        self,
+        *,
+        current_worker_shape: bool,
+        field: str,
+    ) -> None:
+        options = {field: "contradiction"}
+        client = PreflightClient(
+            self.root,
+            self.packet,
+            current_worker_shape=current_worker_shape,
+            **options,
+        )
+        with self.assertRaises(OrchestrateError) as rejected:
+            worker_preflight(
+                self.root,
+                run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                packet_id=str(self.packet["packetId"]),
+                client=client,  # type: ignore[arg-type]
+                environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                platform="win32",
+            )
+        self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(rejected.exception.data["cause"], "preflight_identity_conflict")  # type: ignore[index]
+
+    def test_orca_1_4_198_preflight_rejects_ready_dispatch_failure(self) -> None:
+        self._assert_ready_contradiction_rejected(
+            current_worker_shape=False,
+            field="dispatch_last_failure",
+        )
+
+    def test_orca_1_4_198_preflight_rejects_ready_worker_error(self) -> None:
+        self._assert_ready_contradiction_rejected(
+            current_worker_shape=False,
+            field="worker_last_error",
+        )
+
+    def test_orca_1_4_199_preflight_rejects_ready_dispatch_failure(self) -> None:
+        self._assert_ready_contradiction_rejected(
+            current_worker_shape=True,
+            field="dispatch_last_failure",
+        )
+
+    def test_orca_1_4_199_preflight_rejects_ready_worker_error(self) -> None:
+        self._assert_ready_contradiction_rejected(
+            current_worker_shape=True,
+            field="worker_last_error",
+        )
 
     def test_terminal_reported_non_windows_platform_is_rejected_precisely(self) -> None:
         client = PreflightClient(self.root, self.packet, host_platform="linux")
@@ -359,6 +441,14 @@ class AdmissionTests(unittest.TestCase):
                     reader=reader,
                 )
                 store.save_packet(run.local_id, "task_1", canonical_packet_json(packet))
+                store.record_worker_resource_binding(
+                    run.local_id,
+                    dispatch_id="dispatch_1",
+                    resource_id="terminal-resource-1",
+                    terminal_handle="term_worker",
+                    worktree_id=f"repo::{root.resolve()}",
+                    readback={"fixture": "validated-start-readback"},
+                )
 
             query_script.write_text("// changed clean query implementation\n", encoding="utf-8")
             git(root, "add", "scripts/quality/project-log.mjs")

@@ -13,7 +13,7 @@ from typing import Any
 
 from .errors import OrchestrateError
 from .orca import JsonObject, OrcaClient, OrcaCommandError
-from .orca_compat import WorkerShowShapeError, worker_show_identity
+from .orca_compat import WorkerShowShapeError, worker_input_accepted_readback
 from .packets import (
     PACKET_SCHEMA,
     PREFLIGHT_SCHEMA,
@@ -208,6 +208,9 @@ def _native_identity(
     dispatch_id: str,
     packet_json: str,
     packet: Mapping[str, Any],
+    resource_id: str,
+    resource_terminal_handle: str,
+    resource_worktree_id: str,
     environment: Mapping[str, str],
     platform: str,
 ) -> dict[str, Any]:
@@ -227,6 +230,7 @@ def _native_identity(
     worker_result = _result(worker_payload)
     dispatch = worker_result.get("dispatch")
     worker = worker_result.get("worker")
+    terminal_resource = worker_result.get("terminalResource")
     tasks = _result(tasks_payload).get("tasks")
     admission = packet.get("admission")
     launch = admission.get("launch") if isinstance(admission, Mapping) else None
@@ -293,6 +297,8 @@ def _native_identity(
         not isinstance(root, str)
         or Path(root).resolve() != profile.root.resolve()
         or not isinstance(worktree_id, str)
+        or handle != resource_terminal_handle
+        or worktree_id != resource_worktree_id
         or not isinstance(worktree, Mapping)
         or worktree.get("id") != worktree_id
         or not isinstance(worktree.get("path"), str)
@@ -301,23 +307,28 @@ def _native_identity(
         raise OrchestrateError("Worker preflight is in a different workspace", code="worker_workspace_mismatch")
     options = worker.get("startOptions") if isinstance(worker, Mapping) else None
     option_launch = options.get("launch") if isinstance(options, Mapping) else None
-    if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping):
+    if (
+        not isinstance(dispatch, Mapping)
+        or not isinstance(worker, Mapping)
+        or not isinstance(terminal_resource, Mapping)
+    ):
         raise OrchestrateError("worker-show omitted the preflight worker identity", code="preflight_identity_conflict")
     try:
-        worker_identity = worker_show_identity(dispatch, worker)
+        accepted = worker_input_accepted_readback(
+            dispatch,
+            worker,
+            terminal_resource,
+            run_id=str(run.native_run_id),
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+            worktree_id=resource_worktree_id,
+            terminal_handle=resource_terminal_handle,
+            resource_id=resource_id,
+        )
     except WorkerShowShapeError as exc:
         raise OrchestrateError(str(exc), code="preflight_identity_conflict") from exc
     if (
-        dispatch.get("id") != dispatch_id
-        or worker_identity.dispatch.run_id != run.native_run_id
-        or worker_identity.dispatch.task_id != task_id
-        or dispatch.get("status") != "dispatched"
-        or worker.get("state") != "ready"
-        or worker.get("stage") != "input_accepted"
-        or worker_identity.dispatch_id != dispatch_id
-        or worker_identity.worktree_id != worktree_id
-        or worker_identity.terminal_handle != handle
-        or not isinstance(options, Mapping)
+        not isinstance(options, Mapping)
         or options.get("resolvedWorktreeId") != worktree_id
         or options.get("agent") != launch.get("agent")
         or not isinstance(option_launch, Mapping)
@@ -339,6 +350,7 @@ def _native_identity(
         "runtimeId": next(iter(runtime_ids)),
         "actor": terminal.get("agentIdentity"),
         "terminalHandle": handle,
+        "terminalResourceId": accepted.resource.resource_id,
         "executionHostId": terminal.get("executionHostId"),
         "controllerPlatform": platform,
         "hostPlatform": terminal.get("hostPlatform"),
@@ -384,6 +396,12 @@ def worker_preflight(
             if packet.get("packetId") != packet_id:
                 raise OrchestrateError("Supplied packet ID does not match the immutable Task packet", code="packet_identity_conflict")
             _verify_packet_source_bytes(profile, packet)
+            binding = store.get_worker_resource_binding(run.local_id)
+            if binding is None or binding.dispatch_id != dispatch_id:
+                raise OrchestrateError(
+                    "Worker preflight omitted its immutable controller resource binding",
+                    code="preflight_identity_conflict",
+                )
             native = _native_identity(
                 client,
                 profile=profile,
@@ -392,6 +410,9 @@ def worker_preflight(
                 dispatch_id=dispatch_id,
                 packet_json=packet_json,
                 packet=packet,
+                resource_id=binding.resource_id,
+                resource_terminal_handle=binding.terminal_handle,
+                resource_worktree_id=binding.worktree_id,
                 environment=env,
                 platform=selected_platform,
             )
@@ -473,8 +494,13 @@ def joined_preflight_status(store: StateStore, run: RunRecord) -> str:
         return "conflicting"
     if observation is None:
         return "pending"
-    if observation.get("outcome") == "rejected":
+    if observation.get("schema") != PREFLIGHT_SCHEMA:
+        return "conflicting"
+    outcome = observation.get("outcome")
+    if outcome == "rejected":
         return "rejected"
+    if outcome != "passed":
+        return "conflicting"
     rows = store.connection.execute(
         """SELECT arguments_json, response_json FROM intentions
            WHERE run_local_id = ? AND operation = 'worker-start' AND status = 'applied'
@@ -522,6 +548,7 @@ def joined_preflight_status(store: StateStore, run: RunRecord) -> str:
         "candidate": packet.get("candidate"),
     }
     native = observation.get("native")
+    resource_binding = store.get_worker_resource_binding(run.local_id)
     expected_arguments = [
         "orchestration",
         "worker-start",
@@ -550,6 +577,11 @@ def joined_preflight_status(store: StateStore, run: RunRecord) -> str:
         or launch.get("requested") != expected_launch
         or launch.get("effective") != expected_launch
         or not isinstance(native, Mapping)
+        or resource_binding is None
+        or resource_binding.dispatch_id != run.dispatch_id
+        or native.get("terminalResourceId") != resource_binding.resource_id
+        or native.get("terminalHandle") != resource_binding.terminal_handle
+        or native.get("worktreeId") != resource_binding.worktree_id
         or native.get("runtimeId") != runtime_id
         or native.get("worktreeId") != worktrees[0].get("id")
         or native.get("terminalHandle") != terminals[0].get("id")

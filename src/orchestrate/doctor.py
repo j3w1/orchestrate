@@ -16,13 +16,15 @@ from .errors import OrchestrateError
 from .identity import require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError
 from .orca_compat import (
+    DeliveryAcknowledgementShapeError,
     LifecycleMessageShapeError,
     TerminalResourceIdentity,
     WorkerShowShapeError,
     current_lifecycle_message_payload,
+    exact_delivery_acknowledgement,
     worker_execution_identity,
+    worker_input_accepted_readback,
     worker_show_dispatch_identity,
-    worker_show_identity,
     worker_terminal_resource_identity,
 )
 from .state import make_private_state_directory, require_private_state_target, state_home
@@ -582,38 +584,33 @@ def _validate_started_worker(
     dispatch = result.get("dispatch")
     worker = result.get("worker")
     resource = result.get("terminalResource")
-    if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping):
+    if (
+        not isinstance(dispatch, Mapping)
+        or not isinstance(worker, Mapping)
+        or not isinstance(resource, Mapping)
+    ):
         raise ProbeContractError("Initial worker-show omitted the accepted worker identity")
     try:
-        identity = worker_show_identity(dispatch, worker)
+        accepted = worker_input_accepted_readback(
+            dispatch,
+            worker,
+            resource,
+            run_id=run_id,
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+            worktree_id=worktree_id,
+            terminal_handle=terminal_handle,
+        )
     except WorkerShowShapeError as exc:
         raise ProbeContractError(str(exc)) from exc
-    if (
-        dispatch.get("id") != dispatch_id
-        or identity.dispatch.run_id != run_id
-        or identity.dispatch.task_id != task_id
-        or dispatch.get("status") != "dispatched"
-        or identity.dispatch.last_failure is not None
-        or worker.get("state") != "ready"
-        or worker.get("stage") != "input_accepted"
-        or identity.dispatch_id != dispatch_id
-        or identity.worktree_id != worktree_id
-        or identity.terminal_handle != terminal_handle
-        or identity.last_error is not None
-    ):
-        raise ProbeContractError("Initial worker-show did not confirm the exact accepted worker")
-    if not isinstance(resource, Mapping):
-        raise ProbeContractError("Initial worker-show omitted the terminal resource")
+    return accepted.resource
+
+
+def _validate_delivery_ack(payload: Mapping[str, Any], *, delivery_id: str) -> None:
     try:
-        resource_identity = worker_terminal_resource_identity(resource, dispatch_id=dispatch_id)
-    except WorkerShowShapeError as exc:
+        exact_delivery_acknowledgement(_result_object(payload), delivery_id=delivery_id)
+    except DeliveryAcknowledgementShapeError as exc:
         raise ProbeContractError(str(exc)) from exc
-    if (
-        resource_identity.worktree_id != worktree_id
-        or resource_identity.terminal_handle != terminal_handle
-    ):
-        raise ProbeContractError("Initial worker-show terminal resource conflicts with the accepted worker")
-    return resource_identity
 
 
 def run_worker_probe(client: OrcaClient, probe_token: str, *, project: Path, wait_timeout_ms: int) -> JsonObject:
@@ -841,6 +838,11 @@ def run_worker_probe(client: OrcaClient, probe_token: str, *, project: Path, wai
         "--json",
     )
     _contract_step(receipts, "ackMutation", lambda: _mutation_request(ack))
+    _contract_step(
+        receipts,
+        "ackIdentity",
+        lambda: _validate_delivery_ack(ack, delivery_id=delivery_id),
+    )
     return {
         "schema": DOCTOR_SCHEMA,
         "status": "pass" if worker_outcome == "succeeded" and no_edit_problem is None else "blocked",

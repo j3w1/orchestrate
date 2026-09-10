@@ -16,11 +16,14 @@ from .errors import OrchestrateError
 from .identity import ControllerIdentity, require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError, orca_task_title
 from .orca_compat import (
+    DeliveryAcknowledgementShapeError,
     LifecycleMessageShapeError,
     TerminalResourceIdentity,
     WorkerShowShapeError,
     current_lifecycle_message_payload,
+    exact_delivery_acknowledgement,
     worker_execution_identity,
+    worker_input_accepted_readback,
     worker_show_dispatch_identity,
     worker_show_identity,
     worker_terminal_resource_identity,
@@ -38,6 +41,7 @@ PROMPT_STALL_ERROR = "agent_prompt_stalled"
 PROMPT_STALL_STAGE = "dispatch_input"
 PROMPT_STALL_CLEANUP_PHASE = "launch_cleanup_pending"
 INPUT_SUBMISSION_DIAGNOSTIC_SUBJECT = "worker input submission unproven"
+PREFLIGHT_HELD_PHASE = "preflight_held"
 
 
 def _result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -108,6 +112,64 @@ def _mutation_request_id(payload: Mapping[str, Any], *, expected: str | None = N
     return request_id
 
 
+def _delivery_ack_argument(arguments: list[object]) -> str:
+    if arguments.count("--ack") != 1:
+        raise OrchestrateError(
+            "Stored Delivery acknowledgement arguments are incomplete or conflicting",
+            code="delivery_ack_unconfirmed",
+        )
+    index = arguments.index("--ack")
+    if index + 1 >= len(arguments):
+        raise OrchestrateError(
+            "Stored Delivery acknowledgement omitted its Delivery identity",
+            code="delivery_ack_unconfirmed",
+        )
+    delivery_id = arguments[index + 1]
+    if not isinstance(delivery_id, str) or not delivery_id:
+        raise OrchestrateError(
+            "Stored Delivery acknowledgement identity is malformed",
+            code="delivery_ack_unconfirmed",
+        )
+    return delivery_id
+
+
+def _validate_operation_response(
+    operation: str,
+    arguments: list[object],
+    response: Mapping[str, Any],
+) -> None:
+    if operation != "delivery-ack":
+        return
+    delivery_id = _delivery_ack_argument(arguments)
+    try:
+        exact_delivery_acknowledgement(_result(response), delivery_id=delivery_id)
+    except DeliveryAcknowledgementShapeError as exc:
+        raise OrchestrateError(str(exc), code="delivery_ack_unconfirmed") from exc
+
+
+def _apply_delivery_ack_receipt(
+    store: StateStore,
+    run: RunRecord,
+    arguments: list[object],
+    response: Mapping[str, Any],
+) -> RunRecord:
+    delivery_id = _delivery_ack_argument(arguments)
+    try:
+        next_delivery_id, messages = exact_delivery_acknowledgement(
+            _result(response),
+            delivery_id=delivery_id,
+        )
+    except DeliveryAcknowledgementShapeError as exc:
+        raise OrchestrateError(str(exc), code="delivery_ack_unconfirmed") from exc
+    if next_delivery_id is not None:
+        store.journal_delivery(run.local_id, next_delivery_id, dict(response), messages)
+    store.mark_delivery_acked(run.local_id, delivery_id)
+    current = store.get_run(run.local_id)
+    if next_delivery_id is not None:
+        current = store.update_run(run.local_id, delivery_id=next_delivery_id)
+    return current
+
+
 def _mutation(
     client: OrcaClient,
     store: StateStore,
@@ -137,6 +199,7 @@ def _mutation(
         ) from exc
     try:
         request_id = _mutation_request_id(response)
+        _validate_operation_response(operation, list(arguments), response)
     except OrchestrateError as exc:
         store.mark_intention(
             intention_id,
@@ -145,7 +208,7 @@ def _mutation(
             error=response,
         )
         raise OrchestrateError(
-            f"Orca mutation {operation} succeeded without a recoverable native request receipt",
+            f"Orca mutation {operation} did not confirm its exact requested effect",
             code="mutation_outcome_uncertain",
             data={"operation": operation, "requestId": _request_id(response)},
         ) from exc
@@ -210,13 +273,13 @@ def _replay_applied_intentions(store: StateStore, run: RunRecord) -> RunRecord:
     current = run
     for row in rows:
         if row["response_json"]:
-            current = _apply_intention(store, current, row["operation"], json.loads(row["response_json"]))
             arguments = json.loads(row["arguments_json"])
-            if row["operation"] == "delivery-ack" and "--ack" in arguments:
-                delivery_id = arguments[arguments.index("--ack") + 1]
-                store.mark_delivery_acked(run.local_id, delivery_id)
-                if current.delivery_id == delivery_id:
-                    current = store.update_run(run.local_id, delivery_id=None)
+            response = json.loads(row["response_json"])
+            _validate_operation_response(row["operation"], arguments, response)
+            if row["operation"] == "delivery-ack":
+                current = _apply_delivery_ack_receipt(store, current, arguments, response)
+            else:
+                current = _apply_intention(store, current, row["operation"], response)
             if row["operation"] == "reply" and "--id" in arguments and "--body" in arguments:
                 message_id = arguments[arguments.index("--id") + 1]
                 body = arguments[arguments.index("--body") + 1]
@@ -477,6 +540,7 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                 ) from exc
             try:
                 replay_request_id = _mutation_request_id(replay)
+                _validate_operation_response(row["operation"], arguments, replay)
             except OrchestrateError as exc:
                 store.mark_intention(
                     row["id"],
@@ -485,7 +549,7 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                     error=replay,
                 )
                 raise OrchestrateError(
-                    "A prepared Orca mutation succeeded without a recoverable native request receipt",
+                    "A prepared Orca mutation did not confirm its exact requested effect",
                     code="mutation_outcome_uncertain",
                     data={"operation": row["operation"], "requestId": _request_id(replay)},
                 ) from exc
@@ -558,7 +622,21 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
             "--json",
             allow_worker_start_nonzero=row["operation"] == "worker-start",
         )
-        _mutation_request_id(replay, expected=request_id)
+        try:
+            _mutation_request_id(replay, expected=request_id)
+            _validate_operation_response(row["operation"], arguments, replay)
+        except OrchestrateError as exc:
+            store.mark_intention(
+                row["id"],
+                "uncertain",
+                request_id=_request_id(replay),
+                error=replay,
+            )
+            raise OrchestrateError(
+                "Recovered Orca mutation did not confirm its exact requested effect",
+                code="mutation_outcome_uncertain",
+                data={"operation": row["operation"], "requestId": _request_id(replay)},
+            ) from exc
         if row["operation"] == "worker-start":
             returncode = _response_returncode(replay)
             store.mark_intention(
@@ -579,7 +657,12 @@ def reconcile_intentions(client: OrcaClient, store: StateStore, run: RunRecord) 
                 request_id=request_id,
             )
         else:
-            store.mark_intention(row["id"], "applied", request_id=request_id, response=replay)
+            store.mark_intention(
+                row["id"],
+                "applied",
+                request_id=request_id,
+                response=replay,
+            )
             current = _apply_intention(store, current, row["operation"], replay)
     return _replay_applied_intentions(store, current)
 
@@ -601,6 +684,12 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
                     "limitations": observation.get("limitations", []),
                     "observedAt": observation.get("observedAt"),
                 }
+                if admission == "conflicting":
+                    admission_detail.update(
+                        status="conflicting",
+                        code="preflight_identity_conflict",
+                        message="The immutable preflight observation conflicts with its bound launch",
+                    )
     input_unproven = any(
         item["kind"] == "compatibility" and item["subject"] == INPUT_SUBMISSION_DIAGNOSTIC_SUBJECT
         for item in store.evidence(run.local_id)
@@ -609,10 +698,14 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
         next_obligation = f"answer question {pending[0]['message_id']}"
     elif run.phase == "worker_succeeded" and run.verification_status == "pending":
         next_obligation = "independent verification and project acceptance remain unresolved"
-    elif run.phase == "awaiting_preflight" and admission == "rejected":
+    elif admission in {"rejected", "conflicting"} and run.phase in {
+        "awaiting_preflight",
+        "waiting",
+        PREFLIGHT_HELD_PHASE,
+    }:
         next_obligation = (
-            "the immutable worker preflight was rejected; inspect admissionDetail and settle "
-            "this attempt without issuing a fresh editing grant"
+            "the immutable worker preflight is held; inspect admissionDetail and use a separately "
+            "authorized cleanup path to settle the exact bound attempt"
         )
     elif run.phase == "awaiting_preflight" and input_unproven:
         next_obligation = (
@@ -979,24 +1072,26 @@ def _validate_worker_start_readback(
     result = _result(payload)
     dispatch = result.get("dispatch")
     worker = result.get("worker")
-    if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping):
+    terminal_resource = result.get("terminalResource")
+    if (
+        not isinstance(dispatch, Mapping)
+        or not isinstance(worker, Mapping)
+        or not isinstance(terminal_resource, Mapping)
+    ):
         raise OrchestrateError("worker-show omitted the accepted worker identity", code="orca_contract_error")
     try:
-        identity = worker_show_identity(dispatch, worker)
+        accepted = worker_input_accepted_readback(
+            dispatch,
+            worker,
+            terminal_resource,
+            run_id=str(run.native_run_id),
+            task_id=str(run.task_id),
+            dispatch_id=dispatch_id,
+            worktree_id=worktree_id,
+            terminal_handle=terminal_id,
+        )
     except WorkerShowShapeError as exc:
         raise OrchestrateError(str(exc), code="orca_contract_error") from exc
-    if (
-        dispatch.get("id") != dispatch_id
-        or identity.dispatch.run_id != run.native_run_id
-        or identity.dispatch.task_id != run.task_id
-        or dispatch.get("status") != "dispatched"
-        or worker.get("state") != "ready"
-        or worker.get("stage") != "input_accepted"
-        or identity.dispatch_id != dispatch_id
-        or identity.worktree_id != worktree_id
-        or identity.terminal_handle != terminal_id
-    ):
-        raise OrchestrateError("worker-show did not confirm the exact accepted worker", code="orca_contract_error")
     options = worker.get("startOptions")
     expected_launch = {"agent": agent, "model": model, "effort": effort}
     if (
@@ -1017,25 +1112,7 @@ def _validate_worker_start_readback(
         worktree_id=worktree_id,
         terminal_id=terminal_id,
     )
-    terminal_resource = result.get("terminalResource")
-    if not isinstance(terminal_resource, Mapping):
-        raise OrchestrateError("worker-show omitted its terminal resource", code="orca_contract_error")
-    try:
-        resource_identity = worker_terminal_resource_identity(
-            terminal_resource,
-            dispatch_id=dispatch_id,
-        )
-    except WorkerShowShapeError as exc:
-        raise OrchestrateError(str(exc), code="orca_contract_error") from exc
-    if (
-        resource_identity.terminal_handle != terminal_id
-        or resource_identity.worktree_id != worktree_id
-    ):
-        raise OrchestrateError(
-            "worker-show terminal resource conflicts with the accepted worker",
-            code="orca_contract_error",
-        )
-    return resource_identity
+    return accepted.resource
 
 
 def _validate_prompt_stall_readback(
@@ -1231,6 +1308,13 @@ def _join_admission(store: StateStore, run: RunRecord) -> tuple[RunRecord, str]:
     status = joined_preflight_status(store, run)
     if status == "admitted" and run.phase == "awaiting_preflight":
         run = store.update_run(run.local_id, phase="waiting")
+    elif status in {"rejected", "conflicting"} and run.phase in {
+        "awaiting_preflight",
+        "waiting",
+        PREFLIGHT_HELD_PHASE,
+    }:
+        if run.phase != PREFLIGHT_HELD_PHASE:
+            run = store.update_run(run.local_id, phase=PREFLIGHT_HELD_PHASE)
     return run, status
 
 
@@ -1284,10 +1368,16 @@ def _record_input_submission_diagnostic(
         resource = result.get("terminalResource")
         if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping) or not isinstance(resource, Mapping):
             return persist("conflicting", {"status": "malformed"})
-        identity = worker_show_identity(dispatch, worker)
-        resource_identity = worker_terminal_resource_identity(
+        accepted = worker_input_accepted_readback(
+            dispatch,
+            worker,
             resource,
+            run_id=str(run.native_run_id),
+            task_id=str(run.task_id),
             dispatch_id=str(run.dispatch_id),
+            worktree_id=binding.worktree_id,
+            terminal_handle=binding.terminal_handle,
+            resource_id=binding.resource_id,
         )
     except OrcaCommandError as exc:
         return persist("unavailable", {"status": "unavailable", "code": exc.code})
@@ -1296,20 +1386,8 @@ def _record_input_submission_diagnostic(
     except WorkerShowShapeError:
         return persist("conflicting", {"status": "unsupported-identity-shape"})
     if (
-        dispatch.get("id") != run.dispatch_id
-        or identity.dispatch.run_id != run.native_run_id
-        or identity.dispatch.task_id != run.task_id
-        or identity.dispatch_id != run.dispatch_id
-        or identity.worktree_id != binding.worktree_id
-        or identity.terminal_handle != binding.terminal_handle
-        or resource_identity.resource_id != binding.resource_id
-        or resource_identity.terminal_handle != binding.terminal_handle
-        or resource_identity.worktree_id != binding.worktree_id
-        or resource.get("ownershipState") != "owned"
-        or resource.get("releaseState") != "not_requested"
-        or dispatch.get("status") != "dispatched"
-        or worker.get("state") != "ready"
-        or worker.get("stage") != "input_accepted"
+        accepted.worker.dispatch_id != run.dispatch_id
+        or accepted.resource.resource_id != binding.resource_id
     ):
         return persist("conflicting", {"status": "identity-or-state-mismatch"})
     observation = result.get("observation")
@@ -1649,6 +1727,9 @@ def _require_delivery_journal(
 def _process_delivery(client: OrcaClient, store: StateStore, run: RunRecord, delivery_id: str, messages: list[dict[str, Any]]) -> RunRecord:
     _require_delivery_journal(store, run, delivery_id, messages)
     current = store.update_run(run.local_id, delivery_id=delivery_id)
+    current, _ = _join_admission(store, current)
+    if current.phase == PREFLIGHT_HELD_PHASE:
+        return current
     if sum(message.get("type") == "worker_done" for message in messages) > 1:
         raise OrchestrateError("Delivery contains more than one worker_done", code="delivery_unsupported")
     existing = {row["message_id"]: row["effect_status"] for row in store.messages(run.local_id, delivery_id)}
@@ -1724,21 +1805,22 @@ def _ack_if_resolved(client: OrcaClient, store: StateStore, run: RunRecord) -> b
     rows = store.messages(run.local_id, run.delivery_id)
     if not rows or any(row["effect_status"] not in {"processed", "answered"} for row in rows):
         return False
-    _mutation(
+    arguments = [
+        "orchestration",
+        "check",
+        "--run",
+        str(run.native_run_id),
+        "--ack",
+        run.delivery_id,
+    ]
+    response = _mutation(
         client,
         store,
         run,
         "delivery-ack",
-        [
-            "orchestration",
-            "check",
-            "--run",
-            str(run.native_run_id),
-            "--ack",
-            run.delivery_id,
-        ],
+        arguments,
     )
-    store.mark_delivery_acked(run.local_id, run.delivery_id)
+    _apply_delivery_ack_receipt(store, run, arguments, response)
     return True
 
 
@@ -1794,6 +1876,8 @@ def _bind_native_run(
 def _supervise(client: OrcaClient, store: StateStore, run: RunRecord, *, wait_timeout_ms: int) -> JsonObject:
     deadline = time.monotonic() + (wait_timeout_ms / 1000)
     current, _ = _join_admission(store, run)
+    if current.phase == PREFLIGHT_HELD_PHASE:
+        return _run_summary(store, current)
     while current.phase in {"awaiting_preflight", "waiting"}:
         remaining = max(1, int((deadline - time.monotonic()) * 1000))
         if remaining <= 1:
@@ -1815,6 +1899,8 @@ def _supervise(client: OrcaClient, store: StateStore, run: RunRecord, *, wait_ti
         delivery_id, messages = _delivery(payload)
         if not delivery_id:
             current, admission = _join_admission(store, current)
+            if current.phase == PREFLIGHT_HELD_PHASE:
+                break
             if (
                 current.phase == "awaiting_preflight"
                 and admission == "pending"
@@ -1824,7 +1910,10 @@ def _supervise(client: OrcaClient, store: StateStore, run: RunRecord, *, wait_ti
                 break
             continue
         store.journal_delivery(current.local_id, delivery_id, payload, messages)
+        current = store.update_run(current.local_id, delivery_id=delivery_id)
         current, _ = _join_admission(store, current)
+        if current.phase == PREFLIGHT_HELD_PHASE:
+            break
         current = _process_delivery(client, store, current, delivery_id, messages)
         if store.pending_questions(current.local_id) or current.phase == "blocked":
             break
@@ -1850,23 +1939,28 @@ def implement(
             wait_timeout_ms=wait_timeout_ms,
             require_context=require_context,
         )
-    _require_profile_selection(profile)
-    identity = require_plain_controller(client, profile.root) if require_context else None
     with StateStore(profile.root) as store:
         normalized = objective.strip()
         if not normalized:
             raise OrchestrateError("Objective must not be empty", code="objective_empty")
         if len(normalized) > 8000:
             raise OrchestrateError("Objective exceeds the bounded 8000-character limit", code="objective_too_large")
-        reader = read_project(profile, normalized)
-        sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
-        _require_candidate_coverage(sources)
         with store.lock("project-create"):
-            if store.active_runs():
+            active = store.active_runs()
+            for existing in active:
+                held, _ = _join_admission(store, existing)
+                if held.phase == PREFLIGHT_HELD_PHASE:
+                    return _run_summary(store, held)
+            if active:
                 raise OrchestrateError(
                     "An active local Run already exists; resume it before starting another objective",
                     code="active_run_exists",
                 )
+            _require_profile_selection(profile)
+            identity = require_plain_controller(client, profile.root) if require_context else None
+            reader = read_project(profile, normalized)
+            sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+            _require_candidate_coverage(sources)
             run = store.create_run(objective=normalized, profile_digest=profile.digest, source_digest=sources.digest)
             with store.lock(run.local_id):
                 run = _create_native_run(client, store, run)
@@ -1894,17 +1988,20 @@ def resume(
     profile = ProjectProfile.load(root)
     with StateStore(profile.root) as store:
         run = store.select_run(run_id)
-        identity = (
-            require_plain_controller(
-                client,
-                profile.root,
-                expected_run_id=run.native_run_id,
-                allow_expected_unbound=True,
-            )
-            if require_context and run.native_run_id
-            else (require_plain_controller(client, profile.root) if require_context else None)
-        )
         with store.lock(run.local_id):
+            run, _ = _join_admission(store, run)
+            if run.phase == PREFLIGHT_HELD_PHASE:
+                return _run_summary(store, run)
+            identity = (
+                require_plain_controller(
+                    client,
+                    profile.root,
+                    expected_run_id=run.native_run_id,
+                    allow_expected_unbound=True,
+                )
+                if require_context and run.native_run_id
+                else (require_plain_controller(client, profile.root) if require_context else None)
+            )
             prepared_start = any(
                 row["operation"] == "worker-start" and row["status"] == "prepared"
                 for row in store.unsettled_intentions(run.local_id)
@@ -1913,6 +2010,9 @@ def resume(
                 _require_profile_selection(profile)
                 validate_packet_sources(profile, run, _ensure_packet(store, run, profile))
             run = reconcile_intentions(client, store, run)
+            run, _ = _join_admission(store, run)
+            if run.phase == PREFLIGHT_HELD_PHASE:
+                return _run_summary(store, run)
             run = _bind_native_run(client, store, run, identity)
             run = _finish_prompt_stall_cleanup(client, store, run)
             if run.phase in {"preparing", "run_created", "task_created"}:

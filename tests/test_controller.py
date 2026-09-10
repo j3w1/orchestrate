@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from orchestrate.controller import (
+    _ack_if_resolved,
     _finish_prompt_stall_cleanup,
     _mutation,
     _process_delivery,
@@ -20,6 +21,7 @@ from orchestrate.controller import (
     _release_disposition,
     _request_id,
     _run_summary,
+    _validate_worker_start_readback,
     answer,
     implement,
     reconcile_intentions,
@@ -66,6 +68,21 @@ def mutation(request_id: str, **result: object) -> dict[str, object]:
             "mutation": {"requestId": request_id, "replayed": False},
         }
     }
+
+
+def acknowledgement(
+    delivery_id: str,
+    *,
+    request_id: str = "request_ack",
+    **result: object,
+) -> dict[str, object]:
+    values: dict[str, object] = {
+        "acknowledged": delivery_id,
+        "deliveryId": None,
+        "messages": [],
+    }
+    values.update(result)
+    return mutation(request_id, **values)
 
 
 def lifecycle_message(
@@ -174,40 +191,66 @@ def _worker_start(root: Path) -> OrcaJsonResponse:
     return OrcaJsonResponse(response, returncode=0)
 
 
-def _worker_start_readback(root: Path) -> dict[str, object]:
+def _worker_start_readback(
+    root: Path,
+    *,
+    current_shape: bool = False,
+    dispatch_last_failure: object = None,
+    worker_last_error: object = None,
+) -> dict[str, object]:
     worktree_id = f"repo::{root.resolve()}"
     launch = {
         "requested": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
         "effective": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
     }
     terminal_effect = {"kind": "terminal", "role": "agent", "action": "created", "id": "term_worker"}
+    dispatch: dict[str, object] = {
+        "id": "dispatch_1",
+        "status": "dispatched",
+    }
+    worker: dict[str, object] = {
+        "state": "ready",
+        "stage": "input_accepted",
+        "effects": [],
+        "residualResources": [terminal_effect],
+        "startOptions": {
+            "worktree": f"path:{root.resolve()}",
+            "resolvedWorktreeId": worktree_id,
+            "terminal": None,
+            "agent": "codex",
+            "launch": launch,
+            "setup": "not_applicable",
+            "setupSource": "existing_worktree",
+        },
+    }
+    if current_shape:
+        dispatch.update(
+            runId="run_1",
+            taskId="task_1",
+            task_id="task_1",
+            lastFailure=dispatch_last_failure,
+        )
+        worker.update(
+            dispatchId="dispatch_1",
+            worktreeId=worktree_id,
+            agentTerminalHandle="term_worker",
+            lastError=worker_last_error,
+        )
+    else:
+        dispatch.update(
+            run_id="run_1",
+            task_id="task_1",
+            last_failure=dispatch_last_failure,
+        )
+        worker.update(
+            worktree_id=worktree_id,
+            agent_terminal_handle="term_worker",
+            last_error=worker_last_error,
+        )
     return {
         "result": {
-            "dispatch": {
-                "id": "dispatch_1",
-                "run_id": "run_1",
-                "task_id": "task_1",
-                "last_failure": None,
-                "status": "dispatched",
-            },
-            "worker": {
-                "state": "ready",
-                "stage": "input_accepted",
-                "worktree_id": worktree_id,
-                "agent_terminal_handle": "term_worker",
-                "last_error": None,
-                "effects": [],
-                "residualResources": [terminal_effect],
-                "startOptions": {
-                    "worktree": f"path:{root.resolve()}",
-                    "resolvedWorktreeId": worktree_id,
-                    "terminal": None,
-                    "agent": "codex",
-                    "launch": launch,
-                    "setup": "not_applicable",
-                    "setupSource": "existing_worktree",
-                },
-            },
+            "dispatch": dispatch,
+            "worker": worker,
             "terminalResource": {
                 "id": "terminal-resource-1",
                 "ownershipState": "owned",
@@ -562,6 +605,7 @@ def _worker_start_with_preflight(root: Path) -> Response:
                     "runtimeId": "runtime_test",
                     "actor": launch["agent"],
                     "terminalHandle": "term_worker",
+                    "terminalResourceId": "terminal-resource-1",
                     "executionHostId": "local",
                     "hostPlatform": "win32",
                     "worktreeId": f"repo::{root.resolve()}",
@@ -679,7 +723,7 @@ def completion_responses(root: Path, objective: str, outcome: str = "succeeded")
         _worker_start_readback(root),
         delivery,
         *settlement_responses(outcome, worktree_id=f"repo::{root.resolve()}"),
-        mutation("request_ack", messages=[]),
+        acknowledgement("delivery_1"),
     ]
 
 
@@ -1413,7 +1457,7 @@ class ControllerTests(unittest.TestCase):
                 {"result": {"run": {"id": "run_1"}}},
                 {"result": {"run": {"id": "run_1", "objective": objective}}},
                 mutation("request_reply", message={"id": "reply_1"}),
-                mutation("request_ack", messages=[]),
+                acknowledgement("delivery_q"),
             ]
         )
         answered = answer(
@@ -1703,6 +1747,69 @@ class ControllerTests(unittest.TestCase):
                 1,
             )
 
+    def test_controller_rejects_both_versioned_input_accepted_failure_fields(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective="validate accepted worker", profile_digest="p", source_digest="s")
+            run = store.update_run(
+                run.local_id,
+                native_run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                phase="awaiting_preflight",
+            )
+            for current_shape in (False, True):
+                for field in ("dispatch_last_failure", "worker_last_error"):
+                    with self.subTest(current_shape=current_shape, field=field):
+                        arguments: dict[str, object] = {field: "contradiction"}
+                        payload = _worker_start_readback(
+                            self.root,
+                            current_shape=current_shape,
+                            **arguments,
+                        )
+                        with self.assertRaises(OrchestrateError) as caught:
+                            _validate_worker_start_readback(
+                                payload,
+                                run=run,
+                                dispatch_id="dispatch_1",
+                                worktree_id=f"repo::{self.root.resolve()}",
+                                worktree_selector=f"path:{self.root.resolve()}",
+                                terminal_id="term_worker",
+                                agent="codex",
+                                model="gpt-5.6-sol",
+                                effort="high",
+                            )
+                        self.assertEqual(caught.exception.code, "orca_contract_error")
+
+    def test_bounded_submission_diagnostic_rejects_contradictory_ready_identity(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective="diagnose contradiction", profile_digest="p", source_digest="s")
+            run = store.update_run(
+                run.local_id,
+                native_run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                phase="awaiting_preflight",
+            )
+            _record_fixture_binding(
+                store,
+                run.local_id,
+                worktree_id=f"repo::{self.root.resolve()}",
+            )
+            payload = _worker_start_readback(
+                self.root,
+                current_shape=True,
+                worker_last_error="contradiction",
+            )
+            client = FakeClient([payload])
+
+            self.assertTrue(_record_input_submission_diagnostic(client, store, run))  # type: ignore[arg-type]
+
+            evidence = store.evidence(run.local_id)
+            self.assertEqual(evidence[-1]["status"], "conflicting")
+            self.assertEqual(evidence[-1]["payload"]["workerReadback"]["status"], "unsupported-identity-shape")
+            self.assertEqual(len(client.calls), 1)
+            self.assertFalse(any(call[:2] == ("terminal", "send") for call in client.calls))
+
     def test_run_summary_surfaces_precise_rejected_preflight_mismatch(self) -> None:
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
             run = store.create_run(objective="show rejection", profile_digest="p", source_digest="s")
@@ -1733,11 +1840,343 @@ class ControllerTests(unittest.TestCase):
             report = _run_summary(store, run)
 
         self.assertEqual(report["admission"], "rejected")
-        self.assertIn("immutable worker preflight was rejected", report["nextObligation"])
+        self.assertIn("immutable worker preflight is held", report["nextObligation"])
         self.assertEqual(
             report["admissionDetail"]["mismatches"][0]["code"],
             "preflight_identity_conflict",
         )
+
+    def _seed_ackable_delivery(
+        self,
+        store: StateStore,
+        *,
+        delivery_id: str,
+        objective: str,
+    ) -> object:
+        run = store.create_run(objective=objective, profile_digest="p", source_digest="s")
+        run = store.update_run(
+            run.local_id,
+            native_run_id=f"run_{delivery_id}",
+            phase="waiting",
+            delivery_id=delivery_id,
+        )
+        message = {"id": f"message_{delivery_id}", "type": "heartbeat"}
+        payload = {"result": {"deliveryId": delivery_id, "messages": [message]}}
+        store.journal_delivery(run.local_id, delivery_id, payload, [message])
+        store.mark_message(run.local_id, delivery_id, str(message["id"]), "processed")
+        return store.get_run(run.local_id)
+
+    def test_delivery_ack_rejects_missing_null_wrong_conflicting_and_malformed_identity(self) -> None:
+        cases = {
+            "missing": mutation("request_ack", deliveryId=None, messages=[]),
+            "null": mutation("request_ack", acknowledged=None, deliveryId=None, messages=[]),
+            "wrong": mutation("request_ack", acknowledged="delivery_other", deliveryId=None, messages=[]),
+            "conflicting": mutation(
+                "request_ack",
+                acknowledged="delivery_conflicting",
+                acknowledgedDeliveryId="delivery_other",
+                deliveryId=None,
+                messages=[],
+            ),
+            "malformed": mutation("request_ack", acknowledged={"id": "delivery_malformed"}, messages=[]),
+        }
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            for label, response in cases.items():
+                with self.subTest(label=label):
+                    delivery_id = f"delivery_{label}"
+                    run = self._seed_ackable_delivery(
+                        store,
+                        delivery_id=delivery_id,
+                        objective=f"reject {label} acknowledgement",
+                    )
+                    with self.assertRaises(OrchestrateError) as caught:
+                        _ack_if_resolved(FakeClient([response]), store, run)  # type: ignore[arg-type]
+                    self.assertEqual(caught.exception.code, "mutation_outcome_uncertain")
+                    persisted = store.get_run(run.local_id)
+                    self.assertEqual(persisted.delivery_id, delivery_id)
+                    delivery = store.connection.execute(
+                        "SELECT acked FROM deliveries WHERE run_local_id = ? AND delivery_id = ?",
+                        (run.local_id, delivery_id),
+                    ).fetchone()
+                    self.assertEqual(delivery["acked"], 0)
+                    intention = store.connection.execute(
+                        "SELECT status FROM intentions WHERE run_local_id = ? AND operation = 'delivery-ack'",
+                        (run.local_id,),
+                    ).fetchone()
+                    self.assertEqual(intention["status"], "uncertain")
+
+    def test_applied_ack_receipt_replays_after_crash_before_local_commit(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = self._seed_ackable_delivery(
+                store,
+                delivery_id="delivery_crash",
+                objective="recover exact acknowledgement receipt",
+            )
+            arguments = [
+                "orchestration",
+                "check",
+                "--run",
+                str(run.native_run_id),
+                "--ack",
+                "delivery_crash",
+            ]
+            intention = store.prepare_intention(run.local_id, "delivery-ack", arguments)
+            store.mark_intention(
+                intention,
+                "applied",
+                request_id="request_ack",
+                returncode=0,
+                response=acknowledgement("delivery_crash"),
+            )
+
+            recovered = reconcile_intentions(FakeClient([]), store, run)  # type: ignore[arg-type]
+
+            self.assertIsNone(recovered.delivery_id)
+            delivery = store.connection.execute(
+                "SELECT acked FROM deliveries WHERE run_local_id = ? AND delivery_id = 'delivery_crash'",
+                (run.local_id,),
+            ).fetchone()
+            self.assertEqual(delivery["acked"], 1)
+
+    def test_applied_ack_without_exact_identity_is_never_inferred_from_argv(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = self._seed_ackable_delivery(
+                store,
+                delivery_id="delivery_legacy",
+                objective="reject argument-only acknowledgement",
+            )
+            intention = store.prepare_intention(
+                run.local_id,
+                "delivery-ack",
+                ["orchestration", "check", "--run", str(run.native_run_id), "--ack", "delivery_legacy"],
+            )
+            store.mark_intention(
+                intention,
+                "applied",
+                request_id="request_ack",
+                returncode=0,
+                response=mutation("request_ack", messages=[]),
+            )
+
+            with self.assertRaises(OrchestrateError) as caught:
+                reconcile_intentions(FakeClient([]), store, run)  # type: ignore[arg-type]
+
+            self.assertEqual(caught.exception.code, "delivery_ack_unconfirmed")
+            self.assertEqual(store.get_run(run.local_id).delivery_id, "delivery_legacy")
+
+    def test_uncertain_ack_exact_retry_requires_same_acknowledged_delivery(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = self._seed_ackable_delivery(
+                store,
+                delivery_id="delivery_retry",
+                objective="retry exact acknowledgement",
+            )
+            intention = store.prepare_intention(
+                run.local_id,
+                "delivery-ack",
+                ["orchestration", "check", "--run", str(run.native_run_id), "--ack", "delivery_retry"],
+            )
+            store.mark_intention(intention, "uncertain", request_id="request_ack")
+            client = FakeClient(
+                [
+                    request_show("request_ack", method="orchestration.check"),
+                    acknowledgement("delivery_retry"),
+                ]
+            )
+
+            recovered = reconcile_intentions(client, store, run)  # type: ignore[arg-type]
+
+            self.assertIsNone(recovered.delivery_id)
+            retry = client.calls[-1]
+            self.assertEqual(retry[retry.index("--retry-request") + 1], "request_ack")
+
+    def test_uncertain_ack_retry_with_wrong_acknowledged_delivery_remains_uncommitted(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = self._seed_ackable_delivery(
+                store,
+                delivery_id="delivery_retry_wrong",
+                objective="reject wrong recovered acknowledgement",
+            )
+            intention = store.prepare_intention(
+                run.local_id,
+                "delivery-ack",
+                [
+                    "orchestration",
+                    "check",
+                    "--run",
+                    str(run.native_run_id),
+                    "--ack",
+                    "delivery_retry_wrong",
+                ],
+            )
+            store.mark_intention(intention, "uncertain", request_id="request_ack")
+            client = FakeClient(
+                [
+                    request_show("request_ack", method="orchestration.check"),
+                    acknowledgement("delivery_other"),
+                ]
+            )
+
+            with self.assertRaises(OrchestrateError) as caught:
+                reconcile_intentions(client, store, run)  # type: ignore[arg-type]
+
+            self.assertEqual(caught.exception.code, "mutation_outcome_uncertain")
+            self.assertEqual(store.get_run(run.local_id).delivery_id, "delivery_retry_wrong")
+            row = store.connection.execute(
+                "SELECT status FROM intentions WHERE id = ?",
+                (intention,),
+            ).fetchone()
+            self.assertEqual(row["status"], "uncertain")
+
+    def test_ack_response_journals_a_distinct_valid_next_fifo_delivery(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = self._seed_ackable_delivery(
+                store,
+                delivery_id="delivery_first",
+                objective="preserve next FIFO delivery",
+            )
+            next_message = {"id": "message_next", "type": "heartbeat"}
+            response = acknowledgement(
+                "delivery_first",
+                deliveryId="delivery_next",
+                messages=[next_message],
+            )
+
+            self.assertTrue(_ack_if_resolved(FakeClient([response]), store, run))  # type: ignore[arg-type]
+
+            current = store.get_run(run.local_id)
+            self.assertEqual(current.delivery_id, "delivery_next")
+            rows = store.messages(run.local_id, "delivery_next")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["message_id"], "message_next")
+            self.assertEqual(rows[0]["effect_status"], "observed")
+
+    def _seed_rejected_preflight(self) -> tuple[str, dict[str, str]]:
+        mismatch = {
+            "code": "preflight_identity_conflict",
+            "message": "terminal.executionHostId did not prove local execution",
+        }
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective="held objective", profile_digest="p", source_digest="s")
+            run = store.update_run(
+                run.local_id,
+                native_run_id="run_held",
+                task_id="task_held",
+                dispatch_id="dispatch_held",
+                phase="awaiting_preflight",
+            )
+            store.record_worker_resource_binding(
+                run.local_id,
+                dispatch_id="dispatch_held",
+                resource_id="resource_held",
+                terminal_handle="term_held",
+                worktree_id="worktree_held",
+                readback={"immutable": True},
+            )
+            store.record_preflight(
+                run.local_id,
+                run_id="run_held",
+                task_id="task_held",
+                dispatch_id="dispatch_held",
+                observation={
+                    "schema": "orchestrate-worker-preflight/v1",
+                    "outcome": "rejected",
+                    "runId": "run_held",
+                    "taskId": "task_held",
+                    "dispatchId": "dispatch_held",
+                    "mismatches": [mismatch],
+                },
+            )
+            return run.local_id, mismatch
+
+    def test_implement_surfaces_rejected_preflight_hold_with_zero_orca_effects(self) -> None:
+        local_id, mismatch = self._seed_rejected_preflight()
+        client = FakeClient([])
+
+        report = implement(
+            self.root,
+            "a different objective must not replace the held attempt",
+            client=client,  # type: ignore[arg-type]
+            require_context=False,
+        )
+
+        self.assertEqual(report["localRunId"], local_id)
+        self.assertEqual(report["status"], "preflight_held")
+        self.assertEqual(report["admission"], "rejected")
+        self.assertEqual(report["admissionDetail"]["mismatches"], [mismatch])
+        self.assertEqual(client.calls, [])
+
+    def test_resume_surfaces_rejected_preflight_hold_with_zero_orca_effects(self) -> None:
+        local_id, mismatch = self._seed_rejected_preflight()
+        client = FakeClient([])
+
+        report = resume(
+            self.root,
+            local_id,
+            client=client,  # type: ignore[arg-type]
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "preflight_held")
+        self.assertEqual(report["admissionDetail"]["mismatches"], [mismatch])
+        self.assertIn("separately authorized cleanup", report["nextObligation"])
+        self.assertEqual(client.calls, [])
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            binding = store.get_worker_resource_binding(local_id)
+            self.assertEqual(binding.resource_id, "resource_held")  # type: ignore[union-attr]
+
+    def test_resume_holds_malformed_immutable_preflight_with_zero_orca_effects(self) -> None:
+        local_id, _ = self._seed_rejected_preflight()
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            store.connection.execute(
+                "UPDATE preflight_observations SET observation_json = ? WHERE run_local_id = ?",
+                ("{malformed", local_id),
+            )
+        client = FakeClient([])
+
+        report = resume(
+            self.root,
+            local_id,
+            client=client,  # type: ignore[arg-type]
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "preflight_held")
+        self.assertEqual(report["admission"], "conflicting")
+        self.assertEqual(report["admissionDetail"]["code"], "preflight_identity_conflict")
+        self.assertIn("malformed", report["admissionDetail"]["message"].lower())
+        self.assertEqual(client.calls, [])
+
+    def test_resume_holds_conflicting_immutable_preflight_with_zero_orca_effects(self) -> None:
+        local_id, _ = self._seed_rejected_preflight()
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            store.connection.execute(
+                "UPDATE preflight_observations SET observation_json = ? WHERE run_local_id = ?",
+                (
+                    json.dumps(
+                        {
+                            "schema": "orchestrate-worker-preflight/v1",
+                            "outcome": "indeterminate",
+                            "mismatches": [{"code": "conflicting_outcome"}],
+                        }
+                    ),
+                    local_id,
+                ),
+            )
+        client = FakeClient([])
+
+        report = resume(
+            self.root,
+            local_id,
+            client=client,  # type: ignore[arg-type]
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "preflight_held")
+        self.assertEqual(report["admission"], "conflicting")
+        self.assertEqual(report["admissionDetail"]["code"], "preflight_identity_conflict")
+        self.assertEqual(report["admissionDetail"]["mismatches"], [{"code": "conflicting_outcome"}])
+        self.assertEqual(client.calls, [])
 
     def test_uncertain_request_replays_only_exact_native_shape(self) -> None:
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
@@ -1937,7 +2376,7 @@ class ControllerTests(unittest.TestCase):
             {"result": {"run": {"id": "run_1", "objective": objective}}},
             *settlement_responses()[:2],
             settlement_responses()[3],
-            mutation("request_ack", messages=[]),
+            acknowledgement("delivery_1"),
         ]
         report = resume(
             self.root,
@@ -2503,7 +2942,7 @@ class ControllerTests(unittest.TestCase):
             {"result": {"run": {"id": "run_1", "objective": objective}}},
             completion_responses(self.root, objective)[6],
             *settlement_responses(worktree_id=f"repo::{self.root.resolve()}"),
-            mutation("request_ack", messages=[]),
+            acknowledgement("delivery_1"),
         ]
         final = resume(
             self.root, str(initial["localRunId"]), client=FakeClient(resume_responses),

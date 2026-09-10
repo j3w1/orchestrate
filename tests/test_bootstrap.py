@@ -613,30 +613,32 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result, 23)
         self.assertEqual(json.loads(output.getvalue())["status"], "blocked")
 
-    def test_worker_unadmitted_is_nonzero_directly_and_through_bootstrap(self) -> None:
-        child = {
-            "schema": "orchestrate-report/v1",
-            "status": "worker_unadmitted",
-            "verification": "not_run",
-        }
-        direct_output = io.StringIO()
-        with patch("orchestrate.cli._execute", return_value=(child, True)), redirect_stdout(direct_output):
-            direct = main(["status", "--json"])
-        self.assertEqual(direct, 1)
-        self.assertEqual(json.loads(direct_output.getvalue()), child)
+    def test_held_and_unadmitted_states_are_nonzero_directly_and_through_bootstrap(self) -> None:
+        for status in ("preflight_held", "worker_unadmitted"):
+            with self.subTest(status=status):
+                child = {
+                    "schema": "orchestrate-report/v1",
+                    "status": status,
+                    "verification": "not_run",
+                }
+                direct_output = io.StringIO()
+                with patch("orchestrate.cli._execute", return_value=(child, True)), redirect_stdout(direct_output):
+                    direct = main(["status", "--json"])
+                self.assertEqual(direct, 1)
+                self.assertEqual(json.loads(direct_output.getvalue()), child)
 
-        def launch(*_: object, **__: object) -> int:
-            print(json.dumps(child))
-            return direct
+                def launch(*_: object, **__: object) -> int:
+                    print(json.dumps(child))
+                    return direct
 
-        bootstrap_output = io.StringIO()
-        with patch("orchestrate.cli._needs_bootstrap", return_value=True), patch(
-            "orchestrate.cli.launch_controller",
-            side_effect=launch,
-        ), redirect_stdout(bootstrap_output):
-            outer = main(["implement", "synthetic objective", "--json"])
-        self.assertEqual(outer, 1)
-        self.assertEqual(json.loads(bootstrap_output.getvalue()), child)
+                bootstrap_output = io.StringIO()
+                with patch("orchestrate.cli._needs_bootstrap", return_value=True), patch(
+                    "orchestrate.cli.launch_controller",
+                    side_effect=launch,
+                ), redirect_stdout(bootstrap_output):
+                    outer = main(["implement", "synthetic objective", "--json"])
+                self.assertEqual(outer, 1)
+                self.assertEqual(json.loads(bootstrap_output.getvalue()), child)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,8 @@ Expected evidence is an exact native Run/Task/Dispatch, accepted task input, who
 
 `ready`/`input_accepted` is not itself proof that the agent turn began. If the command returns `awaiting_preflight` with a `worker_input_submission_unproven` compatibility record, preserve that active Dispatch and its terminal for inspection. Do not rerun `implement`, resend the packet, send an arbitrary Enter key, or claim a worker failure; the record was produced by one read-only `worker-show` and leaves recovery as an explicit owner decision.
 
+If status is `preflight_held`, the immutable preflight was rejected or conflicts with its bound launch. `implement` and `resume` will only surface the stored mismatch; they will not wait, launch, reply, release, acknowledge, send terminal input, or replace the worker. Preserve the exact resource binding until the owner authorizes a separate cleanup action.
+
 ## Compatibility no-edit probe
 
 The active doctor probe requires a second, clean disposable project with a committed marker and a one-use token. It is not the product workflow and must not reuse the worker-edited fixture above:
@@ -69,4 +71,4 @@ orchestrate doctor --active-run-probe --disposable-project $probeFixture --json
 orchestrate doctor --active-worker-probe <probe-token> --disposable-project $probeFixture --json
 ```
 
-The probe rejects arbitrary Run IDs, dirty or mismatched worktrees, agent callers, reused tokens, pre-existing Tasks, malformed FIFO entries, declared file changes, and baseline drift.
+The probe rejects arbitrary Run IDs, dirty or mismatched worktrees, agent callers, reused tokens, pre-existing Tasks, contradictory ready-worker failure/error or resource fields, malformed FIFO entries, a Delivery acknowledgement that does not name the exact requested Delivery, declared file changes, and baseline drift.

@@ -247,7 +247,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         exit_code = report.get("controllerExitCode")
         return exit_code if type(exit_code) is int else 1
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n" if emit_json else _human_text(report)
-    exit_code = 0 if report.get("status") not in {"blocked", "worker_failed", "worker_unadmitted"} else 1
+    exit_code = (
+        0
+        if report.get("status")
+        not in {"blocked", "preflight_held", "worker_failed", "worker_unadmitted"}
+        else 1
+    )
     if report.get("status") == "interrupted":
         exit_code = 130
     if type(report.get("controllerExitCode")) is int:
