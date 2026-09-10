@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 
 class WorkerShowShapeError(ValueError):
@@ -33,6 +33,48 @@ class TerminalResourceIdentity:
     resource_id: str
     terminal_handle: str
     worktree_id: str
+
+
+WorkerExecutionSemantics = Literal["succeeded", "failed", "prompt_stall"]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerExecutionShape:
+    dispatch_status: str
+    last_failure: str | None
+    worker_state: str
+    worker_stage: str
+    last_error: str | None
+
+
+# Orca's worker stage records execution progress; terminalResource records the
+# independently changing terminal disposition.  Keep the two installed response
+# versions explicit even where their execution semantics are equal, so a future
+# version cannot silently inherit either contract.
+_WORKER_EXECUTION_SHAPES: dict[str, dict[WorkerExecutionSemantics, WorkerExecutionShape]] = {
+    "1.4.198": {
+        "succeeded": WorkerExecutionShape("completed", None, "succeeded", "settled", None),
+        "failed": WorkerExecutionShape("failed", "worker_failed", "failed", "settled", "worker_failed"),
+        "prompt_stall": WorkerExecutionShape(
+            "failed",
+            "agent_prompt_stalled",
+            "failed",
+            "dispatch_input",
+            "agent_prompt_stalled",
+        ),
+    },
+    "1.4.199": {
+        "succeeded": WorkerExecutionShape("completed", None, "succeeded", "settled", None),
+        "failed": WorkerExecutionShape("failed", "worker_failed", "failed", "settled", "worker_failed"),
+        "prompt_stall": WorkerExecutionShape(
+            "failed",
+            "agent_prompt_stalled",
+            "failed",
+            "dispatch_input",
+            "agent_prompt_stalled",
+        ),
+    },
+}
 
 
 def worker_show_dispatch_identity(dispatch: Mapping[str, Any]) -> DispatchIdentity:
@@ -97,6 +139,31 @@ def worker_show_identity(
         terminal_handle=worker["agent_terminal_handle"],
         last_error=worker["last_error"],
     )
+
+
+def worker_execution_identity(
+    dispatch: Mapping[str, Any],
+    worker: Mapping[str, Any],
+    *,
+    semantics: WorkerExecutionSemantics,
+    terminal_handle: str,
+) -> WorkerIdentity:
+    """Validate one version-bound execution shape independently of resource release."""
+
+    identity = worker_show_identity(dispatch, worker)
+    expected = _WORKER_EXECUTION_SHAPES[identity.dispatch.version][semantics]
+    if (
+        dispatch.get("status") != expected.dispatch_status
+        or identity.dispatch.last_failure != expected.last_failure
+        or worker.get("state") != expected.worker_state
+        or worker.get("stage") != expected.worker_stage
+        or identity.last_error != expected.last_error
+        or identity.terminal_handle != terminal_handle
+    ):
+        raise WorkerShowShapeError(
+            f"Orca {identity.dispatch.version} worker execution does not match {semantics} semantics"
+        )
+    return identity
 
 
 def worker_terminal_resource_identity(

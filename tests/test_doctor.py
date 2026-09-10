@@ -186,18 +186,18 @@ class DoctorTests(unittest.TestCase):
             {
                 "dispatchId": "dispatch_probe",
                 "worktreeId": "worktree_1",
-                "agentTerminalHandle": None,
+                "agentTerminalHandle": "term_probe",
                 "lastError": None if outcome == "succeeded" else "worker_failed",
                 "state": outcome,
-                "stage": "released",
+                "stage": "settled",
             }
             if current_worker_shape
             else {
                 "worktree_id": "worktree_1",
-                "agent_terminal_handle": None,
+                "agent_terminal_handle": "term_probe",
                 "last_error": None if outcome == "succeeded" else "worker_failed",
                 "state": outcome,
-                "stage": "released",
+                "stage": "settled",
             }
         )
         terminal_resource = {
@@ -283,6 +283,7 @@ class DoctorTests(unittest.TestCase):
                 "result": {
                     "dispatch": settled_dispatch,
                     "worker": released_worker,
+                    "terminal": None,
                     "terminalResource": {
                         "id": "terminal-resource-probe",
                         "ownershipState": "released",
@@ -410,11 +411,14 @@ class DoctorTests(unittest.TestCase):
             run_worker_probe(client, minted["probeToken"], project=self.root, wait_timeout_ms=10)  # type: ignore[arg-type]
         self.assertFalse(any("--ack" in call or "worker-release" in call for call in client.calls))
 
-    def test_active_doctor_release_rejects_each_changed_resource_identity(self) -> None:
+    def test_active_doctor_release_rejects_each_changed_resource_identity_and_disposition(self) -> None:
         for changed_field, changed_value in (
             ("id", "terminal-resource-other"),
             ("terminalHandle", "term_other"),
             ("worktreeId", "worktree_other"),
+            ("ownershipState", "owned"),
+            ("releaseState", "releasing"),
+            ("releaseCompletedAt", None),
         ):
             with self.subTest(changed_field=changed_field):
                 minted = self.mint_probe()
@@ -482,6 +486,7 @@ class DoctorTests(unittest.TestCase):
             "worker_stage",
             "worker_last_error",
             "worker_terminal_handle",
+            "attached_terminal",
         )
         for current_shape in (False, True):
             for outcome in ("succeeded", "failed"):
@@ -529,7 +534,9 @@ class DoctorTests(unittest.TestCase):
                         elif field == "worker_terminal_handle":
                             worker[
                                 "agentTerminalHandle" if current_shape else "agent_terminal_handle"
-                            ] = "term_probe"
+                            ] = None
+                        elif field == "attached_terminal":
+                            released["result"]["terminal"] = {"handle": "term_probe"}
                         client = FakeClient(responses)
 
                         with self.assertRaises(ProbeContractError):

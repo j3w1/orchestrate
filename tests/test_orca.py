@@ -7,6 +7,7 @@ import unittest
 from orchestrate.orca import OrcaClient, OrcaCommandError, orca_task_title, resolve_orca_command
 from orchestrate.orca_compat import (
     WorkerShowShapeError,
+    worker_execution_identity,
     worker_show_dispatch_identity,
     worker_show_identity,
 )
@@ -244,6 +245,64 @@ class ClientTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(WorkerShowShapeError, "mixed or incomplete"):
             worker_show_identity(dispatch, mixed_worker)
+
+    def test_worker_execution_semantics_are_exact_for_both_supported_versions(self) -> None:
+        cases = (
+            ("succeeded", "completed", None, "succeeded", "settled", None),
+            ("failed", "failed", "worker_failed", "failed", "settled", "worker_failed"),
+            (
+                "prompt_stall",
+                "failed",
+                "agent_prompt_stalled",
+                "failed",
+                "dispatch_input",
+                "agent_prompt_stalled",
+            ),
+        )
+        for current_shape in (False, True):
+            for semantics, status, failure, state, stage, error in cases:
+                with self.subTest(current_shape=current_shape, semantics=semantics):
+                    dispatch = {"id": "dispatch_1", "status": status}
+                    worker = {"state": state, "stage": stage}
+                    if current_shape:
+                        dispatch.update(
+                            runId="run_1",
+                            taskId="task_1",
+                            task_id="task_1",
+                            lastFailure=failure,
+                        )
+                        worker.update(
+                            dispatchId="dispatch_1",
+                            worktreeId="worktree_1",
+                            agentTerminalHandle="term_1",
+                            lastError=error,
+                        )
+                    else:
+                        dispatch.update(
+                            run_id="run_1",
+                            task_id="task_1",
+                            last_failure=failure,
+                        )
+                        worker.update(
+                            worktree_id="worktree_1",
+                            agent_terminal_handle="term_1",
+                            last_error=error,
+                        )
+                    identity = worker_execution_identity(
+                        dispatch,
+                        worker,
+                        semantics=semantics,
+                        terminal_handle="term_1",
+                    )
+                    self.assertEqual(identity.dispatch.version, "1.4.199" if current_shape else "1.4.198")
+
+                    with self.assertRaises(WorkerShowShapeError):
+                        worker_execution_identity(
+                            dispatch,
+                            {**worker, "stage": "released"},
+                            semantics=semantics,
+                            terminal_handle="term_1",
+                        )
 
 
 if __name__ == "__main__":

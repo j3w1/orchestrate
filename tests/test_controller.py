@@ -279,8 +279,31 @@ def _prompt_stall_readback(root: Path, *, current_shape: bool = False) -> dict[s
 
 def _released_prompt_stall_readback(root: Path, *, current_shape: bool = False) -> dict[str, object]:
     worktree_id = f"repo::{root.resolve()}"
+    terminal_effect = {"kind": "terminal", "role": "agent", "action": "created", "id": "term_worker"}
+    launch = {
+        "requested": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+        "effective": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+    }
     dispatch: dict[str, object] = {"id": "dispatch_1", "status": "failed"}
-    worker: dict[str, object] = {"state": "failed", "stage": "released"}
+    worker: dict[str, object] = {
+        "state": "failed",
+        "stage": "dispatch_input",
+        "effects": [
+            {"kind": "worktree", "action": "reused", "id": worktree_id},
+            {"kind": "setup", "action": "not_applicable", "state": "not_applicable"},
+            terminal_effect,
+        ],
+        "residualResources": [terminal_effect],
+        "startOptions": {
+            "worktree": f"path:{root.resolve()}",
+            "resolvedWorktreeId": worktree_id,
+            "terminal": None,
+            "agent": "codex",
+            "launch": launch,
+            "setup": "not_applicable",
+            "setupSource": "existing_worktree",
+        },
+    }
     if current_shape:
         dispatch.update(
             runId="run_1",
@@ -291,7 +314,7 @@ def _released_prompt_stall_readback(root: Path, *, current_shape: bool = False) 
         worker.update(
             dispatchId="dispatch_1",
             worktreeId=worktree_id,
-            agentTerminalHandle=None,
+            agentTerminalHandle="term_worker",
             lastError="agent_prompt_stalled",
         )
     else:
@@ -302,13 +325,36 @@ def _released_prompt_stall_readback(root: Path, *, current_shape: bool = False) 
         )
         worker.update(
             worktree_id=worktree_id,
-            agent_terminal_handle=None,
+            agent_terminal_handle="term_worker",
             last_error="agent_prompt_stalled",
         )
     return {
         "result": {
             "dispatch": dispatch,
             "worker": worker,
+            "projection": {
+                "id": "dispatch_1",
+                "dispatchId": "dispatch_1",
+                "taskId": "task_1",
+                "runId": "run_1",
+                "stage": {
+                    "worker": "failed",
+                    "dispatch": "failed",
+                    "detail": "dispatch_input",
+                    "activity": "unknown",
+                },
+                "outcome": "failed",
+                "liveness": {"verdict": "exited", "source": "resource_release"},
+                "resource": {
+                    "state": "released",
+                    "id": "terminal-resource-1",
+                    "ownerDispatchId": "dispatch_1",
+                    "releaseState": "released",
+                    "terminalState": "released",
+                }
+            },
+            "terminal": None,
+            "observation": {"status": "missing", "exactWorker": False},
             "terminalResource": {
                 "id": "terminal-resource-1",
                 "ownershipState": "released",
@@ -318,9 +364,13 @@ def _released_prompt_stall_readback(root: Path, *, current_shape: bool = False) 
                 "ownerDispatchId": "dispatch_1",
                 "terminalHandle": "term_worker",
                 "worktreeId": worktree_id,
+                "endpointId": None,
+                "endpointIncarnation": None,
                 "releaseRequestedAt": "2026-01-01T00:00:00Z",
                 "releaseCompletedAt": "2026-01-01T00:00:01Z",
                 "releaseError": None,
+                "recoveryAttemptCount": 0,
+                "lastRecoveryAt": None,
                 "archive": {"source": "transcript", "status": "captured"},
             },
         }
@@ -338,7 +388,7 @@ def _release_worker_show(
 ) -> dict[str, object]:
     last_failure = None if status == "completed" else "worker_failed"
     dispatch: dict[str, object] = {"id": dispatch_id, "status": status}
-    worker: dict[str, object] = {"state": "succeeded" if status == "completed" else "failed", "stage": "released"}
+    worker: dict[str, object] = {"state": "succeeded" if status == "completed" else "failed", "stage": "settled"}
     if current_shape:
         dispatch.update(
             runId=run_id,
@@ -349,17 +399,24 @@ def _release_worker_show(
         worker.update(
             dispatchId=dispatch_id,
             worktreeId=resource.get("worktreeId"),
-            agentTerminalHandle=None,
+            agentTerminalHandle=resource.get("terminalHandle"),
             lastError=last_failure,
         )
     else:
         dispatch.update(run_id=run_id, task_id=task_id, last_failure=last_failure)
         worker.update(
             worktree_id=resource.get("worktreeId"),
-            agent_terminal_handle=None,
+            agent_terminal_handle=resource.get("terminalHandle"),
             last_error=last_failure,
         )
-    return {"result": {"dispatch": dispatch, "worker": worker, "terminalResource": dict(resource)}}
+    return {
+        "result": {
+            "dispatch": dispatch,
+            "worker": worker,
+            "terminal": None if resource.get("releaseState") == "released" else {"handle": resource.get("terminalHandle")},
+            "terminalResource": dict(resource),
+        }
+    }
 
 
 def _released_resource(
@@ -409,7 +466,9 @@ def _contradict_release_semantics(
     elif field == "worker_last_error":
         worker["lastError" if current_shape else "last_error"] = "contradictory_failure"
     elif field == "worker_terminal_handle":
-        worker["agentTerminalHandle" if current_shape else "agent_terminal_handle"] = original_terminal
+        worker["agentTerminalHandle" if current_shape else "agent_terminal_handle"] = None
+    elif field == "attached_terminal":
+        result["terminal"] = {"handle": original_terminal}
     else:  # pragma: no cover - test helper guard
         raise AssertionError(f"Unknown semantic contradiction: {field}")
 
@@ -492,7 +551,7 @@ def settlement_responses(
 ) -> list[Response]:
     native_status = "completed" if outcome == "succeeded" else "failed"
     dispatch: dict[str, object] = {"id": "dispatch_1", "status": native_status}
-    released_worker: dict[str, object] = {"state": outcome, "stage": "released"}
+    released_worker: dict[str, object] = {"state": outcome, "stage": "settled"}
     if current_shape:
         dispatch.update(
             runId="run_1",
@@ -503,7 +562,7 @@ def settlement_responses(
         released_worker.update(
             dispatchId="dispatch_1",
             worktreeId=worktree_id,
-            agentTerminalHandle=None,
+            agentTerminalHandle="term_worker",
             lastError=None if outcome == "succeeded" else "worker_failed",
         )
     else:
@@ -514,7 +573,7 @@ def settlement_responses(
         )
         released_worker.update(
             worktree_id=worktree_id,
-            agent_terminal_handle=None,
+            agent_terminal_handle="term_worker",
             last_error=None if outcome == "succeeded" else "worker_failed",
         )
     return [
@@ -535,6 +594,7 @@ def settlement_responses(
             "result": {
                 "dispatch": dispatch,
                 "worker": released_worker,
+                "terminal": None,
                 "terminalResource": {
                     "id": "terminal-resource-1",
                     "ownershipState": "released",
@@ -935,7 +995,7 @@ class ControllerTests(unittest.TestCase):
                 )  # type: ignore[arg-type]
             self.assertEqual(caught.exception.code, "release_unconfirmed")
 
-    def test_release_readback_binds_all_resource_ids_for_both_orca_shapes(self) -> None:
+    def test_release_readback_binds_exact_resource_identity_and_disposition_for_both_orca_shapes(self) -> None:
         for current_shape in (False, True):
             for receipt_state in ("released", "already_released"):
                 with self.subTest(current_shape=current_shape, receipt_state=receipt_state):
@@ -983,6 +1043,9 @@ class ControllerTests(unittest.TestCase):
             ("id", "terminal-resource-other"),
             ("terminalHandle", "term_other"),
             ("worktreeId", "worktree_other"),
+            ("ownershipState", "owned"),
+            ("releaseState", "releasing"),
+            ("releaseCompletedAt", None),
         ):
             with self.subTest(changed_field=changed_field):
                 with StateStore(self.root, home=Path(self.state_temp.name)) as store:
@@ -1036,6 +1099,7 @@ class ControllerTests(unittest.TestCase):
             "worker_stage",
             "worker_last_error",
             "worker_terminal_handle",
+            "attached_terminal",
         )
         message_template = {
             "id": "message_done",
@@ -1191,6 +1255,7 @@ class ControllerTests(unittest.TestCase):
             "worker_stage",
             "worker_last_error",
             "worker_terminal_handle",
+            "attached_terminal",
         )
         worktree_id = f"repo::{self.root.resolve()}"
         for current_shape in (False, True):
@@ -1908,6 +1973,70 @@ class ControllerTests(unittest.TestCase):
             recovered = store.get_run(local_id)
             self.assertEqual(recovered.phase, "worker_failed")
             self.assertEqual(recovered.verification_status, "not_run")
+
+    def test_resume_converges_from_live_released_prompt_stall_shape_without_lifecycle_replay(self) -> None:
+        objective = "Recover the already released prompt-stall worker"
+        worktree_id = f"repo::{self.root.resolve()}"
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective=objective, profile_digest="p", source_digest="s")
+            run = store.update_run(
+                run.local_id,
+                native_run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                phase="launch_cleanup_pending",
+            )
+            _record_fixture_binding(store, run.local_id, worktree_id=worktree_id)
+            release = store.prepare_intention(
+                run.local_id,
+                "worker-release",
+                ["orchestration", "worker-release", "--dispatch", "dispatch_1"],
+            )
+            store.mark_intention(
+                release,
+                "applied",
+                request_id="request_release",
+                response=mutation(
+                    "request_release",
+                    dispatchId="dispatch_1",
+                    state="already_released",
+                ),
+            )
+            local_id = run.local_id
+
+        live_readback = _released_prompt_stall_readback(self.root, current_shape=True)
+        client = FakeClient(
+            [
+                mutation("request_use", run={"id": "run_1"}),
+                {"result": {"run": {"id": "run_1"}}},
+                {"result": {"run": {"id": "run_1", "objective": objective}}},
+                live_readback,
+            ]
+        )
+
+        report = resume(
+            self.root,
+            local_id,
+            client=client,  # type: ignore[arg-type]
+            wait_timeout_ms=1,
+            require_context=False,
+        )
+
+        self.assertEqual(report["status"], "worker_failed")
+        self.assertEqual(report["workerOutcome"], "failed")
+        self.assertEqual(report["verification"], "not_run")
+        self.assertFalse(any(call[:2] == ("orchestration", "worker-start") for call in client.calls))
+        self.assertFalse(any(call[:2] == ("orchestration", "worker-release") for call in client.calls))
+        self.assertFalse(any(call[:2] == ("terminal", "close") for call in client.calls))
+        self.assertFalse(any("--ack" in call for call in client.calls))
+        self.assertEqual(
+            sum(call[:2] == ("orchestration", "worker-show") for call in client.calls),
+            1,
+        )
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            persisted = store.get_run(local_id)
+            self.assertEqual(persisted.phase, "worker_failed")
+            self.assertEqual(persisted.verification_status, "not_run")
 
     def test_resume_recovers_fea_prompt_stall_receipt_without_replaying_worker_start(self) -> None:
         objective = "Recover the stored failed start"

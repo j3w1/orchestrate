@@ -18,6 +18,7 @@ from .orca import JsonObject, OrcaClient, OrcaCommandError
 from .orca_compat import (
     TerminalResourceIdentity,
     WorkerShowShapeError,
+    worker_execution_identity,
     worker_show_dispatch_identity,
     worker_show_identity,
     worker_terminal_resource_identity,
@@ -460,23 +461,20 @@ def _validate_release(
     if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping):
         raise ProbeContractError("Post-release worker-show omitted the exact worker identity")
     try:
-        identity = worker_show_identity(dispatch, worker)
+        identity = worker_execution_identity(
+            dispatch,
+            worker,
+            semantics=worker_outcome,
+            terminal_handle=expected_resource.terminal_handle,
+        )
     except WorkerShowShapeError as exc:
         raise ProbeContractError(str(exc)) from exc
-    expected_status = "completed" if worker_outcome == "succeeded" else "failed"
-    expected_failure = None if worker_outcome == "succeeded" else "worker_failed"
     if (
         dispatch.get("id") != dispatch_id
         or identity.dispatch.run_id != run_id
         or identity.dispatch.task_id != task_id
-        or dispatch.get("status") != expected_status
-        or identity.dispatch.last_failure != expected_failure
-        or worker.get("state") != worker_outcome
-        or worker.get("stage") != "released"
-        or identity.last_error != expected_failure
         or identity.dispatch_id != dispatch_id
         or identity.worktree_id != expected_resource.worktree_id
-        or identity.terminal_handle is not None
     ):
         raise ProbeContractError(
             "Post-release worker-show did not preserve the exact settled worker semantics"
@@ -496,6 +494,7 @@ def _validate_release(
         or not isinstance(resource.get("releaseCompletedAt"), str)
         or resource.get("releaseError") is not None
         or resource.get("archive") != {"source": "transcript", "status": "captured"}
+        or result.get("terminal") is not None
     ):
         raise ProbeContractError(
             "Worker release is not confirmed as released; the Delivery remains unacknowledged"

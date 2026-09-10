@@ -18,6 +18,7 @@ from .orca import JsonObject, OrcaClient, OrcaCommandError, orca_task_title
 from .orca_compat import (
     TerminalResourceIdentity,
     WorkerShowShapeError,
+    worker_execution_identity,
     worker_show_dispatch_identity,
     worker_show_identity,
     worker_terminal_resource_identity,
@@ -1023,7 +1024,12 @@ def _validate_prompt_stall_readback(
     if not isinstance(dispatch, Mapping) or not isinstance(worker, Mapping):
         raise OrchestrateError("worker-show omitted the failed worker identity", code="orca_contract_error")
     try:
-        identity = worker_show_identity(dispatch, worker)
+        identity = worker_execution_identity(
+            dispatch,
+            worker,
+            semantics="prompt_stall",
+            terminal_handle=terminal_id,
+        )
     except WorkerShowShapeError as exc:
         raise OrchestrateError(str(exc), code="orca_contract_error") from exc
     terminal_resource = result.get("terminalResource")
@@ -1039,24 +1045,13 @@ def _validate_prompt_stall_readback(
         )
     except WorkerShowShapeError as exc:
         raise OrchestrateError(str(exc), code="orca_contract_error") from exc
-    released_terminal = allow_released_terminal and terminal_resource.get("releaseState") == "released"
     if (
         dispatch.get("id") != dispatch_id
         or identity.dispatch.run_id != run.native_run_id
         or identity.dispatch.task_id != run.task_id
-        or dispatch.get("status") != "failed"
-        or identity.dispatch.last_failure != PROMPT_STALL_ERROR
-        or worker.get("state") != "failed"
-        or worker.get("stage") not in (
-            {PROMPT_STALL_STAGE, "released"} if released_terminal else {PROMPT_STALL_STAGE}
-        )
-        or identity.last_error != PROMPT_STALL_ERROR
         or identity.dispatch_id != dispatch_id
         or identity.worktree_id != worktree_id
-        or (
-            identity.terminal_handle != terminal_id
-            and not (released_terminal and identity.terminal_handle is None)
-        )
+        or (terminal_resource.get("releaseState") == "released" and not allow_released_terminal)
     ):
         raise OrchestrateError(
             "worker-show did not confirm the exact failed prompt-stall worker",
@@ -1435,25 +1430,21 @@ def _release_disposition(
         and archive.get("status") is None
     )
     if released_resource or retained_resource:
-        expected_dispatch_status = "completed" if expected_semantics == "succeeded" else "failed"
-        expected_worker_state = "succeeded" if expected_semantics == "succeeded" else "failed"
-        expected_failure = (
-            None
-            if expected_semantics == "succeeded"
-            else PROMPT_STALL_ERROR
-            if expected_semantics == "prompt_stall"
-            else "worker_failed"
-        )
-        if (
-            dispatch.get("status") != expected_dispatch_status
-            or shown_identity.dispatch.last_failure != expected_failure
-            or shown_worker.get("state") != expected_worker_state
-            or shown_worker.get("stage") != "released"
-            or shown_identity.last_error != expected_failure
-            or shown_identity.terminal_handle is not None
-        ):
+        try:
+            worker_execution_identity(
+                dispatch,
+                shown_worker,
+                semantics=expected_semantics,
+                terminal_handle=binding.terminal_handle,
+            )
+        except WorkerShowShapeError as exc:
             raise OrchestrateError(
                 "worker-show release readback does not preserve the exact settled worker semantics",
+                code="release_unconfirmed",
+            ) from exc
+        if released_resource and result.get("terminal") is not None:
+            raise OrchestrateError(
+                "worker-show release readback still exposes an attached terminal",
                 code="release_unconfirmed",
             )
         return
