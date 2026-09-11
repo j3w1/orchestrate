@@ -11,7 +11,7 @@ import subprocess
 from typing import Any
 
 from .errors import OrchestrateError
-from .profile import PROFILE_NAME, ProjectProfile, instruction_inventory
+from .profile import INSTRUCTION_NAMES, PROFILE_NAME, ProjectProfile, instruction_inventory
 from .safeio import approved_project_path, is_sensitive_source, read_project_bytes
 
 
@@ -133,7 +133,7 @@ def build_source_index(profile: ProjectProfile, *, extra_sources: set[str] | Non
         changed_authority = relative == PROFILE_NAME and head != raw
         changed_instruction = (
             relative in profile.value["instructions"]
-            or Path(relative).name in {"AGENTS.md", "CLAUDE.md"}
+            or Path(relative).name in INSTRUCTION_NAMES
         ) and (head is None or head != raw)
         records.append(
             {

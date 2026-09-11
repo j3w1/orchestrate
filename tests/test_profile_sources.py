@@ -10,9 +10,16 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import orchestrate.profile as profile_module
 from orchestrate.errors import OrchestrateError
 from orchestrate.controller import _require_profile_selection
-from orchestrate.profile import PROFILE_NAME, ProjectProfile, _selection_path, setup_project
+from orchestrate.profile import (
+    PROFILE_NAME,
+    ProjectProfile,
+    _selection_path,
+    instruction_inventory,
+    setup_project,
+)
 from orchestrate.readers import _run_ce_query, read_project
 from orchestrate.safeio import read_project_bytes
 from orchestrate.sources import build_source_index
@@ -41,6 +48,20 @@ class DisposableRepo(unittest.TestCase):
         self.environment.stop()
         self.temporary.cleanup()
         self.state_temporary.cleanup()
+
+    def write_large_ignored_dependency_tree(self) -> None:
+        (self.root / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        git(self.root, "add", ".gitignore")
+        git(self.root, "commit", "-qm", "ignore dependencies")
+        dependency = self.root / "vendor" / "node_modules"
+        for index in range(49):
+            package = dependency / f"dependency-{index:03d}-with-a-deliberately-long-name"
+            package.mkdir(parents=True)
+            (package / "metadata-with-a-deliberately-long-name.json").write_text("{}\n", encoding="utf-8")
+        (dependency / "dependency-000-with-a-deliberately-long-name" / "AGENTS.md").write_text(
+            "Ignored dependency text.\n",
+            encoding="utf-8",
+        )
 
 
 class ProfileAndSourceTests(DisposableRepo):
@@ -229,7 +250,7 @@ class ProfileAndSourceTests(DisposableRepo):
         self.assertEqual(caught.exception.code, "state_storage_unsafe")
         self.assertFalse(unsafe.exists())
 
-    def test_ignored_nested_instruction_is_inventoried_and_hashed(self) -> None:
+    def test_ignored_nested_instruction_is_excluded_by_default(self) -> None:
         (self.root / ".gitignore").write_text("nested/AGENTS.md\n", encoding="utf-8")
         git(self.root, "add", ".gitignore")
         git(self.root, "commit", "-qm", "ignore nested authority")
@@ -237,11 +258,89 @@ class ProfileAndSourceTests(DisposableRepo):
         (self.root / "nested" / "AGENTS.md").write_text("Nested authority.\n", encoding="utf-8")
         profile = setup_project(self.root)
 
+        result = read_project(profile, "Apply project instructions")
         indexed = build_source_index(profile)
 
+        self.assertNotIn("nested/AGENTS.md", indexed.value["instructionInventory"])
+        self.assertNotIn("nested/AGENTS.md", [item["path"] for item in indexed.value["sources"]])
+        self.assertTrue(indexed.value["candidate"]["coverageComplete"])
+        self.assertEqual(result.routing["authority"], ["AGENTS.md"])
+
+    def test_explicitly_selected_ignored_instruction_is_read_as_candidate_restriction(self) -> None:
+        (self.root / ".gitignore").write_text("nested/AGENTS.md\n", encoding="utf-8")
+        git(self.root, "add", ".gitignore")
+        git(self.root, "commit", "-qm", "ignore nested authority")
+        (self.root / "nested").mkdir()
+        (self.root / "nested" / "AGENTS.md").write_text("Nested restriction.\n", encoding="utf-8")
+        profile = setup_project(self.root)
+        profile.value["instructions"].append("nested/AGENTS.md")
+        (self.root / PROFILE_NAME).write_text(json.dumps(profile.value), encoding="utf-8")
+        selected = setup_project(self.root, acknowledge_profile=True)
+
+        result = read_project(selected, "Apply project instructions")
+        indexed = build_source_index(selected, extra_sources=set(result.consulted_paths))
+
+        self.assertEqual(result.routing["authority"], ["AGENTS.md", "nested/AGENTS.md"])
         record = next(item for item in indexed.value["sources"] if item["path"] == "nested/AGENTS.md")
         self.assertEqual(record["authority"], "candidate-restrict-only")
-        self.assertIsInstance(record["sha256"], str)
+        self.assertIsNone(record["headSha256"])
+        self.assertEqual(len(record["sha256"]), 64)
+        self.assertTrue(indexed.value["candidate"]["coverageComplete"])
+
+    def test_large_ignored_dependency_tree_stays_within_bounded_inventory_output(self) -> None:
+        self.write_large_ignored_dependency_tree()
+
+        self.assertEqual(profile_module.MAX_GIT_PATH_BYTES, 4 * 1024 * 1024)
+        with patch.object(profile_module, "MAX_GIT_PATH_BYTES", 256):
+            with self.assertRaises(OrchestrateError) as legacy:
+                profile_module._git_bytes(
+                    self.root,
+                    "ls-files",
+                    "-z",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                )
+            self.assertEqual(legacy.exception.code, "instruction_inventory_too_large")
+            self.assertEqual(instruction_inventory(self.root), ("AGENTS.md",))
+            profile = setup_project(self.root)
+
+        self.assertEqual(profile.value["instructions"], ["AGENTS.md"])
+
+    def test_more_than_256_conventional_instructions_fail_closed(self) -> None:
+        profile = setup_project(self.root)
+        for index in range(256):
+            directory = self.root / f"pkg{index:03d}"
+            directory.mkdir()
+            (directory / "AGENTS.md").write_text("Nested instruction.\n", encoding="utf-8")
+
+        for operation in (lambda: instruction_inventory(self.root), lambda: build_source_index(profile)):
+            with self.subTest(operation=operation):
+                with self.assertRaises(OrchestrateError) as caught:
+                    operation()
+                self.assertEqual(caught.exception.code, "instruction_inventory_too_large")
+
+    def test_untracked_nested_instruction_is_inventoried_beside_excluded_ignored_sibling(self) -> None:
+        (self.root / ".gitignore").write_text("pkg/node_modules/\n", encoding="utf-8")
+        git(self.root, "add", ".gitignore")
+        git(self.root, "commit", "-qm", "ignore nested dependencies")
+        (self.root / "pkg" / "node_modules" / "dep").mkdir(parents=True)
+        (self.root / "pkg" / "AGENTS.md").write_text("Package restriction.\n", encoding="utf-8")
+        (self.root / "pkg" / "node_modules" / "dep" / "AGENTS.md").write_text(
+            "Ignored dependency text.\n",
+            encoding="utf-8",
+        )
+        profile = setup_project(self.root)
+
+        indexed = build_source_index(profile)
+
+        self.assertEqual(indexed.value["instructionInventory"], ["AGENTS.md", "pkg/AGENTS.md"])
+        record = next(item for item in indexed.value["sources"] if item["path"] == "pkg/AGENTS.md")
+        self.assertEqual(record["authority"], "candidate-restrict-only")
+        self.assertNotIn(
+            "pkg/node_modules/dep/AGENTS.md",
+            [item["path"] for item in indexed.value["sources"]],
+        )
         self.assertTrue(indexed.value["candidate"]["coverageComplete"])
 
     def test_selected_non_conventional_instruction_is_read_and_routed_as_authority(self) -> None:

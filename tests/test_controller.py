@@ -45,6 +45,9 @@ from orchestrate.sources import build_source_index
 from orchestrate.state import AdmissionEffectFence, StateStore
 
 
+LIVENESS_TIMEOUT = 120.0  # Outer deadlock detector, not a semantic progress budget.
+
+
 def git(root: Path, *arguments: str) -> bytes:
     return subprocess.run(("git", "-C", str(root), *arguments), check=True, capture_output=True).stdout
 
@@ -1238,7 +1241,7 @@ def identity_responses(
     ]
 
 
-class ControllerTests(unittest.TestCase):
+class MilestoneRepo(unittest.TestCase):
     def setUp(self) -> None:
         self.project_temp = tempfile.TemporaryDirectory()
         self.state_temp = tempfile.TemporaryDirectory()
@@ -1320,6 +1323,8 @@ class ControllerTests(unittest.TestCase):
         git(self.root, "commit", "-qm", "add milestone plan")
         return relative
 
+
+class ControllerTests(MilestoneRepo):
     def test_production_controller_executes_tracked_native_milestone_plan(self) -> None:
         objective = "Integrate the exact bounded milestone"
         plan = self._write_milestone_plan(objective)
@@ -3155,14 +3160,16 @@ class ControllerTests(unittest.TestCase):
         before = self._answer_guard_snapshot(local_id)
         answer_inside_fence = threading.Event()
         release_answer = threading.Event()
+        answer_exited_fence = threading.Event()
         preflight_at_fence = threading.Event()
+        answer_thread: dict[str, int | None] = {"identity": None}
         preflight_thread: dict[str, int | None] = {"identity": None}
 
         class BlockingAnswerClient(FakeClient):
             def run_json(self, *arguments: str, **kwargs: object) -> dict[str, object]:
                 if arguments[:2] == ("orchestration", "run-use"):
                     answer_inside_fence.set()
-                    if not release_answer.wait(5):
+                    if not release_answer.wait(LIVENESS_TIMEOUT):
                         raise AssertionError("answer effect interval was not released")
                 return super().run_json(*arguments, **kwargs)
 
@@ -3179,13 +3186,26 @@ class ControllerTests(unittest.TestCase):
             packet = store.get_packet(local_id, "task_1")
         second_client = RealPreflightClient(self.root, packet, current_shape=True)
         original_enter = AdmissionEffectFence.__enter__
+        original_exit = AdmissionEffectFence.__exit__
 
         def observed_enter(fence: AdmissionEffectFence) -> AdmissionEffectFence:
             if threading.get_ident() == preflight_thread["identity"]:
+                fence.timeout_seconds = LIVENESS_TIMEOUT
                 preflight_at_fence.set()
             return original_enter(fence)  # type: ignore[return-value]
 
+        def observed_exit(
+            fence: AdmissionEffectFence,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: object,
+        ) -> None:
+            original_exit(fence, exc_type, exc, traceback)  # type: ignore[arg-type]
+            if threading.get_ident() == answer_thread["identity"]:
+                answer_exited_fence.set()
+
         def run_answer() -> dict[str, object]:
+            answer_thread["identity"] = threading.get_ident()
             return answer(
                 self.root,
                 "run_1",
@@ -3208,20 +3228,25 @@ class ControllerTests(unittest.TestCase):
                 platform="win32",
             )
 
-        with patch.object(AdmissionEffectFence, "__enter__", observed_enter), ThreadPoolExecutor(
+        with patch.object(AdmissionEffectFence, "__enter__", observed_enter), patch.object(
+            AdmissionEffectFence,
+            "__exit__",
+            observed_exit,
+        ), ThreadPoolExecutor(
             max_workers=2,
         ) as executor:
             answer_future = executor.submit(run_answer)
-            self.assertTrue(answer_inside_fence.wait(5))
+            self.assertTrue(answer_inside_fence.wait(LIVENESS_TIMEOUT))
             preflight_future = executor.submit(run_second_preflight)
-            self.assertTrue(preflight_at_fence.wait(5))
+            self.assertTrue(preflight_at_fence.wait(LIVENESS_TIMEOUT))
             self.assertFalse(preflight_future.done())
             self.assertEqual(self._answer_guard_snapshot(local_id), before)
             release_answer.set()
 
-            answered = answer_future.result(timeout=5)
+            self.assertTrue(answer_exited_fence.wait(LIVENESS_TIMEOUT))
+            answered = answer_future.result(timeout=LIVENESS_TIMEOUT)
             with self.assertRaises(OrchestrateError) as rejected:
-                preflight_future.result(timeout=5)
+                preflight_future.result(timeout=LIVENESS_TIMEOUT)
 
         self.assertEqual(answered["admission"], "admitted")
         self.assertEqual(answered["pendingQuestions"], [])

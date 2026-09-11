@@ -20,6 +20,7 @@ PROFILE_SCHEMA = "orchestrate-profile/v1"
 PROFILE_NAME = ".orchestrate.json"
 PROFILE_SELECTION_SCHEMA = "orchestrate-operational-profile-selection/v1"
 INSTRUCTION_NAMES = ("AGENTS.md", "CLAUDE.md")
+INSTRUCTION_PATHSPECS = tuple(f":(top,glob)**/{name}" for name in INSTRUCTION_NAMES)
 MAX_INSTRUCTION_PATHS = 256
 MAX_GIT_PATH_BYTES = 4 * 1024 * 1024
 TASK_ENTRYPOINTS = (
@@ -70,15 +71,13 @@ def find_project_root(start: Path) -> Path:
     return _find_repo_root(start)
 
 
-def _git_bytes(root: Path, *arguments: str, allow_failure: bool = False) -> bytes | None:
+def _git_bytes(root: Path, *arguments: str) -> bytes:
     completed = subprocess.run(
         ("git", "-C", os.fspath(root), *arguments),
         capture_output=True,
         check=False,
     )
     if completed.returncode:
-        if allow_failure:
-            return None
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
         raise OrchestrateError(f"Git instruction inventory failed: {detail}", code="git_inspection_failed")
     if len(completed.stdout) > MAX_GIT_PATH_BYTES:
@@ -90,32 +89,38 @@ def _git_bytes(root: Path, *arguments: str, allow_failure: bool = False) -> byte
 
 
 def instruction_inventory(root: Path) -> tuple[str, ...]:
-    """List conventional tracked, untracked, and ignored instruction files."""
+    """List tracked and ordinary untracked conventional instructions at any depth.
+
+    Ignored files are excluded. An ignored or non-conventional instruction
+    participates only when the operational profile selects it explicitly and
+    that profile selection has been acknowledged.
+    """
 
     repo = _find_repo_root(root)
-    commands = (
-        ("ls-files", "-z", "--cached"),
-        ("ls-files", "-z", "--others", "--exclude-standard"),
-        ("ls-files", "-z", "--others", "--ignored", "--exclude-standard"),
+    raw = _git_bytes(
+        repo,
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "--",
+        *INSTRUCTION_PATHSPECS,
     )
-    paths: set[str] = set()
-    for arguments in commands:
-        raw = _git_bytes(repo, *arguments)
-        assert raw is not None
-        try:
-            names = raw.decode("utf-8", errors="strict").split("\0")
-        except UnicodeDecodeError as exc:
-            raise OrchestrateError("Git instruction paths are not strict UTF-8", code="git_path_encoding") from exc
-        paths.update(
-            name.replace("\\", "/")
-            for name in names
-            if name and Path(name).name in INSTRUCTION_NAMES
+    try:
+        names = raw.decode("utf-8", errors="strict").split("\0")
+    except UnicodeDecodeError as exc:
+        raise OrchestrateError("Git instruction paths are not strict UTF-8", code="git_path_encoding") from exc
+    paths = {
+        name.replace("\\", "/")
+        for name in names
+        if name and Path(name).name in INSTRUCTION_NAMES
+    }
+    if len(paths) > MAX_INSTRUCTION_PATHS:
+        raise OrchestrateError(
+            f"More than {MAX_INSTRUCTION_PATHS} conventional instruction files require an explicit scope decision",
+            code="instruction_inventory_too_large",
         )
-        if len(paths) > MAX_INSTRUCTION_PATHS:
-            raise OrchestrateError(
-                f"More than {MAX_INSTRUCTION_PATHS} conventional instruction files require an explicit scope decision",
-                code="instruction_inventory_too_large",
-            )
     return tuple(sorted(paths))
 
 

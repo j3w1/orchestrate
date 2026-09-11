@@ -20,6 +20,9 @@ from orchestrate.sources import build_source_index
 from orchestrate.state import AdmissionEffectFence, StateStore
 
 
+LIVENESS_TIMEOUT = 120.0  # Outer deadlock detector, not a semantic progress budget.
+
+
 def git(root: Path, *arguments: str) -> None:
     subprocess.run(("git", "-C", str(root), *arguments), check=True, capture_output=True)
 
@@ -224,41 +227,60 @@ class AdmissionTests(unittest.TestCase):
     def test_two_concurrent_public_preflights_cannot_both_receive_fresh_grants(self) -> None:
         first_inside_fence = threading.Event()
         release_first = threading.Event()
+        first_exited_fence = threading.Event()
         second_at_fence = threading.Event()
+        first_thread: dict[str, int | None] = {"identity": None}
         second_thread: dict[str, int | None] = {"identity": None}
 
         class BlockingFirstClient(PreflightClient):
             def run_json(self, *arguments: str, **kwargs: object) -> dict[str, object]:
                 if arguments[:2] == ("terminal", "show"):
                     first_inside_fence.set()
-                    if not release_first.wait(5):
+                    if not release_first.wait(LIVENESS_TIMEOUT):
                         raise AssertionError("first preflight was not released")
                 return super().run_json(*arguments, **kwargs)
 
         original_enter = AdmissionEffectFence.__enter__
+        original_exit = AdmissionEffectFence.__exit__
 
         def observed_enter(fence: AdmissionEffectFence) -> AdmissionEffectFence:
             if threading.get_ident() == second_thread["identity"]:
+                fence.timeout_seconds = LIVENESS_TIMEOUT
                 second_at_fence.set()
             return original_enter(fence)  # type: ignore[return-value]
+
+        def observed_exit(
+            fence: AdmissionEffectFence,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: object,
+        ) -> None:
+            original_exit(fence, exc_type, exc, traceback)  # type: ignore[arg-type]
+            if threading.get_ident() == first_thread["identity"]:
+                first_exited_fence.set()
 
         first_client = BlockingFirstClient(self.root, self.packet)
         second_client = PreflightClient(self.root, self.packet)
 
         def first_preflight() -> dict[str, object]:
+            first_thread["identity"] = threading.get_ident()
             return self._preflight("dispatch_1", first_client)
 
         def second_preflight() -> dict[str, object]:
             second_thread["identity"] = threading.get_ident()
             return self._preflight("dispatch_2", second_client)
 
-        with patch.object(AdmissionEffectFence, "__enter__", observed_enter), ThreadPoolExecutor(
+        with patch.object(AdmissionEffectFence, "__enter__", observed_enter), patch.object(
+            AdmissionEffectFence,
+            "__exit__",
+            observed_exit,
+        ), ThreadPoolExecutor(
             max_workers=2,
         ) as executor:
             first = executor.submit(first_preflight)
-            self.assertTrue(first_inside_fence.wait(5))
+            self.assertTrue(first_inside_fence.wait(LIVENESS_TIMEOUT))
             second = executor.submit(second_preflight)
-            self.assertTrue(second_at_fence.wait(5))
+            self.assertTrue(second_at_fence.wait(LIVENESS_TIMEOUT))
             self.assertFalse(second.done())
             self.assertEqual(self._stored_rows(), [])
             # The waiting preflight loaded the earlier unbound Run, then the
@@ -268,9 +290,10 @@ class AdmissionTests(unittest.TestCase):
                 store.update_run(self.local_id, dispatch_id="dispatch_1")
             release_first.set()
 
-            self.assertEqual(first.result(timeout=5)["editingGrant"], "fresh")
+            self.assertTrue(first_exited_fence.wait(LIVENESS_TIMEOUT))
+            self.assertEqual(first.result(timeout=LIVENESS_TIMEOUT)["editingGrant"], "fresh")
             with self.assertRaises(OrchestrateError) as rejected:
-                second.result(timeout=5)
+                second.result(timeout=LIVENESS_TIMEOUT)
 
         self.assertEqual(rejected.exception.code, "preflight_rejected")
         self.assertEqual(rejected.exception.data["cause"], "preflight_identity_conflict")  # type: ignore[index]
