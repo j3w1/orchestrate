@@ -14,7 +14,7 @@ from unittest.mock import patch
 from orchestrate.admission import joined_preflight_status, other_dispatch_observations, worker_preflight
 from orchestrate.errors import OrchestrateError
 from orchestrate.packets import canonical_packet_json, make_packet, packet_spec
-from orchestrate.profile import setup_project
+from orchestrate.profile import INSTRUCTION_PATHSPECS, setup_project
 from orchestrate.readers import read_project
 from orchestrate.sources import build_source_index
 from orchestrate.state import AdmissionEffectFence, StateStore
@@ -167,11 +167,11 @@ class AdmissionTests(unittest.TestCase):
         self.project.cleanup()
         self.state.cleanup()
 
-    def _run(self) -> dict[str, object]:
+    def _run(self, client: PreflightClient | None = None) -> dict[str, object]:
         return worker_preflight(
             self.root,
             run_id="run_1", task_id="task_1", dispatch_id="dispatch_1",
-            packet_id=str(self.packet["packetId"]), client=PreflightClient(self.root, self.packet),
+            packet_id=str(self.packet["packetId"]), client=client or PreflightClient(self.root, self.packet),
             environment={"ORCA_TERMINAL_HANDLE": "term_worker"}, platform="win32",  # type: ignore[arg-type]
         )
 
@@ -473,9 +473,21 @@ class AdmissionTests(unittest.TestCase):
     def test_rejected_then_restored_sources_never_become_admitted(self) -> None:
         original = (self.root / "AGENTS.md").read_bytes()
         (self.root / "AGENTS.md").write_text("Drifted.\n", encoding="utf-8")
-        with self.assertRaises(OrchestrateError) as rejected:
-            self._run()
+        client = PreflightClient(self.root, self.packet)
+        with patch("subprocess.run", wraps=subprocess.run) as subprocess_calls:
+            with self.assertRaises(OrchestrateError) as rejected:
+                self._run(client)
         self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(rejected.exception.data["cause"], "source_binding_changed")  # type: ignore[index]
+        self.assertEqual(len(subprocess_calls.call_args_list), 1)
+        self.assertEqual(
+            subprocess_calls.call_args.args[0],
+            (
+                "git", "-C", str(self.root), "ls-files", "-z", "--cached",
+                "--others", "--exclude-standard", "--", *INSTRUCTION_PATHSPECS,
+            ),
+        )
+        self.assertEqual(client.calls, [])
         (self.root / "AGENTS.md").write_bytes(original)
         with self.assertRaises(OrchestrateError) as restored:
             self._run()
@@ -483,6 +495,80 @@ class AdmissionTests(unittest.TestCase):
         with StateStore(self.root) as store:
             observed = store.get_preflight(self.local_id, "task_1", "dispatch_1")
         self.assertEqual(observed["outcome"], "rejected")  # type: ignore[index]
+
+    def test_acknowledged_selected_instruction_drift_rejects_before_any_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git(root, "init", "-q")
+            git(root, "config", "user.email", "fixture@example.invalid")
+            git(root, "config", "user.name", "Fixture")
+            instruction = root / "AGENTS.md"
+            instruction.write_text("Acknowledged instruction.\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+            git(root, "add", ".")
+            git(root, "commit", "-qm", "fixture")
+            setup_project(root)
+            profile = setup_project(root, acknowledge_profile=True)
+            self.assertEqual(profile.selection_source, "explicit-configuration-acknowledgment")
+            reader = read_project(profile, "Implement bounded change")
+            sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+            with StateStore(root) as store:
+                run = store.create_run(
+                    objective="Implement bounded change",
+                    profile_digest=profile.digest,
+                    source_digest=sources.digest,
+                )
+                run = store.update_run(
+                    run.local_id,
+                    native_run_id="run_1",
+                    task_id="task_1",
+                    phase="awaiting_preflight",
+                )
+                local_id = run.local_id
+                packet = make_packet(
+                    objective=run.objective,
+                    profile=profile,
+                    sources=sources,
+                    launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+                    python_executable=str(Path(sys.executable).resolve()),
+                    run_id="run_1",
+                    reader=reader,
+                )
+                store.save_packet(run.local_id, "task_1", canonical_packet_json(packet))
+                store.record_worker_resource_binding(
+                    run.local_id,
+                    dispatch_id="dispatch_1",
+                    resource_id="terminal-resource-1",
+                    terminal_handle="term_worker",
+                    worktree_id=f"repo::{root.resolve()}",
+                    readback={"fixture": "validated-start-readback"},
+                )
+
+            instruction.write_text("Drifted after acknowledgment.\n", encoding="utf-8")
+            client = PreflightClient(root, packet)
+            with patch("subprocess.run", side_effect=AssertionError("no subprocess is allowed")) as called:
+                with self.assertRaises(OrchestrateError) as rejected:
+                    worker_preflight(
+                        root,
+                        run_id="run_1",
+                        task_id="task_1",
+                        dispatch_id="dispatch_1",
+                        packet_id=str(packet["packetId"]),
+                        client=client,
+                        environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                        platform="win32",
+                    )
+            self.assertEqual(rejected.exception.code, "preflight_rejected")
+            self.assertEqual(rejected.exception.data["cause"], "source_binding_changed")  # type: ignore[index]
+            called.assert_not_called()
+            self.assertEqual(client.calls, [])
+            with StateStore(root) as store:
+                observed = store.get_preflight(local_id, "task_1", "dispatch_1")
+            self.assertEqual(observed["outcome"], "rejected")  # type: ignore[index]
+            self.assertEqual(
+                observed["mismatches"][0]["code"],  # type: ignore[index]
+                "source_binding_changed",
+            )
 
     def test_wrong_packet_identity_records_rejection_without_native_calls(self) -> None:
         client = PreflightClient(self.root, self.packet)

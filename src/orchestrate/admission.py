@@ -21,7 +21,11 @@ from .packets import (
     expected_packet_id,
     packet_spec_from_json,
 )
-from .profile import ProjectProfile
+from .profile import (
+    INSTRUCTION_NAMES,
+    PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE,
+    ProjectProfile,
+)
 from .readers import CE_QUERY_SCRIPT, ReaderResult, read_project
 from .safeio import approved_project_path, read_project_bytes
 from .sources import SourceIndex, build_source_index
@@ -71,7 +75,13 @@ def _verify_packet_source_bytes(
     profile: ProjectProfile,
     packet: Mapping[str, Any],
 ) -> dict[str, dict[str, Any]]:
-    """Compare packet bytes, rejecting non-instruction drift before subprocesses."""
+    """Compare packet bytes without reading unacknowledged instruction sources.
+
+    Non-instruction sources and explicitly acknowledged selected instructions
+    are safe to verify before the bounded Git inventory. Every other
+    instruction-class source waits for that inventory to prove that Git still
+    exposes it as conventional authority.
+    """
 
     records = packet.get("sources")
     if (
@@ -101,7 +111,15 @@ def _verify_packet_source_bytes(
         prepared.append((path, expected_sha, expected_bytes))
 
     selected_instructions = set(profile.value["instructions"])
+    acknowledged_instructions = (
+        selected_instructions
+        if profile.selection_source == PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE
+        else set()
+    )
     identities: dict[str, dict[str, Any]] = {}
+
+    def is_instruction_source(path: str) -> bool:
+        return path in selected_instructions or Path(path).name in INSTRUCTION_NAMES
 
     def verify(prepared_source: tuple[str, str | None, int]) -> None:
         path, expected_sha, expected_bytes = prepared_source
@@ -121,12 +139,29 @@ def _verify_packet_source_bytes(
         identities[path] = identity
 
     for prepared_source in prepared:
-        if prepared_source[0] not in selected_instructions:
+        path = prepared_source[0]
+        if not is_instruction_source(path) or path in acknowledged_instructions:
             verify(prepared_source)
 
-    profile.require_instruction_acknowledgment()
+    current_instructions = set(profile.require_instruction_acknowledgment())
+    unacknowledged_packet_instructions = sorted(
+        path
+        for path, _expected_sha, _expected_bytes in prepared
+        if (
+            is_instruction_source(path)
+            and path not in current_instructions
+            and path not in acknowledged_instructions
+        )
+    )
+    if unacknowledged_packet_instructions:
+        raise OrchestrateError(
+            "Packet-bound instructions outside the current conventional inventory require explicit selection and acknowledgment; review .orchestrate.json and rerun 'orchestrate setup --acknowledge-profile'",
+            code="instruction_acknowledgment_required",
+            data={"packetInstructionPaths": unacknowledged_packet_instructions},
+        )
     for prepared_source in prepared:
-        if prepared_source[0] in selected_instructions:
+        path = prepared_source[0]
+        if is_instruction_source(path) and path not in acknowledged_instructions:
             verify(prepared_source)
     return identities
 
