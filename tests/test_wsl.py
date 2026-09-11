@@ -53,7 +53,7 @@ class WslForwardingTests(unittest.TestCase):
         self.assertEqual(invocation.argv, arguments)
 
     def test_windows_receiver_gets_one_canonical_context_and_preserves_exit(self) -> None:
-        invocation = make_invocation(distro="Arch", linux_cwd="/home/iqbal/源 code", argv=("status", "--json"))
+        invocation = make_invocation(distro="Arch", linux_cwd="/home/user/源 code", argv=("status", "--json"))
         observed: list[object] = []
         code = receive_on_windows(
             encode_invocation(invocation),
@@ -62,7 +62,7 @@ class WslForwardingTests(unittest.TestCase):
         )
         self.assertEqual(code, 19)
         self.assertEqual(observed, [invocation])
-        self.assertEqual(windows_unc_path(invocation), r"\\wsl.localhost\Arch\home\iqbal\源 code")
+        self.assertEqual(windows_unc_path(invocation), r"\\wsl.localhost\Arch\home\user\源 code")
 
     def test_linux_launcher_creates_no_second_state_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
