@@ -71,7 +71,7 @@ def _verify_packet_source_bytes(
     profile: ProjectProfile,
     packet: Mapping[str, Any],
 ) -> dict[str, dict[str, Any]]:
-    """Compare packet-bound profile/source bytes before invoking any subprocess."""
+    """Compare packet bytes, rejecting non-instruction drift before subprocesses."""
 
     records = packet.get("sources")
     if (
@@ -80,7 +80,8 @@ def _verify_packet_source_bytes(
         or not isinstance(records, list)
     ):
         raise OrchestrateError("Bound operational profile changed", code="source_binding_changed")
-    identities: dict[str, dict[str, Any]] = {}
+    prepared: list[tuple[str, str | None, int]] = []
+    seen: set[str] = set()
     for record in records:
         if not isinstance(record, Mapping):
             raise OrchestrateError("Worker packet source identity is malformed", code="packet_identity_conflict")
@@ -90,12 +91,20 @@ def _verify_packet_source_bytes(
         if (
             not isinstance(path, str)
             or not path
-            or path in identities
+            or path in seen
             or (expected_sha is not None and not isinstance(expected_sha, str))
             or type(expected_bytes) is not int
             or expected_bytes < 0
         ):
             raise OrchestrateError("Worker packet source identity is malformed", code="packet_identity_conflict")
+        seen.add(path)
+        prepared.append((path, expected_sha, expected_bytes))
+
+    selected_instructions = set(profile.value["instructions"])
+    identities: dict[str, dict[str, Any]] = {}
+
+    def verify(prepared_source: tuple[str, str | None, int]) -> None:
+        path, expected_sha, expected_bytes = prepared_source
         candidate = approved_project_path(profile.root, path, require_file=False)
         if expected_sha is None:
             if candidate.exists() or expected_bytes != 0:
@@ -110,6 +119,15 @@ def _verify_packet_source_bytes(
             if identity != {"sha256": expected_sha, "bytes": expected_bytes}:
                 raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed")
         identities[path] = identity
+
+    for prepared_source in prepared:
+        if prepared_source[0] not in selected_instructions:
+            verify(prepared_source)
+
+    profile.require_instruction_acknowledgment()
+    for prepared_source in prepared:
+        if prepared_source[0] in selected_instructions:
+            verify(prepared_source)
     return identities
 
 
@@ -390,7 +408,7 @@ def worker_preflight(
     environment: Mapping[str, str] | None = None,
     platform: str | None = None,
 ) -> JsonObject:
-    profile = ProjectProfile.load(root)
+    profile = ProjectProfile._load_for_packet_source_preflight(root)
     env = os.environ if environment is None else environment
     selected_platform = sys.platform if platform is None else platform
     with StateStore(profile.root) as store:

@@ -11,7 +11,7 @@ import subprocess
 from typing import Any
 
 from .errors import OrchestrateError
-from .profile import INSTRUCTION_NAMES, PROFILE_NAME, ProjectProfile, instruction_inventory
+from .profile import INSTRUCTION_NAMES, PROFILE_NAME, ProjectProfile
 from .safeio import approved_project_path, is_sensitive_source, read_project_bytes
 
 
@@ -97,8 +97,14 @@ def _index_bytes(root: Path, relative: str) -> bytes | None:
 
 def build_source_index(profile: ProjectProfile, *, extra_sources: set[str] | None = None) -> SourceIndex:
     root = profile.root
+    for relative in profile.value["instructions"]:
+        if is_sensitive_source(relative):
+            raise OrchestrateError(
+                f"Secret-bearing source is excluded: {relative}",
+                code="secret_source_excluded",
+            )
+    instructions = set(profile.require_instruction_acknowledgment())
     status = _status_map(root)
-    instructions = set(instruction_inventory(root))
     configured = {
         *profile.value["instructions"],
         *instructions,

@@ -13,7 +13,7 @@ import subprocess
 from typing import Any
 
 from .errors import OrchestrateError
-from .profile import ProjectProfile, instruction_inventory
+from .profile import ProjectProfile
 from .safeio import approved_project_path
 from .sources import read_project_text, read_source_text
 
@@ -411,9 +411,10 @@ def read_project(
     *,
     expected_ce_query_sources: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> ReaderResult:
+    current_instructions = profile.require_instruction_acknowledgment()
     instruction_paths = sorted({
         *profile.value["instructions"],
-        *instruction_inventory(profile.root),
+        *current_instructions,
     })
     instructions = {
         relative: read_project_text(profile, relative)

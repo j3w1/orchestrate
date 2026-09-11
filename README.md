@@ -24,7 +24,7 @@ The ordinary path is deliberately single-owner-first. When a reviewed milestone 
 
 The project keeps one small tracked profile and one host-local database.
 
-First, `orchestrate setup` discovers familiar project entrypoints without running hooks, checks, or models. Conventional `AGENTS.md` and `CLAUDE.md` discovery is a single case-sensitive Git pathspec-filtered inventory: at most 256 tracked and ordinary untracked matches at any depth, with strict UTF-8 and byte limits. Ignored dependency trees do not become authority by accident. An ignored or non-conventional instruction participates only when you select its repository-relative path in `instructions`, review the profile, and run `setup --acknowledge-profile`.
+First, `orchestrate setup` discovers familiar project entrypoints without running hooks, checks, or models. Conventional `AGENTS.md` and `CLAUDE.md` discovery is a single case-sensitive Git pathspec-filtered inventory: at most 256 tracked and ordinary untracked matches at any depth, with strict UTF-8 and byte limits. Ignored dependency trees do not become authority by accident. Any selected instruction outside the current conventional inventory—including one hidden by a later ignore rule—holds before its bytes are read until you review the profile and run `setup --acknowledge-profile`.
 
 Next, `orchestrate implement` reads the selected sources, binds the exact candidate, and prepares a compact worker packet. Dirty paths it was not authorized to read remain opaque and hold dispatch. The worker must pass a Dispatch-bound preflight before its result can count.
 
@@ -97,7 +97,7 @@ Review `.orchestrate.json`, especially its instruction and task entrypoints, req
 orchestrate setup --acknowledge-profile --json
 ```
 
-Committing the file is ordinary candidate history, not a configuration acknowledgment. Then give one concrete, already-authorized objective:
+Committing the file is ordinary candidate history, not a configuration acknowledgment. The same acknowledgment command records reviewed provenance when the selected profile bytes are unchanged, which is the cure when an existing selected instruction becomes ignored. Then give one concrete, already-authorized objective:
 
 ```powershell
 orchestrate implement "Fix the parser regression and run the profile checks" --json

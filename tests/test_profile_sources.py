@@ -25,8 +25,12 @@ from orchestrate.safeio import read_project_bytes
 from orchestrate.sources import build_source_index
 
 
-def git(root: Path, *arguments: str) -> None:
-    subprocess.run(("git", "-C", str(root), *arguments), check=True, capture_output=True)
+def git(root: Path, *arguments: str) -> bytes:
+    return subprocess.run(
+        ("git", "-C", str(root), *arguments),
+        check=True,
+        capture_output=True,
+    ).stdout
 
 
 class DisposableRepo(unittest.TestCase):

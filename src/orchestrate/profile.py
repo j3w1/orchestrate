@@ -19,6 +19,8 @@ from .state import RunLock, make_private_state_directory, project_key, require_p
 PROFILE_SCHEMA = "orchestrate-profile/v1"
 PROFILE_NAME = ".orchestrate.json"
 PROFILE_SELECTION_SCHEMA = "orchestrate-operational-profile-selection/v1"
+PROFILE_SELECTION_INITIAL_SOURCE = "initial-setup-selection"
+PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE = "explicit-configuration-acknowledgment"
 INSTRUCTION_NAMES = ("AGENTS.md", "CLAUDE.md")
 INSTRUCTION_PATHSPECS = tuple(f":(top,glob)**/{name}" for name in INSTRUCTION_NAMES)
 MAX_INSTRUCTION_PATHS = 256
@@ -186,7 +188,10 @@ def _selection_record(root: Path) -> tuple[dict[str, Any], str]:
             or not isinstance(entry.get("digest"), str)
             or not isinstance(entry.get("selectedRaw"), str)
             or not isinstance(entry.get("selectedAt"), str)
-            or entry.get("source") not in {"initial-setup-selection", "explicit-configuration-acknowledgment"}
+            or entry.get("source") not in {
+                PROFILE_SELECTION_INITIAL_SOURCE,
+                PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE,
+            }
         ):
             raise OrchestrateError(
                 "The host-local operational profile selection history is invalid",
@@ -251,14 +256,21 @@ def _write_profile_selection_locked(
     if path.exists():
         record, _ = _selection_record(root)
         if record["activeDigest"] == digest:
-            return
-        if not acknowledge:
-            raise OrchestrateError(
-                "The project profile differs from the selected operational configuration; review it and rerun setup with --acknowledge-profile",
-                code="profile_selection_changed",
-                data={"selectedDigest": record["activeDigest"], "candidateDigest": digest},
+            active = next(
+                entry
+                for entry in reversed(record["history"])
+                if entry["digest"] == record["activeDigest"]
             )
-        source = "explicit-configuration-acknowledgment"
+            if not acknowledge or active["source"] == PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE:
+                return
+        else:
+            if not acknowledge:
+                raise OrchestrateError(
+                    "The project profile differs from the selected operational configuration; review it and rerun setup with --acknowledge-profile",
+                    code="profile_selection_changed",
+                    data={"selectedDigest": record["activeDigest"], "candidateDigest": digest},
+                )
+        source = PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE
     else:
         if not allow_initial and not acknowledge:
             raise OrchestrateError(
@@ -271,7 +283,11 @@ def _write_profile_selection_locked(
             "activeDigest": digest,
             "history": [],
         }
-        source = "initial-setup-selection" if allow_initial else "explicit-configuration-acknowledgment"
+        source = (
+            PROFILE_SELECTION_INITIAL_SOURCE
+            if allow_initial
+            else PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE
+        )
     record["activeDigest"] = digest
     record["history"].append(
         {
@@ -391,12 +407,42 @@ class ProjectProfile:
     selection_history_digest: str
     candidate_changed: bool
 
+    def require_instruction_acknowledgment(self) -> tuple[str, ...]:
+        """Return current conventional instructions or hold unreviewed selections."""
+
+        current = instruction_inventory(self.root)
+        unacknowledged: list[str] = []
+        for relative in sorted(set(self.value["instructions"]) - set(current)):
+            path = approved_project_path(self.root, relative, require_file=False)
+            if path.is_file():
+                unacknowledged.append(relative)
+        if (
+            unacknowledged
+            and self.selection_source != PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE
+        ):
+            raise OrchestrateError(
+                "Selected instructions outside the current conventional inventory require explicit acknowledgment; review .orchestrate.json and rerun 'orchestrate setup --acknowledge-profile'",
+                code="instruction_acknowledgment_required",
+                data={"selectedPaths": unacknowledged},
+            )
+        return current
+
     @classmethod
-    def load(
+    def _load_for_packet_source_preflight(cls, root: Path) -> "ProjectProfile":
+        """Load source metadata for the pre-subprocess check without reading instructions.
+
+        The caller must require instruction acknowledgment before it reads any
+        selected instruction bytes.
+        """
+
+        return cls._load_selected(root, require_sources=True)
+
+    @classmethod
+    def _load_selected(
         cls,
         root: Path,
         *,
-        require_sources: bool = True,
+        require_sources: bool,
     ) -> "ProjectProfile":
         repo = _find_repo_root(root)
         path = repo / PROFILE_NAME
@@ -417,7 +463,7 @@ class ProjectProfile:
                 code="profile_selection_invalid",
             ) from exc
         operational = validate_profile(selected_value, root=repo, require_sources=require_sources)
-        return cls(
+        profile = cls(
             repo,
             path,
             operational,
@@ -427,6 +473,18 @@ class ProjectProfile:
             selection_history_digest,
             raw != selected_raw,
         )
+        return profile
+
+    @classmethod
+    def load(
+        cls,
+        root: Path,
+        *,
+        require_sources: bool = True,
+    ) -> "ProjectProfile":
+        profile = cls._load_selected(root, require_sources=require_sources)
+        profile.require_instruction_acknowledgment()
+        return profile
 
 
 def setup_project(
