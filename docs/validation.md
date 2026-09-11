@@ -37,6 +37,16 @@ Do not record credentials, private source text, raw environments, personal files
 
 One earlier full-suite run failed once in `AdmissionTests.test_two_concurrent_public_preflights_cannot_both_receive_fresh_grants` because the test treated a five-second wall-clock window as semantic completion. That historical failure remains `FAILED` until a fresh full-suite record on the corrected candidate supersedes it; focused tests alone do not supersede it.
 
+## Known limitations
+
+### Missing selected source before the admission fence
+
+When a packet-bound selected source no longer exists on disk, `worker-preflight` fails with `source_unavailable` during operational-profile loading. That load occurs before the state store is opened, the admission/effect fence is acquired, or an immutable observation is recorded, so the attempt leaves no durable rejected observation; restoring the exact bytes allows a later preflight of the same Dispatch to receive a fresh editing grant. This behavior predates the third increment and is present in the accepted second-increment base `5f250f38bb2defcb01833842c29dea5394c41877`. To reproduce it, build and bind a packet while a selected instruction exists, remove that file, call `worker-preflight`, then restore it byte-for-byte and call `worker-preflight` again for the same Dispatch. The documented immutability guarantee is therefore limited to attempts that reach the fence. Byte drift in a selected source that still exists is unaffected: it reaches the fence and produces a durable rejection, so restoring the bytes cannot turn a replay into admission.
+
+### Incomplete packet source-record prepass
+
+The packet source-record prepass does not validate every mandatory field of the source-index record shape. This behavior predates the third increment and is present in the accepted second-increment base `5f250f38bb2defcb01833842c29dea5394c41877`. To reproduce it, start with a canonical `orchestrate-worker-packet/v3`, keep a source record's `path`, `sha256`, and `bytes` valid, remove another mandatory field such as `authority`, recompute the canonical `packetId`, and retain matching stored-packet and native Task-spec identities. The malformed record passes the prepass and is rejected later as source drift with `source_binding_changed`, after native Orca readbacks, rather than immediately as a packet identity conflict.
+
 ## Cost trial record
 
 For the matched trial, record reported worker tokens, reported coordinator tokens, wall time, repeated work such as retries or duplicate checks, and correctness against the same required checks. Keep unknown token usage as `unknown`; reported usage is not provider billing.
