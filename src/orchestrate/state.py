@@ -20,23 +20,158 @@ from .errors import OrchestrateError
 
 STATE_SCHEMA = "orchestrate-state/v1"
 SYNC_STATE_COMPONENTS = {"box", "dropbox", "google drive", "googledrive", "iclouddrive", "syncthing"}
-STATE_TABLES = {
-    "meta",
-    "runs",
-    "intentions",
-    "worker_resource_bindings",
-    "packets",
-    "preflight_observations",
-    "deliveries",
-    "delivery_messages",
-    "questions",
-    "evidence",
-    "interventions",
-    "milestone_task_bindings",
-    "milestone_plan_bindings",
-    "milestone_gate_bindings",
-    "milestone_worker_bindings",
+REQUIRED_STATE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
+    "meta": frozenset({"key", "value"}),
+    "runs": frozenset(
+        {
+            "local_id",
+            "project_key",
+            "native_run_id",
+            "objective",
+            "profile_digest",
+            "source_digest",
+            "task_id",
+            "dispatch_id",
+            "phase",
+            "worker_outcome",
+            "verification_status",
+            "delivery_id",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "intentions": frozenset(
+        {
+            "id",
+            "run_local_id",
+            "operation",
+            "arguments_json",
+            "request_id",
+            "status",
+            "returncode",
+            "response_json",
+            "error_json",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "worker_resource_bindings": frozenset(
+        {
+            "run_local_id",
+            "dispatch_id",
+            "resource_id",
+            "terminal_handle",
+            "worktree_id",
+            "readback_json",
+            "created_at",
+        }
+    ),
+    "packets": frozenset({"run_local_id", "task_id", "packet_json", "created_at"}),
+    "preflight_observations": frozenset(
+        {
+            "run_local_id",
+            "run_id",
+            "task_id",
+            "dispatch_id",
+            "outcome",
+            "observation_json",
+            "created_at",
+        }
+    ),
+    "deliveries": frozenset(
+        {"run_local_id", "delivery_id", "response_json", "acked", "created_at"}
+    ),
+    "delivery_messages": frozenset(
+        {
+            "run_local_id",
+            "delivery_id",
+            "message_id",
+            "ordinal",
+            "message_type",
+            "payload_json",
+            "effect_status",
+        }
+    ),
+    "questions": frozenset(
+        {"message_id", "run_local_id", "delivery_id", "body", "status", "answer", "updated_at"}
+    ),
+    "evidence": frozenset(
+        {"id", "run_local_id", "kind", "status", "subject", "payload_json", "created_at"}
+    ),
+    "interventions": frozenset(
+        {
+            "run_local_id",
+            "task_key",
+            "record_json",
+            "correction_key",
+            "evidence_digest",
+            "correction_count",
+            "diagnosis_status",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "milestone_task_bindings": frozenset(
+        {
+            "run_local_id",
+            "task_key",
+            "task_id",
+            "candidate_digest",
+            "contract_digest",
+            "spec",
+            "dependencies_json",
+            "created_at",
+        }
+    ),
+    "milestone_plan_bindings": frozenset(
+        {
+            "run_local_id",
+            "relative_path",
+            "plan_digest",
+            "plan_json",
+            "candidate_digest",
+            "contract_digest",
+            "status",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "milestone_gate_bindings": frozenset(
+        {
+            "run_local_id",
+            "task_key",
+            "task_id",
+            "gate_id",
+            "gate_kind",
+            "question",
+            "status",
+            "resolution",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "milestone_worker_bindings": frozenset(
+        {
+            "run_local_id",
+            "task_key",
+            "task_id",
+            "dispatch_id",
+            "role",
+            "agent",
+            "resource_id",
+            "terminal_handle",
+            "worktree_id",
+            "outcome",
+            "result_outcome",
+            "result_digest",
+            "release_state",
+            "readback_json",
+            "created_at",
+            "updated_at",
+        }
+    ),
 }
+STATE_TABLES = frozenset(REQUIRED_STATE_TABLE_COLUMNS)
 
 
 def utc_now() -> str:
@@ -535,6 +670,18 @@ class StateStore(AbstractContextManager["StateStore"]):
                     code="state_schema_migration_required",
                     data={"missingTables": sorted(STATE_TABLES - tables)},
                 )
+            for table, required_columns in REQUIRED_STATE_TABLE_COLUMNS.items():
+                observed_columns = {
+                    row["name"]
+                    for row in self.connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+                }
+                missing_columns = sorted(required_columns - observed_columns)
+                if missing_columns:
+                    raise OrchestrateError(
+                        "Host-local state requires schema migration before read-only reporting",
+                        code="state_schema_migration_required",
+                        data={"table": table, "missingColumns": missing_columns},
+                    )
             schema = self.connection.execute(
                 "SELECT value FROM meta WHERE key = 'schema'"
             ).fetchone()
@@ -547,16 +694,6 @@ class StateStore(AbstractContextManager["StateStore"]):
                 raise OrchestrateError(
                     f"Unsupported host-local state schema: {schema['value']}",
                     code="state_schema_unsupported",
-                )
-            intention_columns = {
-                row["name"]
-                for row in self.connection.execute("PRAGMA table_info(intentions)").fetchall()
-            }
-            if "returncode" not in intention_columns:
-                raise OrchestrateError(
-                    "Host-local state requires schema migration before read-only reporting",
-                    code="state_schema_migration_required",
-                    data={"table": "intentions", "missingColumns": ["returncode"]},
                 )
         except sqlite3.DatabaseError as exc:
             raise OrchestrateError(

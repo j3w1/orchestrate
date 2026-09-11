@@ -10,7 +10,7 @@ import time
 import unittest
 
 from orchestrate.errors import OrchestrateError
-from orchestrate.state import AdmissionEffectFence, StateStore
+from orchestrate.state import AdmissionEffectFence, REQUIRED_STATE_TABLE_COLUMNS, StateStore
 
 
 class StateTests(unittest.TestCase):
@@ -84,6 +84,62 @@ class StateTests(unittest.TestCase):
                 StateStore.open_read_only(root, home=home)
 
             self.assertEqual(caught.exception.code, "state_schema_migration_required")
+
+    def test_required_read_schema_contract_exactly_matches_every_writable_table(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            with StateStore(Path(project_dir), home=Path(home_dir)) as store:
+                observed = {
+                    table: frozenset(
+                        row["name"]
+                        for row in store.connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+                    )
+                    for table in REQUIRED_STATE_TABLE_COLUMNS
+                }
+
+            self.assertEqual(observed, REQUIRED_STATE_TABLE_COLUMNS)
+
+    def test_read_only_open_rejects_every_missing_required_column_with_exact_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            root = Path(project_dir)
+            home_root = Path(home_dir)
+            cases = [
+                (table, column)
+                for table, columns in REQUIRED_STATE_TABLE_COLUMNS.items()
+                for column in sorted(columns)
+            ]
+            for index, (table, missing_column) in enumerate(cases):
+                with self.subTest(table=table, missing_column=missing_column):
+                    home = home_root / f"case-{index}"
+                    with StateStore(root, home=home) as store:
+                        path = store.path
+                        ordered_columns = [
+                            row["name"]
+                            for row in store.connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+                        ]
+                    retained_columns = [column for column in ordered_columns if column != missing_column]
+                    selected = ", ".join(f'"{column}"' for column in retained_columns)
+                    replacement = f"missing_column_{index}"
+                    connection = sqlite3.connect(path)
+                    try:
+                        connection.execute(
+                            f'CREATE TABLE "{replacement}" AS SELECT {selected} FROM "{table}"'
+                        )
+                        connection.execute(f'DROP TABLE "{table}"')
+                        connection.execute(f'ALTER TABLE "{replacement}" RENAME TO "{table}"')
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    before = self._database_files(path)
+
+                    with self.assertRaises(OrchestrateError) as caught:
+                        StateStore.open_read_only(root, home=home)
+
+                    self.assertEqual(caught.exception.code, "state_schema_migration_required")
+                    self.assertEqual(
+                        caught.exception.data,
+                        {"table": table, "missingColumns": [missing_column]},
+                    )
+                    self.assertEqual(self._database_files(path), before)
 
     def test_project_contained_and_recognized_synchronized_state_roots_are_rejected_before_write(self) -> None:
         with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as outside_dir:

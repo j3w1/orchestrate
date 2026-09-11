@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1700,6 +1701,252 @@ class ControllerTests(unittest.TestCase):
                             )
                 finally:
                     restore()
+
+        restored = explain(self.root, local_run_id)
+        self.assertEqual(restored["status"], "worker_succeeded")
+        self.assertEqual(restored["verification"], "review_accepted")
+        self.assertIs(restored["sourceBinding"]["unchanged"], True)
+
+    def test_accepted_review_requires_exact_canonical_plan_and_complete_native_history(self) -> None:
+        objective = "Reject altered or missing milestone plan authority"
+        plan_path = self._write_milestone_plan(objective)
+        accepted = implement(
+            self.root,
+            objective,
+            client=MilestoneClient(self.root),  # type: ignore[arg-type]
+            milestone_plan=plan_path,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        local_run_id = str(accepted["localRunId"])
+        with StateStore(self.root) as store:
+            state_path = store.path
+            plan_row = dict(
+                store.connection.execute(
+                    "SELECT * FROM milestone_plan_bindings WHERE run_local_id = ?",
+                    (local_run_id,),
+                ).fetchone()
+            )
+            plan_schema = store.connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'milestone_plan_bindings'"
+            ).fetchone()["sql"]
+            task_dependencies = {
+                row["task_key"]: row["dependencies_json"]
+                for row in store.connection.execute(
+                    "SELECT task_key, dependencies_json FROM milestone_task_bindings WHERE run_local_id = ?",
+                    (local_run_id,),
+                ).fetchall()
+            }
+            gate_kinds = {
+                row["task_key"]: row["gate_kind"]
+                for row in store.connection.execute(
+                    "SELECT task_key, gate_kind FROM milestone_gate_bindings WHERE run_local_id = ?",
+                    (local_run_id,),
+                ).fetchall()
+            }
+
+        def canonical(value: object) -> str:
+            return json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+
+        def digest(value: str, prefix: str) -> str:
+            return f"{prefix}_sha256_" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+        def replace_plan(value: dict[str, object], *, contract_digest: str | None = None) -> None:
+            encoded = canonical(value)
+            with StateStore(self.root) as store:
+                store.connection.execute(
+                    """UPDATE milestone_plan_bindings
+                       SET plan_json = ?, plan_digest = ?, contract_digest = COALESCE(?, contract_digest)
+                       WHERE run_local_id = ?""",
+                    (encoded, digest(encoded, "plan"), contract_digest, local_run_id),
+                )
+
+        def corrupt(kind: str) -> None:
+            if kind == "duplicate_plan_history":
+                connection = sqlite3.connect(state_path)
+                try:
+                    connection.execute(
+                        "CREATE TABLE milestone_plan_bindings_duplicate AS SELECT * FROM milestone_plan_bindings"
+                    )
+                    connection.execute("DROP TABLE milestone_plan_bindings")
+                    connection.execute(
+                        "ALTER TABLE milestone_plan_bindings_duplicate RENAME TO milestone_plan_bindings"
+                    )
+                    connection.execute(
+                        "INSERT INTO milestone_plan_bindings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        tuple(plan_row.values()),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                return
+            with StateStore(self.root) as store:
+                if kind == "missing_plan_row":
+                    store.connection.execute(
+                        "DELETE FROM milestone_plan_bindings WHERE run_local_id = ?",
+                        (local_run_id,),
+                    )
+                elif kind == "plan_digest_mismatch":
+                    store.connection.execute(
+                        "UPDATE milestone_plan_bindings SET plan_digest = 'plan_sha256_conflict' WHERE run_local_id = ?",
+                        (local_run_id,),
+                    )
+                elif kind == "candidate_digest_mismatch":
+                    store.connection.execute(
+                        "UPDATE milestone_plan_bindings SET candidate_digest = 'candidate_conflict' WHERE run_local_id = ?",
+                        (local_run_id,),
+                    )
+                elif kind == "contract_digest_mismatch":
+                    store.connection.execute(
+                        "UPDATE milestone_plan_bindings SET contract_digest = 'contract_sha256_conflict' WHERE run_local_id = ?",
+                        (local_run_id,),
+                    )
+                elif kind == "noncanonical_plan_json":
+                    noncanonical = json.dumps(json.loads(plan_row["plan_json"]), indent=2)
+                    store.connection.execute(
+                        "UPDATE milestone_plan_bindings SET plan_json = ? WHERE run_local_id = ?",
+                        (noncanonical, local_run_id),
+                    )
+                elif kind == "invalid_plan_json":
+                    store.connection.execute(
+                        "UPDATE milestone_plan_bindings SET plan_json = '{invalid' WHERE run_local_id = ?",
+                        (local_run_id,),
+                    )
+                elif kind == "changed_native_dependencies":
+                    store.connection.execute(
+                        """UPDATE milestone_task_bindings SET dependencies_json = '[]'
+                           WHERE run_local_id = ? AND task_key = 'review'""",
+                        (local_run_id,),
+                    )
+                elif kind == "changed_gate_binding":
+                    store.connection.execute(
+                        """UPDATE milestone_gate_bindings SET gate_kind = 'review'
+                           WHERE run_local_id = ? AND task_key = 'verify'""",
+                        (local_run_id,),
+                    )
+                elif kind == "unbound_task_history":
+                    store.connection.execute(
+                        """INSERT INTO milestone_task_bindings
+                           VALUES (?, 'unbound', 'task_unbound_plan', ?, ?, 'unbound', '[]', '2026-01-01T00:00:00Z')""",
+                        (
+                            local_run_id,
+                            plan_row["candidate_digest"],
+                            plan_row["contract_digest"],
+                        ),
+                    )
+                elif kind in {"changed_plan_contract", "changed_plan_task_topology"}:
+                    pass
+                else:
+                    raise AssertionError(kind)
+            original_value = json.loads(plan_row["plan_json"])
+            if kind == "changed_plan_contract":
+                changed_contract = {"interface": "frozen-v2", "checks": ["focused", "changed"]}
+                original_value["contract"] = changed_contract
+                replace_plan(
+                    original_value,
+                    contract_digest=digest(canonical(changed_contract), "contract"),
+                )
+            elif kind == "changed_plan_task_topology":
+                tasks = original_value["tasks"]
+                assert isinstance(tasks, list)
+                reviewer = next(task for task in tasks if task["key"] == "review")
+                reviewer["dependencies"].append("verify_extra")
+                tasks.insert(
+                    -1,
+                    {
+                        "key": "verify_extra",
+                        "title": "Verify an altered topology",
+                        "spec": "Read only the altered topology.",
+                        "role": "specialist",
+                        "dependencies": ["owner"],
+                        "gate": "verification",
+                    },
+                )
+                replace_plan(original_value)
+
+        def restore(*, duplicate_schema: bool = False) -> None:
+            if duplicate_schema:
+                connection = sqlite3.connect(state_path)
+                try:
+                    connection.execute("ALTER TABLE milestone_plan_bindings RENAME TO corrupt_plan_bindings")
+                    connection.execute(plan_schema)
+                    connection.execute(
+                        "INSERT INTO milestone_plan_bindings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        tuple(plan_row.values()),
+                    )
+                    connection.execute("DROP TABLE corrupt_plan_bindings")
+                    connection.commit()
+                finally:
+                    connection.close()
+                return
+            with StateStore(self.root) as store:
+                store.connection.execute(
+                    "DELETE FROM milestone_plan_bindings WHERE run_local_id = ?",
+                    (local_run_id,),
+                )
+                store.connection.execute(
+                    "INSERT INTO milestone_plan_bindings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    tuple(plan_row.values()),
+                )
+                store.connection.execute(
+                    "DELETE FROM milestone_task_bindings WHERE run_local_id = ? AND task_key = 'unbound'",
+                    (local_run_id,),
+                )
+                for task_key, dependencies_json in task_dependencies.items():
+                    store.connection.execute(
+                        """UPDATE milestone_task_bindings SET dependencies_json = ?
+                           WHERE run_local_id = ? AND task_key = ?""",
+                        (dependencies_json, local_run_id, task_key),
+                    )
+                for task_key, gate_kind in gate_kinds.items():
+                    store.connection.execute(
+                        """UPDATE milestone_gate_bindings SET gate_kind = ?
+                           WHERE run_local_id = ? AND task_key = ?""",
+                        (gate_kind, local_run_id, task_key),
+                    )
+
+        kinds = (
+            "missing_plan_row",
+            "plan_digest_mismatch",
+            "candidate_digest_mismatch",
+            "contract_digest_mismatch",
+            "noncanonical_plan_json",
+            "invalid_plan_json",
+            "changed_plan_contract",
+            "changed_plan_task_topology",
+            "changed_native_dependencies",
+            "changed_gate_binding",
+            "unbound_task_history",
+            "duplicate_plan_history",
+        )
+        for kind in kinds:
+            with self.subTest(kind=kind):
+                corrupt(kind)
+                try:
+                    reports = (
+                        status(self.root, local_run_id, client=ReportingClient()),  # type: ignore[arg-type]
+                        explain(self.root, local_run_id),
+                    )
+                    for report in reports:
+                        self.assertEqual(report["status"], "stale_review")
+                        self.assertEqual(report["verification"], "review_stale")
+                        self.assertIsNone(report["sourceBinding"]["current"])
+                        self.assertEqual(report["sourceBinding"]["error"]["code"], "packet_identity_conflict")
+                        self.assertEqual(report["staleEvidence"]["storedVerification"], "review_accepted")
+                    for command, report in (("status", reports[0]), ("explain", reports[1])):
+                        with patch("orchestrate.cli._execute", return_value=(report, True)), patch("builtins.print"):
+                            self.assertEqual(
+                                cli_main([command, "--project", str(self.root), "--run", local_run_id, "--json"]),
+                                1,
+                            )
+                finally:
+                    restore(duplicate_schema=kind == "duplicate_plan_history")
 
         restored = explain(self.root, local_run_id)
         self.assertEqual(restored["status"], "worker_succeeded")

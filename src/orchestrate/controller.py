@@ -24,6 +24,8 @@ from .coordination import (
     SharedContract,
     WorkerSession,
     load_milestone_plan,
+    load_stored_milestone_plan,
+    milestone_gate_question,
     milestone_plan_relative_path,
     require_current_review,
     validate_release_receipt,
@@ -840,6 +842,22 @@ def _milestone_plan_path(store: StateStore, run: RunRecord) -> str | None:
         (run.local_id,),
     ).fetchone()
     return str(row["relative_path"]) if row is not None else None
+
+
+def _has_milestone_history(store: StateStore, run: RunRecord) -> bool:
+    """Identify milestone reporting without trusting the nullable plan projection row."""
+
+    if run.verification_status == "review_accepted" or run.phase.startswith("milestone_"):
+        return True
+    row = store.connection.execute(
+        """SELECT 1 FROM milestone_plan_bindings WHERE run_local_id = ?
+           UNION ALL SELECT 1 FROM milestone_task_bindings WHERE run_local_id = ?
+           UNION ALL SELECT 1 FROM milestone_gate_bindings WHERE run_local_id = ?
+           UNION ALL SELECT 1 FROM milestone_worker_bindings WHERE run_local_id = ?
+           LIMIT 1""",
+        (run.local_id, run.local_id, run.local_id, run.local_id),
+    ).fetchone()
+    return row is not None
 
 
 def _run_source_index(
@@ -2546,6 +2564,237 @@ def _process_milestone_delivery(
     return store.get_run(run.local_id)
 
 
+def _validated_stored_milestone_plan_identity(
+    store: StateStore,
+    run: RunRecord,
+) -> tuple[Any, LoadedMilestonePlan]:
+    """Validate stored plan bytes and every immutable native projection before packets."""
+
+    plan_rows = store.connection.execute(
+        "SELECT * FROM milestone_plan_bindings WHERE run_local_id = ? ORDER BY created_at, relative_path",
+        (run.local_id,),
+    ).fetchall()
+    if len(plan_rows) != 1:
+        raise OrchestrateError(
+            "Accepted milestone history does not have exactly one bound plan identity",
+            code="packet_identity_conflict",
+        )
+    row = plan_rows[0]
+    candidate_digest = row["candidate_digest"]
+    contract_digest = row["contract_digest"]
+    relative_path = row["relative_path"]
+    plan_json = row["plan_json"]
+    if (
+        not isinstance(candidate_digest, str)
+        or not candidate_digest
+        or not isinstance(contract_digest, str)
+        or not contract_digest
+        or not isinstance(relative_path, str)
+        or not relative_path
+        or not isinstance(plan_json, str)
+        or not plan_json
+        or row["status"] not in {"owner_pending", "active", "review_accepted"}
+    ):
+        raise OrchestrateError(
+            "The stored milestone plan identity is incomplete or unsupported",
+            code="packet_identity_conflict",
+        )
+    if (
+        run.phase == "worker_succeeded"
+        and run.verification_status == "review_accepted"
+        and row["status"] != "review_accepted"
+    ):
+        raise OrchestrateError(
+            "Accepted milestone review conflicts with the stored plan lifecycle",
+            code="packet_identity_conflict",
+        )
+    if not isinstance(run.native_run_id, str) or not run.native_run_id or not isinstance(run.task_id, str) or not run.task_id:
+        raise OrchestrateError(
+            "The stored milestone plan has no exact native Run or integration-owner Task binding",
+            code="packet_identity_conflict",
+        )
+    try:
+        canonical_relative_path = milestone_plan_relative_path(store.root, relative_path)
+        loaded = load_stored_milestone_plan(
+            canonical_relative_path,
+            plan_json,
+            objective=run.objective,
+            candidate_digest=candidate_digest,
+        )
+    except OrchestrateError as exc:
+        raise OrchestrateError(
+            "The stored milestone plan schema, bytes, contract, or Task topology is invalid",
+            code="packet_identity_conflict",
+            data={"cause": exc.code},
+        ) from exc
+    if (
+        canonical_relative_path != relative_path
+        or loaded.digest != row["plan_digest"]
+        or loaded.canonical_json != plan_json
+        or loaded.plan.candidate_digest != candidate_digest
+        or loaded.plan.contract.digest != contract_digest
+    ):
+        raise OrchestrateError(
+            "The stored milestone plan digest, candidate, or contract identity conflicts with its canonical bytes",
+            code="packet_identity_conflict",
+        )
+
+    owner = next(task for task in loaded.plan.tasks if task.integration_owner)
+    followups = tuple(task for task in loaded.plan.tasks if not task.integration_owner)
+    task_rows = store.connection.execute(
+        "SELECT * FROM milestone_task_bindings WHERE run_local_id = ? ORDER BY created_at, task_key",
+        (run.local_id,),
+    ).fetchall()
+    task_keys = [task_row["task_key"] for task_row in task_rows]
+    task_ids = [task_row["task_id"] for task_row in task_rows]
+    if (
+        len(task_rows) != len(followups)
+        or set(task_keys) != {task.key for task in followups}
+        or len(task_keys) != len(set(task_keys))
+        or len(task_ids) != len(set(task_ids))
+        or run.task_id in task_ids
+        or any(not isinstance(task_id, str) or not task_id for task_id in task_ids)
+    ):
+        raise OrchestrateError(
+            "The immutable native Task bindings do not exactly match the stored milestone plan",
+            code="packet_identity_conflict",
+        )
+    task_rows_by_key = {task_row["task_key"]: task_row for task_row in task_rows}
+    task_ids_by_key = {owner.key: run.task_id, **{key: value["task_id"] for key, value in task_rows_by_key.items()}}
+    for task in followups:
+        task_row = task_rows_by_key[task.key]
+        dependency_ids = [task_ids_by_key[dependency] for dependency in task.dependencies]
+        if (
+            task_row["candidate_digest"] != candidate_digest
+            or task_row["contract_digest"] != contract_digest
+            or task_row["dependencies_json"]
+            != json.dumps(dependency_ids, separators=(",", ":"))
+        ):
+            raise OrchestrateError(
+                "An immutable native Task binding conflicts with the stored milestone candidate, contract, or dependencies",
+                code="packet_identity_conflict",
+            )
+
+    worker_rows = store.connection.execute(
+        "SELECT * FROM milestone_worker_bindings WHERE run_local_id = ? ORDER BY created_at, task_key",
+        (run.local_id,),
+    ).fetchall()
+    worker_keys = [worker["task_key"] for worker in worker_rows]
+    if (
+        len(worker_rows) != len(followups)
+        or set(worker_keys) != {task.key for task in followups}
+        or len(worker_keys) != len(set(worker_keys))
+    ):
+        raise OrchestrateError(
+            "The immutable milestone worker bindings do not exactly match the stored plan",
+            code="packet_identity_conflict",
+        )
+    workers_by_key = {worker["task_key"]: worker for worker in worker_rows}
+    for task in followups:
+        worker = workers_by_key[task.key]
+        immutable_worker_values = (
+            worker["dispatch_id"],
+            worker["agent"],
+            worker["resource_id"],
+            worker["terminal_handle"],
+            worker["worktree_id"],
+            worker["readback_json"],
+        )
+        if (
+            worker["task_id"] != task_ids_by_key[task.key]
+            or worker["role"] != task.role
+            or any(not isinstance(value, str) or not value for value in immutable_worker_values)
+        ):
+            raise OrchestrateError(
+                "A milestone worker conflicts with its exact Task, role, Dispatch, or resource binding",
+                code="packet_identity_conflict",
+            )
+        try:
+            readback = json.loads(worker["readback_json"])
+            result = _result(readback)
+            dispatch = result.get("dispatch")
+            worker_readback = result.get("worker")
+            resource = result.get("terminalResource")
+            if not all(isinstance(value, Mapping) for value in (dispatch, worker_readback, resource)):
+                raise WorkerShowShapeError("worker-show omitted immutable worker resource identity")
+            accepted_readback = worker_input_accepted_readback(
+                dispatch,  # type: ignore[arg-type]
+                worker_readback,  # type: ignore[arg-type]
+                resource,  # type: ignore[arg-type]
+                run_id=run.native_run_id,
+                task_id=worker["task_id"],
+                dispatch_id=worker["dispatch_id"],
+                worktree_id=worker["worktree_id"],
+                terminal_handle=worker["terminal_handle"],
+                resource_id=worker["resource_id"],
+            )
+            start_options = worker_readback.get("startOptions")  # type: ignore[union-attr]
+            if (
+                accepted_readback.resource.resource_id != worker["resource_id"]
+                or not isinstance(start_options, Mapping)
+                or start_options.get("agent") != worker["agent"]
+            ):
+                raise WorkerShowShapeError("worker-show changed the immutable launch identity")
+        except (json.JSONDecodeError, TypeError, WorkerShowShapeError) as exc:
+            raise OrchestrateError(
+                "The immutable milestone worker readback is malformed or conflicting",
+                code="packet_identity_conflict",
+            ) from exc
+        if run.verification_status == "review_accepted" and (
+            worker["outcome"] != "succeeded"
+            or worker["result_outcome"] != "accepted"
+            or not isinstance(worker["result_digest"], str)
+            or not worker["result_digest"]
+            or worker["release_state"] != "released"
+        ):
+            raise OrchestrateError(
+                "Accepted milestone review conflicts with settled worker result or release history",
+                code="packet_identity_conflict",
+            )
+
+    gate_rows = store.connection.execute(
+        "SELECT * FROM milestone_gate_bindings WHERE run_local_id = ? ORDER BY created_at, task_key",
+        (run.local_id,),
+    ).fetchall()
+    gated_tasks = tuple(task for task in followups if task.gate in {"verification", "review"})
+    gate_keys = [gate["task_key"] for gate in gate_rows]
+    gate_ids = [gate["gate_id"] for gate in gate_rows]
+    if (
+        len(gate_rows) != len(gated_tasks)
+        or set(gate_keys) != {task.key for task in gated_tasks}
+        or len(gate_keys) != len(set(gate_keys))
+        or len(gate_ids) != len(set(gate_ids))
+        or any(not isinstance(gate_id, str) or not gate_id for gate_id in gate_ids)
+    ):
+        raise OrchestrateError(
+            "The immutable native gate bindings do not exactly match the stored milestone plan",
+            code="packet_identity_conflict",
+        )
+    gates_by_key = {gate["task_key"]: gate for gate in gate_rows}
+    for task in gated_tasks:
+        gate = gates_by_key[task.key]
+        if (
+            gate["task_id"] != task_ids_by_key[task.key]
+            or gate["gate_kind"] != task.gate
+            or gate["question"] != milestone_gate_question(task, loaded.plan)
+            or gate["status"] not in {"pending", "resolved"}
+            or (gate["status"] == "pending" and gate["resolution"] is not None)
+            or (gate["status"] == "resolved" and gate["resolution"] not in {"accepted", "rejected"})
+        ):
+            raise OrchestrateError(
+                "A native gate conflicts with its exact planned Task, kind, question, or resolution",
+                code="packet_identity_conflict",
+            )
+        if run.verification_status == "review_accepted" and (
+            gate["status"] != "resolved" or gate["resolution"] != "accepted"
+        ):
+            raise OrchestrateError(
+                "Accepted milestone review conflicts with unresolved or rejected native gate history",
+                code="packet_identity_conflict",
+            )
+    return row, loaded
+
+
 def _milestone_source_binding(
     profile: ProjectProfile | None,
     store: StateStore,
@@ -2553,70 +2802,28 @@ def _milestone_source_binding(
     *,
     profile_error: OrchestrateError | None = None,
 ) -> JsonObject:
-    plan = store.connection.execute(
-        """SELECT relative_path, plan_json, candidate_digest, contract_digest, status
-           FROM milestone_plan_bindings WHERE run_local_id = ?""",
-        (run.local_id,),
-    ).fetchone()
-    expected = (
-        plan["candidate_digest"]
-        if plan is not None and plan["candidate_digest"] is not None
-        else run.source_digest
-    )
-    if profile is None:
-        error = profile_error or OrchestrateError(
-            "The current project profile identity is unavailable",
-            code="profile_unreadable",
-        )
-        return {
-            "expected": expected,
-            "current": None,
-            "unchanged": None,
-            "coverageComplete": None,
-            "error": {"code": error.code, "message": str(error)},
-        }
+    expected: str | None = None
     try:
-        if plan is None or not isinstance(expected, str) or not expected:
+        plan, loaded = _validated_stored_milestone_plan_identity(store, run)
+        expected = loaded.plan.candidate_digest
+        if joined_preflight_status(store, run) != "admitted":
             raise OrchestrateError(
-                "The milestone has no exact stored candidate binding",
+                "The integration owner no longer has exact admitted native Task and Dispatch history",
                 code="packet_identity_conflict",
             )
-        try:
-            plan_value = json.loads(plan["plan_json"])
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise OrchestrateError(
-                "The stored milestone plan identity is malformed",
-                code="packet_identity_conflict",
-            ) from exc
-        raw_plan_tasks = plan_value.get("tasks") if isinstance(plan_value, Mapping) else None
-        if not isinstance(raw_plan_tasks, list):
-            raise OrchestrateError(
-                "The stored milestone plan Task identities are malformed",
-                code="packet_identity_conflict",
+        if profile is None:
+            raise profile_error or OrchestrateError(
+                "The current project profile identity is unavailable",
+                code="profile_unreadable",
             )
-        plan_tasks: dict[str, Mapping[str, Any]] = {}
-        owner_keys: set[str] = set()
-        for item in raw_plan_tasks:
-            key = item.get("key") if isinstance(item, Mapping) else None
-            if not isinstance(key, str) or not key or key in plan_tasks:
-                raise OrchestrateError(
-                    "The stored milestone plan Task identities are malformed",
-                    code="packet_identity_conflict",
-                )
-            plan_tasks[key] = item
-            if item.get("role") == "owner":
-                owner_keys.add(key)
-        if len(owner_keys) != 1:
-            raise OrchestrateError(
-                "The stored milestone owner identity is malformed",
-                code="packet_identity_conflict",
-            )
+        plan_tasks = {task.key: task for task in loaded.plan.tasks}
+        owner_keys = {task.key for task in loaded.plan.tasks if task.integration_owner}
 
         task_rows = store.connection.execute(
             """SELECT b.task_key, b.task_id, b.candidate_digest, b.contract_digest, b.spec,
                       p.packet_json,
-                      w.task_id AS worker_task_id, w.dispatch_id, w.resource_id,
-                      w.terminal_handle, w.worktree_id
+                      w.task_id AS worker_task_id, w.dispatch_id, w.role AS worker_role,
+                      w.agent, w.resource_id, w.terminal_handle, w.worktree_id
                FROM milestone_task_bindings b
                LEFT JOIN packets p
                  ON p.run_local_id = b.run_local_id AND p.task_id = b.task_id
@@ -2688,25 +2895,35 @@ def _milestone_source_binding(
             scope = packet_value.get("scope")
             milestone = packet_value.get("milestone")
             contract = milestone.get("contract") if isinstance(milestone, Mapping) else None
-            if isinstance(contract, Mapping) and isinstance(plan["contract_digest"], str):
+            admission = packet_value.get("admission")
+            launch = admission.get("launch") if isinstance(admission, Mapping) else None
+            native = packet_value.get("native")
+            if isinstance(contract, Mapping):
                 SharedContract(plan["contract_digest"], "settled", contract)
             if (
                 not isinstance(packet_id, str)
                 or packet_id in packet_ids
                 or row["worker_task_id"] != row["task_id"]
+                or row["worker_role"] != planned.role
                 or row["candidate_digest"] != expected
                 or row["contract_digest"] != plan["contract_digest"]
                 or row["spec"] != packet_spec_from_json(packet_json)
+                or packet_value.get("objective") != run.objective
+                or not isinstance(native, Mapping)
+                or native.get("runId") != run.native_run_id
                 or not isinstance(scope, Mapping)
                 or scope.get("projectRoot") != "."
                 or scope.get("strategy") != "bounded-native-dag"
-                or scope.get("maxWorkers") != plan_value.get("maxWorkers")
+                or scope.get("maxWorkers") != loaded.plan.max_workers
                 or scope.get("taskKey") != row["task_key"]
-                or scope.get("taskSpec") != planned.get("spec")
-                or scope.get("role") != planned.get("role")
+                or scope.get("taskSpec") != planned.spec
+                or scope.get("role") != planned.role
+                or not isinstance(launch, Mapping)
+                or launch.get("agent") != row["agent"]
                 or not isinstance(milestone, Mapping)
                 or milestone.get("candidateDigest") != expected
                 or milestone.get("contractDigest") != plan["contract_digest"]
+                or contract != json.loads(loaded.plan.contract.canonical_json)
                 or packet_value.get("sourceDigest") != expected
                 or joined_preflight_status(store, task_run) != "admitted"
             ):
@@ -3308,13 +3525,13 @@ def status(root: Path, run_id: str | None, *, client: OrcaClient) -> JsonObject:
     project_root = find_project_root(root)
     with StateStore.open_read_only(project_root) as store:
         run = store.select_for_read(run_id)
-        milestone_path = _milestone_plan_path(store, run)
+        milestone_history = _has_milestone_history(store, run)
         profile_error: OrchestrateError | None = None
         try:
             profile = ProjectProfile.load(project_root, require_sources=False)
         except OrchestrateError as exc:
             if (
-                milestone_path is None
+                not milestone_history
                 or run.phase != "worker_succeeded"
                 or run.verification_status != "review_accepted"
             ):
@@ -3344,7 +3561,7 @@ def status(root: Path, run_id: str | None, *, client: OrcaClient) -> JsonObject:
                 }
             except OrcaCommandError as exc:
                 live = {"status": "unavailable", "code": exc.code, "detail": str(exc)}
-        if milestone_path is not None:
+        if milestone_history:
             source_binding = _milestone_source_binding(
                 profile,
                 store,
@@ -3359,20 +3576,20 @@ def explain(root: Path, run_id: str | None) -> JsonObject:
     project_root = find_project_root(root)
     with StateStore.open_read_only(project_root) as store:
         run = store.select_for_read(run_id)
-        milestone_path = _milestone_plan_path(store, run)
+        milestone_history = _has_milestone_history(store, run)
         profile_error: OrchestrateError | None = None
         try:
             profile = ProjectProfile.load(project_root, require_sources=False)
         except OrchestrateError as exc:
             if (
-                milestone_path is None
+                not milestone_history
                 or run.phase != "worker_succeeded"
                 or run.verification_status != "review_accepted"
             ):
                 raise
             profile = None
             profile_error = exc
-        if milestone_path is not None:
+        if milestone_history:
             source_binding = _milestone_source_binding(
                 profile,
                 store,

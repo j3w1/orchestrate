@@ -339,6 +339,56 @@ def load_milestone_plan(
         decoded = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OrchestrateError("Milestone plan is not strict UTF-8 JSON", code="milestone_plan_invalid") from exc
+    plan = _validated_milestone_plan_value(
+        decoded,
+        objective=objective,
+        candidate_digest=candidate_digest,
+    )
+    canonical = _canonical_json(decoded)
+    digest = _canonical_digest_from_json(canonical, "plan")
+    return LoadedMilestonePlan(relative, digest, canonical, plan)
+
+
+def load_stored_milestone_plan(
+    relative_path: str,
+    plan_json: str,
+    *,
+    objective: str,
+    candidate_digest: str,
+) -> LoadedMilestonePlan:
+    """Revalidate one stored plan from its exact canonical bytes and bound candidate."""
+
+    try:
+        decoded = json.loads(plan_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise OrchestrateError("Stored milestone plan is not strict JSON", code="milestone_plan_invalid") from exc
+    canonical = _canonical_json(decoded)
+    if canonical != plan_json:
+        raise OrchestrateError(
+            "Stored milestone plan bytes are not canonical",
+            code="milestone_plan_invalid",
+        )
+    plan = _validated_milestone_plan_value(
+        decoded,
+        objective=objective,
+        candidate_digest=candidate_digest,
+    )
+    return LoadedMilestonePlan(
+        relative_path,
+        _canonical_digest_from_json(canonical, "plan"),
+        canonical,
+        plan,
+    )
+
+
+def _validated_milestone_plan_value(
+    decoded: object,
+    *,
+    objective: str,
+    candidate_digest: str,
+) -> MilestonePlan:
+    """Validate the complete v1 schema, contract, Tasks, roles, dependencies, and gates."""
+
     if not isinstance(decoded, Mapping) or set(decoded) != {"schema", "contract", "maxWorkers", "tasks"}:
         raise OrchestrateError("Milestone plan has unsupported or missing fields", code="milestone_plan_invalid")
     if decoded.get("schema") != MILESTONE_PLAN_SCHEMA:
@@ -408,9 +458,16 @@ def load_milestone_plan(
             "A production milestone requires one final reviewer gated by every specialist Task",
             code="review_gate_invalid",
         )
-    canonical = _canonical_json(decoded)
-    digest = _canonical_digest_from_json(canonical, "plan")
-    return LoadedMilestonePlan(relative, digest, canonical, plan)
+    return plan
+
+
+def milestone_gate_question(task: MilestoneTask, plan: MilestonePlan) -> str:
+    """Return the immutable native-gate question bound to one planned Task."""
+
+    return (
+        f"Accept {task.gate} prerequisites for planned Task {task.key} at "
+        f"{plan.candidate_digest} / {plan.contract.digest}?"
+    )
 
 
 def validate_effective_launch(choice: RoleChoice, launch: object) -> Mapping[str, str]:
@@ -746,10 +803,7 @@ class NativeDagScheduler:
 
     @staticmethod
     def _gate_question(task: MilestoneTask, plan: MilestonePlan) -> str:
-        return (
-            f"Accept {task.gate} prerequisites for planned Task {task.key} at "
-            f"{plan.candidate_digest} / {plan.contract.digest}?"
-        )
+        return milestone_gate_question(task, plan)
 
     @staticmethod
     def _gate_task_id(row: Mapping[str, Any]) -> object:
