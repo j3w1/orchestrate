@@ -91,6 +91,7 @@ class FakeDagClient:
         if arguments[:2] == ("orchestration", "task-create"):
             task_id = f"task_{len(self.rows) + 1}"
             run_id = arguments[arguments.index("--run") + 1]
+            task_title = arguments[arguments.index("--task-title") + 1]
             spec = arguments[arguments.index("--spec") + 1]
             deps = (
                 json.loads(arguments[arguments.index("--deps") + 1])
@@ -98,7 +99,16 @@ class FakeDagClient:
                 else []
             )
             status = "pending" if deps else "ready"
-            self.rows.append({"id": task_id, "run_id": run_id, "spec": spec, "deps": deps, "status": status})
+            self.rows.append(
+                {
+                    "id": task_id,
+                    "run_id": run_id,
+                    "task_title": task_title,
+                    "spec": spec,
+                    "deps": deps,
+                    "status": status,
+                }
+            )
             return {
                 "ok": True,
                 "result": {
@@ -216,6 +226,10 @@ class CoordinationTests(unittest.TestCase):
                 # Applied receipts rebuild projection without duplicate Tasks.
                 repeated = NativeDagScheduler(client, store, run.local_id).create("run_1", milestone())  # type: ignore[arg-type]
                 self.assertEqual(repeated, bindings)
+                client.rows[1]["task_title"] = "Altered native Task title"
+                with self.assertRaises(OrchestrateError) as altered_title:
+                    NativeDagScheduler(client, store, run.local_id).create("run_1", milestone())  # type: ignore[arg-type]
+                self.assertEqual(altered_title.exception.code, "native_task_binding_mismatch")
 
         self.assertEqual(bindings["unit"].dependencies, ("task_1",))
         self.assertEqual(bindings["incident"].dependencies, ("task_1",))

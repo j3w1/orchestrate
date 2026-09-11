@@ -27,6 +27,7 @@ from .coordination import (
     load_stored_milestone_plan,
     milestone_gate_question,
     milestone_plan_relative_path,
+    native_task_create_arguments,
     require_current_review,
     validate_release_receipt,
 )
@@ -67,6 +68,7 @@ PROMPT_STALL_STAGE = "dispatch_input"
 PROMPT_STALL_CLEANUP_PHASE = "launch_cleanup_pending"
 INPUT_SUBMISSION_DIAGNOSTIC_SUBJECT = "worker input submission unproven"
 PREFLIGHT_HELD_PHASE = "preflight_held"
+_monotonic = time.monotonic
 
 
 def _result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -901,16 +903,11 @@ def _create_task_and_packet(client: OrcaClient, store: StateStore, run: RunRecor
         store,
         run,
         "task-create",
-        [
-            "orchestration",
-            "task-create",
-            "--run",
-            str(run.native_run_id),
-            "--task-title",
-            orca_task_title(run.objective),
-            "--spec",
-            packet_spec_from_json(draft_json),
-        ],
+        native_task_create_arguments(
+            run_id=str(run.native_run_id),
+            title=run.objective,
+            spec=packet_spec_from_json(draft_json),
+        ),
     )
     current = _apply_intention(store, run, "task-create", response)
     store.save_packet(current.local_id, str(current.task_id), draft_json)
@@ -1982,12 +1979,12 @@ def _bind_native_run(
 
 
 def _supervise(client: OrcaClient, store: StateStore, run: RunRecord, *, wait_timeout_ms: int) -> JsonObject:
-    deadline = time.monotonic() + (wait_timeout_ms / 1000)
+    deadline = _monotonic() + (wait_timeout_ms / 1000)
     current, _ = _join_admission(store, run)
     if current.phase == PREFLIGHT_HELD_PHASE:
         return _run_summary(store, current)
     while current.phase in {"awaiting_preflight", "waiting"}:
-        remaining = max(1, int((deadline - time.monotonic()) * 1000))
+        remaining = max(1, int((deadline - _monotonic()) * 1000))
         if remaining <= 1:
             break
         window = min(remaining, 60_000)
@@ -2564,6 +2561,155 @@ def _process_milestone_delivery(
     return store.get_run(run.local_id)
 
 
+def _validate_milestone_task_creation_history(
+    store: StateStore,
+    run: RunRecord,
+    loaded: LoadedMilestonePlan,
+    *,
+    task_ids_by_key: Mapping[str, str],
+) -> None:
+    """Join every planned native Task to its exact applied creation receipt."""
+
+    if not isinstance(run.native_run_id, str) or not run.native_run_id:
+        raise OrchestrateError(
+            "Milestone Task creation history has no exact native Run identity",
+            code="packet_identity_conflict",
+        )
+    owner = next(task for task in loaded.plan.tasks if task.integration_owner)
+    native_specs: dict[str, str] = {}
+    for task_key, task_id in task_ids_by_key.items():
+        packet_rows = store.connection.execute(
+            "SELECT packet_json FROM packets WHERE run_local_id = ? AND task_id = ?",
+            (run.local_id, task_id),
+        ).fetchall()
+        if len(packet_rows) != 1 or not isinstance(packet_rows[0]["packet_json"], str):
+            raise OrchestrateError(
+                "A planned Task has no exact immutable native packet spec",
+                code="packet_identity_conflict",
+            )
+        try:
+            native_specs[task_key] = packet_spec_from_json(packet_rows[0]["packet_json"])
+        except (OrchestrateError, TypeError, ValueError) as exc:
+            raise OrchestrateError(
+                "A planned Task packet spec is malformed",
+                code="packet_identity_conflict",
+            ) from exc
+
+    expected: dict[str, tuple[str, list[str]]] = {
+        "task-create": (
+            task_ids_by_key[owner.key],
+            native_task_create_arguments(
+                run_id=run.native_run_id,
+                title=run.objective,
+                spec=native_specs[owner.key],
+            ),
+        )
+    }
+    for task in loaded.plan.tasks:
+        if task.integration_owner:
+            continue
+        dependency_ids = [task_ids_by_key[key] for key in task.dependencies]
+        expected[f"milestone-task-create:{task.key}"] = (
+            task_ids_by_key[task.key],
+            native_task_create_arguments(
+                run_id=run.native_run_id,
+                title=task.title,
+                spec=native_specs[task.key],
+                dependency_ids=dependency_ids,
+            ),
+        )
+
+    all_rows = store.connection.execute(
+        "SELECT * FROM intentions WHERE run_local_id = ? ORDER BY created_at, id",
+        (run.local_id,),
+    ).fetchall()
+    history_rows = [
+        intention
+        for intention in all_rows
+        if intention["operation"] == "task-create"
+        or (
+            isinstance(intention["operation"], str)
+            and intention["operation"].startswith("milestone-task-create:")
+        )
+    ]
+    operations = [intention["operation"] for intention in history_rows]
+    if (
+        len(history_rows) != len(expected)
+        or set(operations) != set(expected)
+        or len(operations) != len(set(operations))
+    ):
+        raise OrchestrateError(
+            "The native Task creation intention history is missing, duplicate, or unbound",
+            code="packet_identity_conflict",
+        )
+
+    request_id_counts: dict[str, int] = {}
+    for intention in all_rows:
+        request_id = intention["request_id"]
+        if isinstance(request_id, str) and request_id:
+            request_id_counts[request_id] = request_id_counts.get(request_id, 0) + 1
+    request_ids: set[str] = set()
+    for intention in history_rows:
+        operation = intention["operation"]
+        expected_task_id, expected_arguments = expected[operation]
+        raw_arguments = intention["arguments_json"]
+        raw_response = intention["response_json"]
+        try:
+            arguments = json.loads(raw_arguments)
+            response = json.loads(raw_response)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise OrchestrateError(
+                "A native Task creation intention or receipt is malformed",
+                code="packet_identity_conflict",
+            ) from exc
+        if (
+            not isinstance(arguments, list)
+            or not all(isinstance(argument, str) for argument in arguments)
+            or arguments != expected_arguments
+            or raw_arguments != json.dumps(expected_arguments)
+            or not isinstance(response, Mapping)
+            or raw_response != json.dumps(response)
+        ):
+            raise OrchestrateError(
+                "A native Task creation intention changed its exact argv or receipt bytes",
+                code="packet_identity_conflict",
+            )
+        result = response.get("result")
+        native_task = result.get("task") if isinstance(result, Mapping) else None
+        mutation = result.get("mutation") if isinstance(result, Mapping) else None
+        metadata = response.get("_meta")
+        response_request_id = mutation.get("requestId") if isinstance(mutation, Mapping) else None
+        stored_request_id = intention["request_id"]
+        returncode = intention["returncode"]
+        if (
+            intention["status"] != "applied"
+            or intention["error_json"] is not None
+            or not isinstance(native_task, Mapping)
+            or native_task.get("id") != expected_task_id
+            or not isinstance(mutation, Mapping)
+            or not isinstance(response_request_id, str)
+            or not response_request_id
+            or response_request_id != stored_request_id
+            or request_id_counts.get(response_request_id) != 1
+            or not isinstance(mutation.get("replayed"), bool)
+            or not isinstance(metadata, Mapping)
+            or not isinstance(metadata.get("runtimeId"), str)
+            or not metadata.get("runtimeId")
+            or isinstance(returncode, bool)
+            or returncode not in {None, 0}
+        ):
+            raise OrchestrateError(
+                "A native Task creation receipt conflicts with its applied Run, Task, request, or runtime identity",
+                code="packet_identity_conflict",
+            )
+        if response_request_id in request_ids:
+            raise OrchestrateError(
+                "Native Task creation receipts reuse a conflicting immutable request identity",
+                code="packet_identity_conflict",
+            )
+        request_ids.add(response_request_id)
+
+
 def _validated_stored_milestone_plan_identity(
     store: StateStore,
     run: RunRecord,
@@ -2674,6 +2820,13 @@ def _validated_stored_milestone_plan_identity(
                 "An immutable native Task binding conflicts with the stored milestone candidate, contract, or dependencies",
                 code="packet_identity_conflict",
             )
+
+    _validate_milestone_task_creation_history(
+        store,
+        run,
+        loaded,
+        task_ids_by_key=task_ids_by_key,
+    )
 
     worker_rows = store.connection.execute(
         "SELECT * FROM milestone_worker_bindings WHERE run_local_id = ? ORDER BY created_at, task_key",
@@ -3228,9 +3381,9 @@ def _supervise_milestone(
         if store.pending_questions(run.local_id) or run.phase == "milestone_blocked":
             return _milestone_summary(store, run)
     current, plan = _advance_milestone(client, store, run, profile, worktree_id=worktree_id)
-    deadline = time.monotonic() + (wait_timeout_ms / 1000)
+    deadline = _monotonic() + (wait_timeout_ms / 1000)
     while current.phase == "milestone_waiting":
-        remaining = max(1, int((deadline - time.monotonic()) * 1000))
+        remaining = max(1, int((deadline - _monotonic()) * 1000))
         if remaining <= 1:
             break
         window = min(remaining, 60_000)

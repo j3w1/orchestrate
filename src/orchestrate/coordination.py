@@ -470,6 +470,30 @@ def milestone_gate_question(task: MilestoneTask, plan: MilestonePlan) -> str:
     )
 
 
+def native_task_create_arguments(
+    *,
+    run_id: str,
+    title: str,
+    spec: str,
+    dependency_ids: Sequence[str] = (),
+) -> list[str]:
+    """Return the exact public Orca argv used to create one native Task."""
+
+    arguments = [
+        "orchestration",
+        "task-create",
+        "--run",
+        run_id,
+        "--task-title",
+        orca_task_title(title),
+        "--spec",
+        spec,
+    ]
+    if dependency_ids:
+        arguments.extend(("--deps", json.dumps(list(dependency_ids), separators=(",", ":"))))
+    return arguments
+
+
 def validate_effective_launch(choice: RoleChoice, launch: object) -> Mapping[str, str]:
     """Require Orca to echo the exact requested and effective launch values."""
 
@@ -582,18 +606,12 @@ class NativeDagScheduler:
     ) -> dict[str, NativeTaskBinding]:
         for task in selected:
             dependency_ids = [bindings[key].task_id for key in task.dependencies]
-            arguments = [
-                "orchestration",
-                "task-create",
-                "--run",
-                run_id,
-                "--task-title",
-                orca_task_title(task.title),
-                "--spec",
-                task.spec,
-            ]
-            if dependency_ids:
-                arguments.extend(("--deps", json.dumps(dependency_ids, separators=(",", ":"))))
+            arguments = native_task_create_arguments(
+                run_id=run_id,
+                title=task.title,
+                spec=task.spec,
+                dependency_ids=dependency_ids,
+            )
             stored = self._stored_binding(task, dependency_ids, arguments)
             if stored is not None:
                 bindings[task.key] = stored
@@ -721,12 +739,13 @@ class NativeDagScheduler:
             if (
                 not isinstance(row, Mapping)
                 or row.get("run_id") != run_id
+                or row.get("task_title") != orca_task_title(task.title)
                 or row.get("spec") != task.spec
                 or row.get("deps", []) != list(binding.dependencies)
                 or row.get("status") not in allowed_statuses
             ):
                 raise OrchestrateError(
-                    f"Native Task readback changed {task.key}'s identity, spec, dependencies, or gate state",
+                    f"Native Task readback changed {task.key}'s identity, title, spec, dependencies, or gate state",
                     code="native_task_binding_mismatch",
                 )
 

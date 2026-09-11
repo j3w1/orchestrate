@@ -1415,16 +1415,30 @@ class ControllerTests(unittest.TestCase):
         plan = self._write_milestone_plan(objective, specialist_keys=specialists)
         client = MilestoneClient(self.root, pause_after_owner=True)
 
-        paused = implement(
-            self.root,
-            objective,
-            client=client,  # type: ignore[arg-type]
-            milestone_plan=plan,
-            wait_timeout_ms=20,
-            require_context=False,
-        )
+        with patch(
+            "orchestrate.controller._monotonic",
+            side_effect=(0.0, 0.0, 0.0, 61.0),
+        ) as controlled_clock:
+            paused = implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
 
         self.assertEqual(paused["status"], "milestone_waiting")
+        self.assertEqual(controlled_clock.call_count, 4)
+        self.assertEqual(client.tasks["task_1"]["status"], "completed")
+        self.assertTrue(
+            any(
+                call[:2] == ("orchestration", "check")
+                and "--ack" in call
+                and call[call.index("--ack") + 1] == "delivery_1"
+                for call in client.calls
+            )
+        )
         self.assertEqual(client.peak_active_workers, 2)
         self.assertEqual(
             [
@@ -1737,6 +1751,33 @@ class ControllerTests(unittest.TestCase):
                     (local_run_id,),
                 ).fetchall()
             }
+            task_specs = {
+                row["task_key"]: row["spec"]
+                for row in store.connection.execute(
+                    "SELECT task_key, spec FROM milestone_task_bindings WHERE run_local_id = ?",
+                    (local_run_id,),
+                ).fetchall()
+            }
+            task_ids = {"owner": str(accepted["taskId"])}
+            task_ids.update(
+                {
+                    row["task_key"]: row["task_id"]
+                    for row in store.connection.execute(
+                        "SELECT task_key, task_id FROM milestone_task_bindings WHERE run_local_id = ?",
+                        (local_run_id,),
+                    ).fetchall()
+                }
+            )
+            task_creation_rows = [
+                dict(row)
+                for row in store.connection.execute(
+                    "SELECT * FROM intentions WHERE run_local_id = ? ORDER BY created_at, id",
+                    (local_run_id,),
+                ).fetchall()
+                if row["operation"] == "task-create"
+                or row["operation"].startswith("milestone-task-create:")
+            ]
+            task_creation_by_operation = {row["operation"]: row for row in task_creation_rows}
             gate_kinds = {
                 row["task_key"]: row["gate_kind"]
                 for row in store.connection.execute(
@@ -1744,6 +1785,13 @@ class ControllerTests(unittest.TestCase):
                     (local_run_id,),
                 ).fetchall()
             }
+
+        initial_current = explain(self.root, local_run_id)
+        self.assertEqual(
+            initial_current["status"],
+            "worker_succeeded",
+            initial_current.get("sourceBinding"),
+        )
 
         def canonical(value: object) -> str:
             return json.dumps(
@@ -1767,6 +1815,38 @@ class ControllerTests(unittest.TestCase):
                     (encoded, digest(encoded, "plan"), contract_digest, local_run_id),
                 )
 
+        def duplicate_task_creation(operation: str) -> None:
+            original = task_creation_by_operation[operation]
+            with StateStore(self.root) as store:
+                store.connection.execute(
+                    """INSERT INTO intentions(
+                           id, run_local_id, operation, arguments_json, request_id, status,
+                           returncode, response_json, error_json, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        f"{original['id']}_duplicate",
+                        original["run_local_id"],
+                        original["operation"],
+                        original["arguments_json"],
+                        original["request_id"],
+                        original["status"],
+                        original["returncode"],
+                        original["response_json"],
+                        original["error_json"],
+                        original["created_at"],
+                        original["updated_at"],
+                    ),
+                )
+
+        def alter_task_creation_argument(operation: str, flag: str, value: str) -> None:
+            arguments = json.loads(task_creation_by_operation[operation]["arguments_json"])
+            arguments[arguments.index(flag) + 1] = value
+            with StateStore(self.root) as store:
+                store.connection.execute(
+                    "UPDATE intentions SET arguments_json = ? WHERE run_local_id = ? AND operation = ?",
+                    (json.dumps(arguments), local_run_id, operation),
+                )
+
         def corrupt(kind: str) -> None:
             if kind == "duplicate_plan_history":
                 connection = sqlite3.connect(state_path)
@@ -1785,6 +1865,22 @@ class ControllerTests(unittest.TestCase):
                     connection.commit()
                 finally:
                     connection.close()
+                return
+            if kind == "duplicate_owner_task_creation":
+                duplicate_task_creation("task-create")
+                return
+            if kind == "duplicate_followup_task_creation":
+                duplicate_task_creation("milestone-task-create:verify")
+                return
+            if kind == "altered_owner_task_creation":
+                alter_task_creation_argument("task-create", "--task-title", "Altered owner title")
+                return
+            if kind == "altered_followup_task_creation":
+                alter_task_creation_argument(
+                    "milestone-task-create:verify",
+                    "--spec",
+                    "Altered follow-up Task creation spec.",
+                )
                 return
             with StateStore(self.root) as store:
                 if kind == "missing_plan_row":
@@ -1818,6 +1914,55 @@ class ControllerTests(unittest.TestCase):
                         "UPDATE milestone_plan_bindings SET plan_json = '{invalid' WHERE run_local_id = ?",
                         (local_run_id,),
                     )
+                elif kind == "missing_owner_task_creation":
+                    store.connection.execute(
+                        "DELETE FROM intentions WHERE run_local_id = ? AND operation = 'task-create'",
+                        (local_run_id,),
+                    )
+                elif kind == "missing_followup_task_creation":
+                    store.connection.execute(
+                        """DELETE FROM intentions
+                           WHERE run_local_id = ? AND operation = 'milestone-task-create:verify'""",
+                        (local_run_id,),
+                    )
+                elif kind == "malformed_owner_task_creation":
+                    store.connection.execute(
+                        """UPDATE intentions SET arguments_json = '{invalid'
+                           WHERE run_local_id = ? AND operation = 'task-create'""",
+                        (local_run_id,),
+                    )
+                elif kind == "malformed_followup_task_creation":
+                    store.connection.execute(
+                        """UPDATE intentions SET response_json = '{invalid'
+                           WHERE run_local_id = ? AND operation = 'milestone-task-create:verify'""",
+                        (local_run_id,),
+                    )
+                elif kind == "conflicting_owner_task_creation":
+                    response = json.loads(task_creation_by_operation["task-create"]["response_json"])
+                    response["result"]["task"]["id"] = "task_conflict"
+                    store.connection.execute(
+                        """UPDATE intentions SET response_json = ?
+                           WHERE run_local_id = ? AND operation = 'task-create'""",
+                        (json.dumps(response), local_run_id),
+                    )
+                elif kind == "conflicting_followup_task_creation":
+                    store.connection.execute(
+                        """UPDATE intentions SET request_id = 'request_conflict'
+                           WHERE run_local_id = ? AND operation = 'milestone-task-create:verify'""",
+                        (local_run_id,),
+                    )
+                elif kind == "unapplied_owner_task_creation":
+                    store.connection.execute(
+                        """UPDATE intentions SET status = 'prepared'
+                           WHERE run_local_id = ? AND operation = 'task-create'""",
+                        (local_run_id,),
+                    )
+                elif kind == "unapplied_followup_task_creation":
+                    store.connection.execute(
+                        """UPDATE intentions SET status = 'prepared'
+                           WHERE run_local_id = ? AND operation = 'milestone-task-create:verify'""",
+                        (local_run_id,),
+                    )
                 elif kind == "changed_native_dependencies":
                     store.connection.execute(
                         """UPDATE milestone_task_bindings SET dependencies_json = '[]'
@@ -1840,7 +1985,13 @@ class ControllerTests(unittest.TestCase):
                             plan_row["contract_digest"],
                         ),
                     )
-                elif kind in {"changed_plan_contract", "changed_plan_task_topology"}:
+                elif kind in {
+                    "changed_plan_contract",
+                    "changed_plan_task_title",
+                    "changed_plan_task_spec",
+                    "changed_plan_task_dependencies",
+                    "changed_plan_task_topology",
+                }:
                     pass
                 else:
                     raise AssertionError(kind)
@@ -1852,6 +2003,40 @@ class ControllerTests(unittest.TestCase):
                     original_value,
                     contract_digest=digest(canonical(changed_contract), "contract"),
                 )
+            elif kind == "changed_plan_task_title":
+                tasks = original_value["tasks"]
+                assert isinstance(tasks, list)
+                specialist = next(task for task in tasks if task["key"] == "verify")
+                specialist["title"] = "Tampered accepted verification title"
+                replace_plan(original_value)
+            elif kind == "changed_plan_task_spec":
+                tasks = original_value["tasks"]
+                assert isinstance(tasks, list)
+                specialist = next(task for task in tasks if task["key"] == "verify")
+                changed_spec = "Read only a recomputed but historically uncreated specification."
+                specialist["spec"] = changed_spec
+                replace_plan(original_value)
+                with StateStore(self.root) as store:
+                    store.connection.execute(
+                        """UPDATE milestone_task_bindings SET spec = ?
+                           WHERE run_local_id = ? AND task_key = 'verify'""",
+                        (changed_spec, local_run_id),
+                    )
+            elif kind == "changed_plan_task_dependencies":
+                tasks = original_value["tasks"]
+                assert isinstance(tasks, list)
+                reviewer = next(task for task in tasks if task["key"] == "review")
+                reviewer["dependencies"] = ["verify", "owner"]
+                replace_plan(original_value)
+                with StateStore(self.root) as store:
+                    store.connection.execute(
+                        """UPDATE milestone_task_bindings SET dependencies_json = ?
+                           WHERE run_local_id = ? AND task_key = 'review'""",
+                        (
+                            json.dumps([task_ids["verify"], task_ids["owner"]], separators=(",", ":")),
+                            local_run_id,
+                        ),
+                    )
             elif kind == "changed_plan_task_topology":
                 tasks = original_value["tasks"]
                 assert isinstance(tasks, list)
@@ -1884,7 +2069,6 @@ class ControllerTests(unittest.TestCase):
                     connection.commit()
                 finally:
                     connection.close()
-                return
             with StateStore(self.root) as store:
                 store.connection.execute(
                     "DELETE FROM milestone_plan_bindings WHERE run_local_id = ?",
@@ -1904,11 +2088,31 @@ class ControllerTests(unittest.TestCase):
                            WHERE run_local_id = ? AND task_key = ?""",
                         (dependencies_json, local_run_id, task_key),
                     )
+                for task_key, task_spec in task_specs.items():
+                    store.connection.execute(
+                        """UPDATE milestone_task_bindings SET spec = ?
+                           WHERE run_local_id = ? AND task_key = ?""",
+                        (task_spec, local_run_id, task_key),
+                    )
                 for task_key, gate_kind in gate_kinds.items():
                     store.connection.execute(
                         """UPDATE milestone_gate_bindings SET gate_kind = ?
                            WHERE run_local_id = ? AND task_key = ?""",
                         (gate_kind, local_run_id, task_key),
+                    )
+                store.connection.execute(
+                    """DELETE FROM intentions
+                       WHERE run_local_id = ?
+                         AND (operation = 'task-create' OR operation GLOB 'milestone-task-create:*')""",
+                    (local_run_id,),
+                )
+                for original in task_creation_rows:
+                    store.connection.execute(
+                        """INSERT INTO intentions(
+                               id, run_local_id, operation, arguments_json, request_id, status,
+                               returncode, response_json, error_json, created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        tuple(original.values()),
                     )
 
         kinds = (
@@ -1919,7 +2123,22 @@ class ControllerTests(unittest.TestCase):
             "noncanonical_plan_json",
             "invalid_plan_json",
             "changed_plan_contract",
+            "changed_plan_task_title",
+            "changed_plan_task_spec",
+            "changed_plan_task_dependencies",
             "changed_plan_task_topology",
+            "missing_owner_task_creation",
+            "missing_followup_task_creation",
+            "altered_owner_task_creation",
+            "altered_followup_task_creation",
+            "duplicate_owner_task_creation",
+            "duplicate_followup_task_creation",
+            "malformed_owner_task_creation",
+            "malformed_followup_task_creation",
+            "conflicting_owner_task_creation",
+            "conflicting_followup_task_creation",
+            "unapplied_owner_task_creation",
+            "unapplied_followup_task_creation",
             "changed_native_dependencies",
             "changed_gate_binding",
             "unbound_task_history",
