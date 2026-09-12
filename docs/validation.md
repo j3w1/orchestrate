@@ -21,17 +21,17 @@ Do not record credentials, private source text, raw environments, personal files
 
 | Gate | Scope / boundary | Evidence record | Status |
 | --- | --- | --- | --- |
-| Fresh full suite | `python -m unittest discover -s tests -v` plus explicit `python -m unittest discover -s tests/incidents -t tests -v`; disposable Git and synthetic command fixtures only | Candidate implementation report | `NOT_RUN` |
-| Compile and diff checks | `python -m compileall -q src tests` and `git diff --check` | Candidate implementation report | `NOT_RUN` |
-| Frozen build | Build from a clean `git archive HEAD` export, not the mutable working tree | Candidate implementation report | `NOT_RUN` |
-| Fresh wheel install | Install the frozen wheel into a new virtual environment | Candidate implementation report | `NOT_RUN` |
-| CLI help smoke | Installed `orchestrate --help`, `orchestrate doctor --help`, and `orchestrate-wsl --help` | Candidate implementation report | `NOT_RUN` |
-| Read-only discovery trial, CE-governed repository | Discovery functions only; never run `setup`, project hooks, checks, or mutations | Coordinator trial record | `NOT_RUN` |
-| Read-only discovery trial, `j3w1.github.io` | Discovery functions only; never run `setup`, project hooks, checks, or mutations | Coordinator trial record | `NOT_RUN` |
-| Disposable Windows multi-worker frontier | More ready work than `maxWorkers`, native dependencies/gates, deterministic waves, and restart reconciliation in a disposable repository | Coordinator live-lifecycle record | `NOT_RUN` |
-| Windows-coordinated WSL lifecycle | This candidate admits managed workers only on Windows; prove launcher transport and direct Orca WSL lifecycle separately without claiming WSL worker admission | Coordinator WSL record | `NOT_RUN` |
+| Fresh full suite | `python -m unittest discover -s tests -v` plus explicit `python -m unittest discover -s tests/incidents -t tests -v`; disposable Git and synthetic command fixtures only | Candidate implementation report; coordinator frozen-export run, 225 tests, exit 0, and explicit incident discovery, 6 tests | `PASS` |
+| Compile and diff checks | `python -m compileall -q src tests` and `git diff --check` | Candidate implementation report | `PASS` |
+| Frozen build | Build from a clean `git archive HEAD` export, not the mutable working tree | Candidate implementation report | `PASS` |
+| Fresh wheel install | Install the frozen wheel into a new virtual environment | Candidate implementation report | `PASS` |
+| CLI help smoke | Installed `orchestrate --help`, `orchestrate doctor --help`, and `orchestrate-wsl --help` | Candidate implementation report | `PASS` |
+| Read-only discovery trial, CE-governed repository | Discovery functions only; never run `setup`, project hooks, checks, or mutations | Coordinator trial record; bounded inventory of two conventional instruction files, no ignored dependency path, repository byte-unchanged | `PASS` |
+| Read-only discovery trial, `j3w1.github.io` | Discovery functions only; never run `setup`, project hooks, checks, or mutations | Coordinator trial record; bounded inventory of one conventional instruction file, ignored dependency instruction excluded, repository byte-unchanged | `PASS` |
+| Disposable Windows multi-worker frontier | More ready work than `maxWorkers`, native dependencies/gates, deterministic waves, and restart reconciliation in a disposable repository | Coordinator live-lifecycle record; native Run, plan binding, Task creation and dispatch observed, and unproven-submission containment plus restart reconciliation without duplicate dispatch observed; the dispatched worker's model turn never started, so frontier waves and gate ordering were not exercised | `UNAVAILABLE` |
+| Windows-coordinated WSL lifecycle | This candidate admits managed workers only on Windows; prove launcher transport and direct Orca WSL lifecycle separately without claiming WSL worker admission | Coordinator WSL record; launcher transport into the canonical Windows installation verified, including forwarded doctor, project translation of a path containing a space and a non-ASCII character, internal-command refusal, and no Linux state owner; direct Orca WSL worker lifecycle not exercised | `UNAVAILABLE` |
 | Matched direct-versus-orchestrate cost trial | Same disposable starting inputs, roster, objective, and required checks; no provider billing inference | Coordinator cost record | `NOT_RUN` |
-| Hosted Windows/Linux CI | Exact candidate jobs, including both test-discovery commands, frozen build, install, and help smokes | Hosted run reference | `NOT_RUN` |
+| Hosted Windows/Linux CI | Exact candidate jobs, including both test-discovery commands, frozen build, install, and help smokes | Hosted run reference; both matrix jobs succeeded for this exact candidate | `PASS` |
 | Final repository verification | Public repository visibility and exact commit/tree readback; no merge or release inference | Coordinator repository record | `NOT_RUN` |
 | Independent final audit | Fresh reviewer bound to the frozen candidate and tree; reviewer reports findings and does not repair | Independent audit record | `NOT_RUN` |
 
@@ -50,6 +50,12 @@ When a packet-bound selected source no longer exists on disk, `worker-preflight`
 ### Incomplete packet source-record prepass
 
 The packet source-record prepass does not validate every mandatory field of the source-index record shape. This behavior predates the third increment and is present in the accepted second-increment base `5f250f38bb2defcb01833842c29dea5394c41877`. To reproduce it, start with a canonical `orchestrate-worker-packet/v3`, keep a source record's `path`, `sha256`, and `bytes` valid, remove another mandatory field such as `authority`, recompute the canonical `packetId`, and retain matching stored-packet and native Task-spec identities. The malformed record passes the prepass and is rejected later as source drift with `source_binding_changed`, after native Orca readbacks, rather than immediately as a packet identity conflict.
+
+### Hosted CI history and unstarted worker attempt
+
+Hosted CI had never executed for this project before this candidate. Its first execution failed on both runners, and the failures were attributed before correction: all Linux failures and two of three Windows failures were reproduced against the accepted second-increment base and were therefore pre-existing, while one Windows failure was introduced by this increment's added Git-argument assertion.
+
+A dispatched worker's model turn failing to start was observed live. The controller contained the attempt with a single read-only readback and no resend or external effect. Recovery of such an attempt is an explicit owner decision.
 
 ## Cost trial record
 
