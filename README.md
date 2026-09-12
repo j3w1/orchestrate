@@ -72,7 +72,7 @@ The package never edits `AGENTS.md`, user prompts, or another agent's configurat
 
 ### Linux and WSL
 
-The CI workflow is configured to run unit, incident, wheel-build, and isolated-install checks on Windows and Linux. A workflow definition is not proof that a particular candidate passed; [Validation evidence](docs/validation.md) keeps that distinction explicit. The Orca CLI resolver uses `ORCA_CLI_COMMAND` in a managed forwarded session, `orca-dev` in a dev checkout, `orca-ide` on Linux outside Orca, and `orca` on packaged Windows.
+The CI workflow runs the complete unit and incident suite on Windows, including the managed-admission and controller-lifecycle fixtures that require native Windows. Linux runs every host-neutral test and explicitly skips only tests whose intended assertion requires the win32-only managed worker admission path. Both jobs run explicit incident discovery, wheel build, isolated install, and CLI help smokes. A workflow definition is not proof that a particular candidate passed; [Validation evidence](docs/validation.md) keeps that distinction explicit. The Orca CLI resolver uses `ORCA_CLI_COMMAND` in a managed forwarded session, `orca-dev` in a dev checkout, `orca-ide` on Linux outside Orca, and `orca` on packaged Windows.
 
 `orchestrate-wsl` is a transport-only launcher. Configure its one machine-local pointer as a JSON argument array naming the reviewed Windows entry point, then pass ordinary CLI arguments:
 
@@ -156,7 +156,7 @@ For a copyable disposable live exercise, use [Live first-increment exercise](doc
 - A focused ordinary-terminal bootstrap with durable result, exit, and exact uncertain-close reconciliation receipts.
 - Passive compatibility diagnostics and a separately contained no-edit active probe.
 - Synthetic practical regressions under `tests/incidents`, including ignored dependency authority, Task-history tampering, and capacity waves.
-- A Windows/Linux CI workflow for unit, explicit incident-discovery, build, and isolated-install smoke checks.
+- A CI workflow with the complete suite on Windows, the host-neutral subset on Linux, and explicit incident-discovery, build, and isolated-install smoke checks on both.
 - A sanitized evidence matrix in [`docs/validation.md`](docs/validation.md).
 
 Detailed role, dependency, review-invalidation, intervention, and uncertain-release shapes live in [Execution contracts and recovery](docs/contracts-and-recovery.md).

@@ -21,6 +21,10 @@ from orchestrate.state import AdmissionEffectFence, StateStore
 
 
 LIVENESS_TIMEOUT = 120.0  # Outer deadlock detector, not a semantic progress budget.
+requires_native_windows_admission = unittest.skipUnless(
+    sys.platform == "win32",
+    "managed worker admission is win32-only by design",
+)
 
 
 def git(root: Path, *arguments: str) -> None:
@@ -175,6 +179,7 @@ class AdmissionTests(unittest.TestCase):
             environment={"ORCA_TERMINAL_HANDLE": "term_worker"}, platform="win32",  # type: ignore[arg-type]
         )
 
+    @requires_native_windows_admission
     def test_exact_preflight_is_immutable_and_replay_is_not_a_fresh_grant(self) -> None:
         report = self._run()
         self.assertEqual(report["status"], "admitted")
@@ -203,6 +208,7 @@ class AdmissionTests(unittest.TestCase):
             ).fetchall()
         return [(row["dispatch_id"], row["outcome"], row["observation_json"]) for row in rows]
 
+    @requires_native_windows_admission
     def test_second_dispatch_preflight_for_same_task_is_rejected_without_native_calls(self) -> None:
         self.assertEqual(self._run()["status"], "admitted")
         before = self._stored_rows()
@@ -224,6 +230,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(replay.exception.code, "preflight_already_rejected")
         self.assertEqual(self._stored_rows(), after)
 
+    @requires_native_windows_admission
     def test_two_concurrent_public_preflights_cannot_both_receive_fresh_grants(self) -> None:
         first_inside_fence = threading.Event()
         release_first = threading.Event()
@@ -301,6 +308,7 @@ class AdmissionTests(unittest.TestCase):
         rows = self._stored_rows()
         self.assertEqual([(row[0], row[1]) for row in rows], [("dispatch_1", "passed"), ("dispatch_2", "rejected")])
 
+    @requires_native_windows_admission
     def test_join_treats_other_dispatch_observation_as_conflicting_not_absent(self) -> None:
         self.assertEqual(self._run()["status"], "admitted")
         with StateStore(self.root) as store:
@@ -319,6 +327,7 @@ class AdmissionTests(unittest.TestCase):
             # Absent observation for the bound Dispatch with no other rows stays pending.
             self.assertEqual(joined_preflight_status(store, store.update_run(self.local_id, task_id="task_2")), "pending")
 
+    @requires_native_windows_admission
     def test_join_with_multiple_observations_is_conflicting_even_for_the_passed_dispatch(self) -> None:
         self.assertEqual(self._run()["status"], "admitted")
         with self.assertRaises(OrchestrateError):
@@ -331,6 +340,7 @@ class AdmissionTests(unittest.TestCase):
                 [("dispatch_1", "passed"), ("dispatch_2", "rejected")],
             )
 
+    @requires_native_windows_admission
     def test_orca_1_4_199_worker_show_identity_is_admitted_explicitly(self) -> None:
         report = worker_preflight(
             self.root,
@@ -344,6 +354,7 @@ class AdmissionTests(unittest.TestCase):
         )
         self.assertEqual(report["status"], "admitted")
 
+    @requires_native_windows_admission
     def test_orca_1_4_199_local_terminal_without_host_platform_is_admitted_on_native_windows(self) -> None:
         report = worker_preflight(
             self.root,
@@ -392,30 +403,35 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(rejected.exception.code, "preflight_rejected")
         self.assertEqual(rejected.exception.data["cause"], "preflight_identity_conflict")  # type: ignore[index]
 
+    @requires_native_windows_admission
     def test_orca_1_4_198_preflight_rejects_ready_dispatch_failure(self) -> None:
         self._assert_ready_contradiction_rejected(
             current_worker_shape=False,
             field="dispatch_last_failure",
         )
 
+    @requires_native_windows_admission
     def test_orca_1_4_198_preflight_rejects_ready_worker_error(self) -> None:
         self._assert_ready_contradiction_rejected(
             current_worker_shape=False,
             field="worker_last_error",
         )
 
+    @requires_native_windows_admission
     def test_orca_1_4_199_preflight_rejects_ready_dispatch_failure(self) -> None:
         self._assert_ready_contradiction_rejected(
             current_worker_shape=True,
             field="dispatch_last_failure",
         )
 
+    @requires_native_windows_admission
     def test_orca_1_4_199_preflight_rejects_ready_worker_error(self) -> None:
         self._assert_ready_contradiction_rejected(
             current_worker_shape=True,
             field="worker_last_error",
         )
 
+    @requires_native_windows_admission
     def test_terminal_reported_non_windows_platform_is_rejected_precisely(self) -> None:
         client = PreflightClient(self.root, self.packet, host_platform="linux")
         with self.assertRaises(OrchestrateError) as rejected:
@@ -434,6 +450,7 @@ class AdmissionTests(unittest.TestCase):
         mismatch = rejected.exception.data["mismatches"][0]  # type: ignore[index]
         self.assertEqual(mismatch["details"]["fields"][0]["field"], "terminal.hostPlatform")
 
+    @requires_native_windows_admission
     def test_terminal_without_execution_host_identity_is_rejected_as_ambiguous(self) -> None:
         client = PreflightClient(
             self.root,
@@ -455,6 +472,7 @@ class AdmissionTests(unittest.TestCase):
         mismatch = rejected.exception.data["mismatches"][0]  # type: ignore[index]
         self.assertEqual(mismatch["details"]["fields"][0]["field"], "terminal.executionHostId")
 
+    @requires_native_windows_admission
     def test_terminal_on_a_different_execution_host_is_rejected_even_if_it_reports_windows(self) -> None:
         client = PreflightClient(self.root, self.packet, execution_host_id="connected-host")
         with self.assertRaises(OrchestrateError) as rejected:
@@ -480,10 +498,16 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(rejected.exception.code, "preflight_rejected")
         self.assertEqual(rejected.exception.data["cause"], "source_binding_changed")  # type: ignore[index]
         self.assertEqual(len(subprocess_calls.call_args_list), 1)
+        actual_git_argv = subprocess_calls.call_args.args[0]
         self.assertEqual(
-            subprocess_calls.call_args.args[0],
+            actual_git_argv[:2],
+            ("git", "-C"),
+        )
+        self.assertEqual(Path(actual_git_argv[2]).resolve(), self.root.resolve())
+        self.assertEqual(
+            actual_git_argv[3:],
             (
-                "git", "-C", str(self.root), "ls-files", "-z", "--cached",
+                "ls-files", "-z", "--cached",
                 "--others", "--exclude-standard", "--", *INSTRUCTION_PATHSPECS,
             ),
         )

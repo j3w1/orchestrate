@@ -46,6 +46,10 @@ from orchestrate.state import AdmissionEffectFence, StateStore
 
 
 LIVENESS_TIMEOUT = 120.0  # Outer deadlock detector, not a semantic progress budget.
+requires_native_windows_admission = unittest.skipUnless(
+    sys.platform == "win32",
+    "managed worker admission is win32-only by design",
+)
 
 
 def git(root: Path, *arguments: str) -> bytes:
@@ -1325,6 +1329,7 @@ class MilestoneRepo(unittest.TestCase):
 
 
 class ControllerTests(MilestoneRepo):
+    @requires_native_windows_admission
     def test_production_controller_executes_tracked_native_milestone_plan(self) -> None:
         objective = "Integrate the exact bounded milestone"
         plan = self._write_milestone_plan(objective)
@@ -1355,6 +1360,7 @@ class ControllerTests(MilestoneRepo):
             ["admitted", "admitted"],
         )
 
+    @requires_native_windows_admission
     def test_production_controller_executes_wide_ready_frontier_in_bounded_waves(self) -> None:
         objective = "Execute every specialist in deterministic bounded waves"
         specialists = ("verify_a", "verify_b", "verify_c")
@@ -1414,6 +1420,7 @@ class ControllerTests(MilestoneRepo):
             ],
         )
 
+    @requires_native_windows_admission
     def test_resume_executes_valid_mixed_later_waves_under_remaining_capacity(self) -> None:
         objective = "Resume every valid later specialist wave"
         specialists = ("verify_a", "verify_b", "verify_c")
@@ -1477,6 +1484,7 @@ class ControllerTests(MilestoneRepo):
             ["task_1", "task_2", "task_3", "task_4", "task_5"],
         )
 
+    @requires_native_windows_admission
     def test_status_and_explain_retract_accepted_review_for_all_consulted_source_drift(self) -> None:
         objective = "Invalidate accepted review as soon as consulted source identity changes"
         plan = self._write_milestone_plan(objective)
@@ -1588,6 +1596,7 @@ class ControllerTests(MilestoneRepo):
                 self.assertEqual(restored["verification"], "review_accepted")
                 self.assertIs(restored["sourceBinding"]["unchanged"], True)
 
+    @requires_native_windows_admission
     def test_status_and_explain_reject_every_corrupt_or_unbound_candidate_packet_identity(self) -> None:
         objective = "Reject corrupt immutable candidate packet identity"
         plan = self._write_milestone_plan(objective)
@@ -1726,6 +1735,7 @@ class ControllerTests(MilestoneRepo):
         self.assertEqual(restored["verification"], "review_accepted")
         self.assertIs(restored["sourceBinding"]["unchanged"], True)
 
+    @requires_native_windows_admission
     def test_accepted_review_requires_exact_canonical_plan_and_complete_native_history(self) -> None:
         objective = "Reject altered or missing milestone plan authority"
         plan_path = self._write_milestone_plan(objective)
@@ -2177,6 +2187,7 @@ class ControllerTests(MilestoneRepo):
         self.assertEqual(restored["verification"], "review_accepted")
         self.assertIs(restored["sourceBinding"]["unchanged"], True)
 
+    @requires_native_windows_admission
     def test_accepted_review_projects_unavailable_profile_identity_as_stale_until_exact_restoration(self) -> None:
         objective = "Project unavailable current profile identity as stale"
         plan = self._write_milestone_plan(objective)
@@ -2240,6 +2251,7 @@ class ControllerTests(MilestoneRepo):
                 operation()
             self.assertEqual(caught.exception.code, "profile_missing")
 
+    @requires_native_windows_admission
     def test_status_and_explain_leave_closed_state_database_and_sidecars_unchanged(self) -> None:
         objective = "Report without mutating host-local state"
         plan = self._write_milestone_plan(objective)
@@ -2296,6 +2308,7 @@ class ControllerTests(MilestoneRepo):
         self.assertEqual(caught.exception.code, "milestone_plan_untracked")
         self.assertEqual(client.calls, [])
 
+    @requires_native_windows_admission
     def test_false_verification_success_keeps_review_gate_blocking(self) -> None:
         objective = "Integrate then reject false verifier success"
         plan = self._write_milestone_plan(objective)
@@ -2356,6 +2369,7 @@ class ControllerTests(MilestoneRepo):
         self.assertEqual(resumed["status"], "milestone_blocked")
         self.assertEqual(mutating_after, mutating_before)
 
+    @requires_native_windows_admission
     def test_rejected_exact_review_never_completes_the_milestone(self) -> None:
         objective = "Integrate then preserve rejected review evidence"
         plan = self._write_milestone_plan(objective)
@@ -2376,6 +2390,7 @@ class ControllerTests(MilestoneRepo):
         self.assertEqual(review["result_outcome"], "rejected")
         self.assertNotEqual(report["verification"], "review_accepted")
 
+    @requires_native_windows_admission
     def test_uncertain_milestone_launch_is_not_duplicated_on_resume(self) -> None:
         objective = "Integrate then preserve uncertain follow-up launch"
         plan = self._write_milestone_plan(objective)
@@ -3116,6 +3131,7 @@ class ControllerTests(MilestoneRepo):
                 ],
             }
 
+    @requires_native_windows_admission
     def test_question_delivery_remains_unacknowledged_then_answers_exactly(self) -> None:
         objective = "Ask when blocked"
         report = self._start_pending_question(objective)
@@ -3153,6 +3169,7 @@ class ControllerTests(MilestoneRepo):
             self.assertEqual((question["status"], question["answer"]), ("answered", "Choose A"))
             self.assertEqual(delivery["acked"], 1)
 
+    @requires_native_windows_admission
     def test_concurrent_public_preflight_cannot_cross_complete_answer_effect_interval(self) -> None:
         objective = "Fence a concurrent answer and second preflight"
         report = self._start_pending_question(objective)
@@ -3278,6 +3295,7 @@ class ControllerTests(MilestoneRepo):
         self.assertEqual(idle.calls, [])
         self.assertEqual(self._answer_guard_snapshot(local_id), conflict_snapshot)
 
+    @requires_native_windows_admission
     def test_answer_holds_second_dispatch_observation_before_orca_or_local_effects(self) -> None:
         report = self._start_pending_question("Hold answer after a second Dispatch observation")
         local_id = str(report["localRunId"])
@@ -3325,6 +3343,7 @@ class ControllerTests(MilestoneRepo):
             self.assertEqual(run.phase, "preflight_held")
             self.assertEqual(joined_preflight_status(store, run), "conflicting")
 
+    @requires_native_windows_admission
     def test_answer_holds_malformed_observation_before_orca_or_local_effects(self) -> None:
         report = self._start_pending_question("Hold answer after malformed immutable evidence")
         local_id = str(report["localRunId"])
@@ -3356,6 +3375,7 @@ class ControllerTests(MilestoneRepo):
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
             self.assertEqual(store.get_run(local_id).phase, "preflight_held")
 
+    @requires_native_windows_admission
     def test_conflicting_blocked_question_transitions_to_preflight_hold_and_keeps_escalation(self) -> None:
         objective = "Hold a blocked question after conflicting preflight"
         question = lifecycle_message(
@@ -3425,6 +3445,7 @@ class ControllerTests(MilestoneRepo):
             self.assertEqual(store.evidence(local_id), escalation_evidence)
         self.assertTrue(any(item["kind"] == "worker-escalation" for item in escalation_evidence))
 
+    @requires_native_windows_admission
     def test_pending_admission_preflight_obligation_precedes_question_instruction(self) -> None:
         report = self._start_pending_question("Report pending admission before a question")
         local_id = str(report["localRunId"])
@@ -4943,9 +4964,11 @@ class ControllerTests(MilestoneRepo):
             self.assertEqual(observation["native"]["terminalHandle"], binding.terminal_handle)  # type: ignore[index,union-attr]
             self.assertEqual(observation["native"]["worktreeId"], binding.worktree_id)  # type: ignore[index,union-attr]
 
+    @requires_native_windows_admission
     def test_orca_1_4_198_real_preflight_before_controller_receipt_joins_to_admitted(self) -> None:
         self._assert_real_pre_receipt_preflight_joins(current_shape=False)
 
+    @requires_native_windows_admission
     def test_orca_1_4_199_real_preflight_before_controller_receipt_joins_to_admitted(self) -> None:
         self._assert_real_pre_receipt_preflight_joins(current_shape=True)
 
@@ -5001,12 +5024,15 @@ class ControllerTests(MilestoneRepo):
             self.assertEqual(run.phase, "preflight_held")
             self.assertNotEqual(observation["native"][native_field], getattr(binding, field))  # type: ignore[index,arg-type]
 
+    @requires_native_windows_admission
     def test_later_controller_resource_id_mismatch_holds(self) -> None:
         self._assert_later_controller_binding_mismatch_holds("resource_id")
 
+    @requires_native_windows_admission
     def test_later_controller_terminal_handle_mismatch_holds(self) -> None:
         self._assert_later_controller_binding_mismatch_holds("terminal_handle")
 
+    @requires_native_windows_admission
     def test_later_controller_worktree_id_mismatch_holds(self) -> None:
         self._assert_later_controller_binding_mismatch_holds("worktree_id")
 
@@ -5117,12 +5143,15 @@ class ControllerTests(MilestoneRepo):
         self._assert_split_dispatch_detail(explained, other=[("dispatch_1", "passed")])
         self.assertEqual(self._preflight_rows(local_id), [("dispatch_1", "passed", passed_bytes)])
 
+    @requires_native_windows_admission
     def test_orca_1_4_198_later_controller_dispatch_id_mismatch_holds(self) -> None:
         self._assert_later_controller_dispatch_mismatch_holds(current_shape=False)
 
+    @requires_native_windows_admission
     def test_orca_1_4_199_later_controller_dispatch_id_mismatch_holds(self) -> None:
         self._assert_later_controller_dispatch_mismatch_holds(current_shape=True)
 
+    @requires_native_windows_admission
     def test_second_dispatch_preflight_is_rejected_and_exact_later_binding_still_holds(self) -> None:
         objective = "Hold an ambiguous pre-receipt double preflight"
         responses = completion_responses(self.root, objective)[:4]

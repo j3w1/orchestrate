@@ -39,6 +39,10 @@ One earlier full-suite run failed once in `AdmissionTests.test_two_concurrent_pu
 
 ## Known limitations
 
+### Native-Windows managed admission limits Linux test coverage
+
+Managed worker preflight is win32-only by design in this milestone. Tests whose intended assertion requires a successful native-Windows admission path therefore use an explicit non-Windows skip, while Linux continues to run every host-neutral test and every pre-admission rejection test. The Windows and Linux CI jobs do not exercise equivalent unit/incident coverage: Windows runs the complete suite, and Linux runs that host-neutral subset; both jobs still run explicit incident discovery, wheel build, isolated install, and CLI help smokes. A passing Linux subset is not evidence of managed Linux or WSL worker admission, and the Windows-coordinated WSL lifecycle remains a separate `NOT_RUN` gate above.
+
 ### Missing selected source before the admission fence
 
 When a packet-bound selected source no longer exists on disk, `worker-preflight` fails with `source_unavailable` during operational-profile loading. That load occurs before the state store is opened, the admission/effect fence is acquired, or an immutable observation is recorded, so the attempt leaves no durable rejected observation; restoring the exact bytes allows a later preflight of the same Dispatch to receive a fresh editing grant. This behavior predates the third increment and is present in the accepted second-increment base `5f250f38bb2defcb01833842c29dea5394c41877`. To reproduce it, build and bind a packet while a selected instruction exists, remove that file, call `worker-preflight`, then restore it byte-for-byte and call `worker-preflight` again for the same Dispatch. The documented immutability guarantee is therefore limited to attempts that reach the fence. Byte drift in a selected source that still exists is unaffected: it reaches the fence and produces a durable rejection, so restoring the bytes cannot turn a replay into admission.

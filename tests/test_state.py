@@ -163,8 +163,9 @@ class StateTests(unittest.TestCase):
                 first = store.create_run(objective="one", profile_digest="p", source_digest="s")
                 second = store.create_run(objective="two", profile_digest="p", source_digest="s")
                 self.assertNotEqual(first.local_id, second.local_id)
-                self.assertTrue(store.path.is_relative_to(Path(home_dir)))
-                self.assertFalse(store.path.is_relative_to(root))
+                normalized_store_path = store.path.resolve()
+                self.assertTrue(normalized_store_path.is_relative_to(Path(home_dir).resolve()))
+                self.assertFalse(normalized_store_path.is_relative_to(root.resolve()))
                 with self.assertRaisesRegex(OrchestrateError, "More than one"):
                     store.select_run(None)
 

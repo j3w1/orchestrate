@@ -6,10 +6,16 @@ from unittest.mock import patch
 from orchestrate.cli import main as cli_main
 from orchestrate.controller import explain, implement, status
 from orchestrate.state import StateStore
-from test_controller import MilestoneClient, MilestoneRepo, ReportingClient
+from test_controller import (
+    MilestoneClient,
+    MilestoneRepo,
+    ReportingClient,
+    requires_native_windows_admission,
+)
 
 
 class TaskCreationHistoryTamperingIncident(MilestoneRepo):
+    @requires_native_windows_admission
     def test_accepted_review_fails_closed_until_exact_history_is_restored(self) -> None:
         objective = "Preserve exact Task creation history"
         plan = self._write_milestone_plan(objective)

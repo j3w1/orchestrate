@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,6 +15,12 @@ from orchestrate.bootstrap import _exit_code, controller_command, decode_payload
 from orchestrate.cli import build_parser, main
 from orchestrate.errors import OrchestrateError
 from orchestrate.orca import OrcaCommandError, OrcaCommandResult
+
+
+requires_native_windows_admission = unittest.skipUnless(
+    sys.platform == "win32",
+    "managed worker admission is win32-only by design",
+)
 
 
 class FakeClient:
@@ -300,6 +307,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn("'/opt/python 3.13/bin/python'", linux)
         self.assertIn(" -I -m orchestrate ", linux)
 
+    @requires_native_windows_admission
     def test_launcher_journals_mirrors_output_and_returns_inner_exit_code(self) -> None:
         client = FakeClient()
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
@@ -375,6 +383,7 @@ class BootstrapTests(unittest.TestCase):
                 _exit_code(boolean_receipt, expected_handle="term_controller")
             self.assertEqual(boolean_mismatch.exception.code, "bootstrap_exit_unproven")
 
+    @requires_native_windows_admission
     def test_ctrl_c_still_requires_durable_result_and_exact_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
             os.environ,
@@ -403,6 +412,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(replay.exception.code, "bootstrap_effect_uncertain")
             self.assertEqual(second.calls, [])
 
+    @requires_native_windows_admission
     def test_uncertain_interrupt_is_never_repeated_and_exact_exit_can_recover(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
             os.environ,
@@ -426,6 +436,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertFalse(any(call[:2] == ("terminal", "send") for call in recovery.calls))
             self.assertFalse(any(call[:2] == ("terminal", "create") for call in recovery.calls))
 
+    @requires_native_windows_admission
     def test_uncertain_close_reconciles_live_historical_show_without_host_platform(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
             os.environ,
@@ -457,6 +468,7 @@ class BootstrapTests(unittest.TestCase):
             cleanup = json.loads(journal["cleanup_observation_json"])
             self.assertEqual(cleanup["outcome"], "observed-exited-and-absent")
 
+    @requires_native_windows_admission
     def test_uncertain_close_rejects_contradictory_historical_host_platform(self) -> None:
         for host_platform in ("linux", None, False):
             with self.subTest(host_platform=host_platform), tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
@@ -474,6 +486,7 @@ class BootstrapTests(unittest.TestCase):
                 self.assertEqual(held.exception.code, "bootstrap_effect_uncertain")
                 self.assertFalse(any(call[:2] == ("terminal", "close") for call in recovery.calls))
 
+    @requires_native_windows_admission
     def test_uncertain_close_holds_when_durable_child_result_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
             os.environ,
@@ -495,6 +508,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(held.exception.code, "bootstrap_effect_uncertain")
             self.assertEqual(recovery.calls, [])
 
+    @requires_native_windows_admission
     def test_uncertain_close_holds_on_stale_runtime_without_repeating_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
             os.environ,
@@ -511,6 +525,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(held.exception.code, "bootstrap_effect_uncertain")
             self.assertFalse(any(call[:2] == ("terminal", "close") for call in recovery.calls))
 
+    @requires_native_windows_admission
     def test_uncertain_close_rejects_boolean_exit_receipts_and_durable_results(self) -> None:
         for integer, boolean in ((0, False), (1, True)):
             with self.subTest(receipt=boolean), tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
@@ -554,6 +569,7 @@ class BootstrapTests(unittest.TestCase):
                 self.assertEqual(held.exception.code, "bootstrap_effect_uncertain")
                 self.assertEqual(recovery.calls, [])
 
+    @requires_native_windows_admission
     def test_uncertain_close_rejects_boolean_inventory_completeness(self) -> None:
         for field, boolean in (("totalCount", True), ("topologyRevision", False), ("topologyRevision", True)):
             with self.subTest(field=field, value=boolean), tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(

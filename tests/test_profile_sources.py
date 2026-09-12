@@ -348,9 +348,14 @@ class ProfileAndSourceTests(DisposableRepo):
         self.assertTrue(indexed.value["candidate"]["coverageComplete"])
 
     def test_selected_non_conventional_instruction_is_read_and_routed_as_authority(self) -> None:
+        git(self.root, "config", "core.autocrlf", "false")
         (self.root / "POLICY.md").write_text("Selected policy.\n", encoding="utf-8")
         git(self.root, "add", "POLICY.md")
         git(self.root, "commit", "-qm", "add selected policy")
+        self.assertEqual(
+            git(self.root, "show", "HEAD:POLICY.md"),
+            (self.root / "POLICY.md").read_bytes(),
+        )
         profile = setup_project(self.root)
         profile.value["instructions"].append("POLICY.md")
         (self.root / PROFILE_NAME).write_text(json.dumps(profile.value), encoding="utf-8")
