@@ -1,6 +1,6 @@
 # orchestrate contributor instructions
 
-Read `docs/implementation-plan.md` before implementation. Inspect Git state and preserve unrelated work. The project is an Orca-native Python CLI; Orca owns native tasks, dispatches, environments and worker lifecycle. Existing project governance owns authority and acceptance.
+Read `docs/contracts-and-recovery.md` and `docs/validation.md` before implementation. Inspect Git state and preserve unrelated work. The project is an Orca-native Python CLI; Orca owns native tasks, dispatches, environments and worker lifecycle. Existing project governance owns authority and acceptance.
 
 Use Python 3.13+, a standard src layout, standard-library runtime facilities where practical, and a small JSON project profile. Never embed personal paths, runtime IDs, credentials, private source packets or live local bookkeeping in committed files.
 

@@ -22,7 +22,5 @@
     "kind": "single-owner-first",
     "maxWorkers": 3
   },
-  "taskEntrypoints": [
-    "docs/implementation-plan.md"
-  ]
+  "taskEntrypoints": []
 }

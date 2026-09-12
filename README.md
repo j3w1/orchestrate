@@ -177,7 +177,7 @@ There is no parallel task database, worktree manager, provider API, policy engin
 
 ## Contributing
 
-Read [AGENTS.md](AGENTS.md) and the [approved implementation plan](docs/implementation-plan.md) before changing code. The tracked plan remains until final project completion.
+Read [AGENTS.md](AGENTS.md) before changing code. The approved implementation plan was archived outside this repository at final project completion.
 
 Run the repository gates with Python 3.13:
 
