@@ -565,6 +565,26 @@ class AdmissionTests(unittest.TestCase):
                     decode_packet(canonical_packet_json(malformed))
                 self.assertEqual(rejected.exception.code, "packet_identity_conflict")
 
+    def test_strict_packet_decode_rejects_duplicate_keys_and_nonfinite_numbers(self) -> None:
+        from orchestrate.packets import decode_packet
+
+        packet_json = canonical_packet_json(self.packet)
+        duplicate = packet_json.replace(
+            '  "schema": "orchestrate-worker-packet/v3",',
+            '  "schema": "orchestrate-worker-packet/v3",\n  "schema": "orchestrate-worker-packet/v3",',
+            1,
+        )
+        nonfinite = packet_json.replace(
+            '  "unresolvedDecisions": []',
+            '  "unresolvedDecisions": [NaN]',
+            1,
+        )
+        for malformed in (duplicate, nonfinite):
+            with self.subTest(malformed=malformed[-80:]):
+                with self.assertRaises(OrchestrateError) as rejected:
+                    decode_packet(malformed)
+                self.assertEqual(rejected.exception.code, "packet_identity_conflict")
+
     def test_reader_and_index_consume_the_single_completed_source_stage(self) -> None:
         with StateStore(self.root) as store:
             run = store.get_run(self.local_id)

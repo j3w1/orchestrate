@@ -75,12 +75,29 @@ def _git_oid(value: object) -> bool:
     )
 
 
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
 def decode_packet(packet_json: str) -> DecodedPacket:
     """Strictly decode canonical v3 and every source record without I/O."""
 
     try:
-        packet = json.loads(packet_json)
-    except json.JSONDecodeError as exc:
+        packet = json.loads(
+            packet_json,
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
         raise OrchestrateError("Stored worker packet is invalid JSON", code="packet_identity_conflict") from exc
     if isinstance(packet, dict) and packet.get("schema") != PACKET_SCHEMA:
         raise OrchestrateError(

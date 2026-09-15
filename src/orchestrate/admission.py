@@ -22,11 +22,12 @@ from .packets import (
 )
 from .profile import ProjectProfile
 from .readers import CE_QUERY_SCRIPT, ReaderResult, read_project
-from .safeio import approved_project_path, read_project_bytes
+from .safeio import approved_project_path, is_sensitive_source, read_project_bytes
 from .sources import (
     PreparedSourceSet,
     SourceAccess,
     SourceIndex,
+    SourceKind,
     SourceReference,
     build_source_index,
     classify_source_reference,
@@ -167,6 +168,20 @@ def _prepare_packet_sources(
         )
         for record in decoded.source_records
     )
+    for reference in references:
+        memberships = reference.kinds - {SourceKind.PACKET_BOUND}
+        if (
+            not memberships
+            or is_sensitive_source(reference.path)
+            or (
+                reference.access == SourceAccess.REFERENCE_ONLY
+                and SourceKind.CANDIDATE not in memberships
+            )
+        ):
+            raise OrchestrateError(
+                "Worker packet source eligibility is malformed",
+                code="packet_identity_conflict",
+            )
     raw_by_path: dict[str, bytes | None] = {}
     guarded: list[SourceReference] = []
     for reference in references:
