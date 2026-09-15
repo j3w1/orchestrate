@@ -1193,8 +1193,14 @@ def settlement_responses(
     ]
 
 
-def completion_responses(root: Path, objective: str, outcome: str = "succeeded") -> list[Response]:
-    delivery = {
+def completion_responses(
+    root: Path,
+    objective: str,
+    outcome: str = "succeeded",
+    *,
+    delivery_observed: threading.Event | None = None,
+) -> list[Response]:
+    delivery_payload = {
         "result": {
             "deliveryId": "delivery_1",
             "messages": [
@@ -1207,6 +1213,13 @@ def completion_responses(root: Path, objective: str, outcome: str = "succeeded")
             ],
         }
     }
+    delivery: Response = delivery_payload
+    if delivery_observed is not None:
+        def observed_delivery(_: FakeClient, __: tuple[str, ...]) -> dict[str, object]:
+            delivery_observed.set()
+            return delivery_payload
+
+        delivery = observed_delivery
     return [
         mutation("request_run", run={"id": "run_1"}),
         {"result": {"run": {"id": "run_1", "objective": objective}}},
@@ -1274,6 +1287,38 @@ class MilestoneRepo(unittest.TestCase):
         self.environment.stop()
         self.project_temp.cleanup()
         self.state_temp.cleanup()
+
+    def _run_event_backed(
+        self,
+        action: Callable[[], dict[str, object]],
+        observed: threading.Event,
+        *,
+        description: str,
+    ) -> dict[str, object]:
+        completed = threading.Event()
+        outcome: dict[str, object] = {}
+
+        def run_action() -> None:
+            try:
+                outcome["report"] = action()
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=run_action, daemon=True)
+        worker.start()
+        self.assertTrue(
+            completed.wait(LIVENESS_TIMEOUT),
+            f"{description} exceeded its outer liveness bound",
+        )
+        if "error" in outcome:
+            raise outcome["error"]  # type: ignore[misc]
+        report = outcome.get("report")
+        if not isinstance(report, dict):
+            self.fail(f"{description} did not return a report")
+        self.assertTrue(observed.is_set(), f"{description} did not observe its completion event")
+        return report
 
     def _write_milestone_plan(
         self,
@@ -1594,7 +1639,7 @@ class ControllerTests(MilestoneRepo):
                                 local_run_id,
                                 client=client,  # type: ignore[arg-type]
                                 milestone_plan=plan,
-                                wait_timeout_ms=100,
+                                wait_timeout_ms=60_000,
                                 require_context=False,
                             )
                         self.assertEqual(stale_resume.exception.code, "stale_review")
@@ -2324,7 +2369,7 @@ class ControllerTests(MilestoneRepo):
                 objective,
                 client=client,  # type: ignore[arg-type]
                 milestone_plan=untracked,
-                wait_timeout_ms=100,
+                wait_timeout_ms=60_000,
                 require_context=False,
             )
 
@@ -2374,7 +2419,7 @@ class ControllerTests(MilestoneRepo):
             None,
             client=client,  # type: ignore[arg-type]
             milestone_plan=plan,
-            wait_timeout_ms=100,
+            wait_timeout_ms=60_000,
             require_context=False,
         )
         mutating_after = [
@@ -2437,7 +2482,7 @@ class ControllerTests(MilestoneRepo):
                 None,
                 client=client,  # type: ignore[arg-type]
                 milestone_plan=plan,
-                wait_timeout_ms=100,
+                wait_timeout_ms=60_000,
                 require_context=False,
             )
         self.assertEqual(resumed.exception.code, "unknown_external_effect")
@@ -2447,8 +2492,25 @@ class ControllerTests(MilestoneRepo):
     def test_single_worker_happy_path_releases_before_ack_and_preserves_wip(self) -> None:
         objective = "Make the bounded change"
         before = git(self.root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
-        client = FakeClient(completion_responses(self.root, objective))
-        report = implement(self.root, objective, client=client, wait_timeout_ms=100, require_context=False)  # type: ignore[arg-type]
+        delivery_observed = threading.Event()
+        client = FakeClient(
+            completion_responses(
+                self.root,
+                objective,
+                delivery_observed=delivery_observed,
+            )
+        )
+        report = self._run_event_backed(
+            lambda: implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=int(LIVENESS_TIMEOUT * 500),
+                require_context=False,
+            ),
+            delivery_observed,
+            description="happy-path worker completion",
+        )
         after = git(self.root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
 
         self.assertEqual(before, after)
@@ -2463,14 +2525,25 @@ class ControllerTests(MilestoneRepo):
             "Make the failing counter test pass by changing only counter.py. Preserve the existing README.md "
             "and owner-note.txt WIP. Run python -m unittest discover -s tests."
         )
-        client = FakeClient(completion_responses(self.root, objective))
+        delivery_observed = threading.Event()
+        client = FakeClient(
+            completion_responses(
+                self.root,
+                objective,
+                delivery_observed=delivery_observed,
+            )
+        )
 
-        report = implement(
-            self.root,
-            objective,
-            client=client,  # type: ignore[arg-type]
-            wait_timeout_ms=100,
-            require_context=False,
+        report = self._run_event_backed(
+            lambda: implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=int(LIVENESS_TIMEOUT * 500),
+                require_context=False,
+            ),
+            delivery_observed,
+            description="long-title worker completion",
         )
 
         task_call = next(call for call in client.calls if call[:2] == ("orchestration", "task-create"))
@@ -2585,12 +2658,25 @@ class ControllerTests(MilestoneRepo):
 
     def test_failed_worker_is_not_reported_as_success_or_verification(self) -> None:
         objective = "Fail honestly"
-        report = implement(
-            self.root,
-            objective,
-            client=FakeClient(completion_responses(self.root, objective, "failed")),  # type: ignore[arg-type]
-            wait_timeout_ms=100,
-            require_context=False,
+        delivery_observed = threading.Event()
+        client = FakeClient(
+            completion_responses(
+                self.root,
+                objective,
+                "failed",
+                delivery_observed=delivery_observed,
+            )
+        )
+        report = self._run_event_backed(
+            lambda: implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=int(LIVENESS_TIMEOUT * 500),
+                require_context=False,
+            ),
+            delivery_observed,
+            description="failed-worker completion",
         )
         self.assertEqual(report["status"], "worker_failed")
         self.assertEqual(report["workerOutcome"], "failed")
@@ -3439,18 +3525,29 @@ class ControllerTests(MilestoneRepo):
             subject="Blocked: preserve this evidence",
             body="The worker is still blocked.",
         )
+        delivery_observed = threading.Event()
+
+        def blocked_delivery(_: FakeClient, __: tuple[str, ...]) -> dict[str, object]:
+            delivery_observed.set()
+            return {"result": {"deliveryId": "delivery_blocked", "messages": [question, escalation]}}
+
         responses = completion_responses(self.root, objective)[:4]
         responses.extend([
             _worker_start_with_real_preflight(self.root, current_shape=True),
             _worker_start_readback(self.root, current_shape=True),
-            {"result": {"deliveryId": "delivery_blocked", "messages": [question, escalation]}},
+            blocked_delivery,
         ])
-        initial = implement(
-            self.root,
-            objective,
-            client=FakeClient(responses),  # type: ignore[arg-type]
-            wait_timeout_ms=100,
-            require_context=False,
+        client = FakeClient(responses)
+        initial = self._run_event_backed(
+            lambda: implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=int(LIVENESS_TIMEOUT * 500),
+                require_context=False,
+            ),
+            delivery_observed,
+            description="blocked question and escalation",
         )
         local_id = str(initial["localRunId"])
         self.assertEqual(initial["status"], "blocked")
@@ -3543,20 +3640,29 @@ class ControllerTests(MilestoneRepo):
             subject="Blocked: exact fixture",
             body="The worker is blocked.",
         )
-        delivery = {
-            "result": {
-                "deliveryId": "delivery_raw",
-                "messages": [question, escalation],
-            }
-        }
-        client = FakeClient([*completion_responses(self.root, objective)[:6], delivery])
+        delivery_observed = threading.Event()
 
-        report = implement(
-            self.root,
-            objective,
-            client=client,  # type: ignore[arg-type]
-            wait_timeout_ms=100,
-            require_context=False,
+        def raw_delivery(_: FakeClient, __: tuple[str, ...]) -> dict[str, object]:
+            delivery_observed.set()
+            return {
+                "result": {
+                    "deliveryId": "delivery_raw",
+                    "messages": [question, escalation],
+                }
+            }
+
+        client = FakeClient([*completion_responses(self.root, objective)[:6], raw_delivery])
+
+        report = self._run_event_backed(
+            lambda: implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=int(LIVENESS_TIMEOUT * 500),
+                require_context=False,
+            ),
+            delivery_observed,
+            description="raw question and escalation",
         )
 
         self.assertEqual(report["status"], "blocked")
@@ -4446,9 +4552,11 @@ class ControllerTests(MilestoneRepo):
 
     def test_dispatched_and_stored_packet_have_one_truthful_identity(self) -> None:
         objective = "Inspect packet identity"
-        responses = completion_responses(self.root, objective)[:6]
-        responses.append(
-            {
+        delivery_observed = threading.Event()
+
+        def pending_delivery(_: FakeClient, __: tuple[str, ...]) -> dict[str, object]:
+            delivery_observed.set()
+            return {
                 "result": {
                     "deliveryId": "delivery_q",
                     "messages": [
@@ -4461,9 +4569,21 @@ class ControllerTests(MilestoneRepo):
                     ],
                 }
             }
-        )
+
+        responses = completion_responses(self.root, objective)[:6]
+        responses.append(pending_delivery)
         client = FakeClient(responses)
-        report = implement(self.root, objective, client=client, wait_timeout_ms=100, require_context=False)  # type: ignore[arg-type]
+        report = self._run_event_backed(
+            lambda: implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=int(LIVENESS_TIMEOUT * 500),
+                require_context=False,
+            ),
+            delivery_observed,
+            description="stored-packet question",
+        )
         task_call = next(call for call in client.calls if "task-create" in call)
         spec = task_call[task_call.index("--spec") + 1]
         embedded_json = spec[spec.index("{"):]
@@ -5264,17 +5384,30 @@ class ControllerTests(MilestoneRepo):
             self.root, objective, client=FakeClient(responses), wait_timeout_ms=1, require_context=False,  # type: ignore[arg-type]
         )
         self.assertEqual(initial["status"], "waiting")
+        delivery_observed = threading.Event()
         resume_responses: list[Response] = [
             mutation("request_use", run={"id": "run_1"}),
             {"result": {"run": {"id": "run_1"}}},
             {"result": {"run": {"id": "run_1", "objective": objective}}},
-            completion_responses(self.root, objective)[6],
+            completion_responses(
+                self.root,
+                objective,
+                delivery_observed=delivery_observed,
+            )[6],
             *settlement_responses(worktree_id=f"repo::{self.root.resolve()}"),
             acknowledgement("delivery_1"),
         ]
-        final = resume(
-            self.root, str(initial["localRunId"]), client=FakeClient(resume_responses),
-            wait_timeout_ms=100, require_context=False,  # type: ignore[arg-type]
+        client = FakeClient(resume_responses)
+        final = self._run_event_backed(
+            lambda: resume(
+                self.root,
+                str(initial["localRunId"]),
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=int(LIVENESS_TIMEOUT * 500),
+                require_context=False,
+            ),
+            delivery_observed,
+            description="admitted-output resume completion",
         )
         self.assertEqual(final["status"], "worker_succeeded")
         self.assertEqual((self.root / "output.txt").read_text(encoding="utf-8").strip(), "legitimate worker output")
@@ -5421,14 +5554,11 @@ class ControllerTests(MilestoneRepo):
                 }
             }
 
-        responses: list[Response] = [
-            mutation("request_use", run={"id": "run_1"}),
-            {"result": {"run": {"id": "run_1"}}},
-            {"result": {"run": {"id": "run_1", "objective": objective}}},
-            recovered_task_readback,
-            _worker_start(self.root),
-            _worker_start_readback(self.root),
-            {
+        delivery_observed = threading.Event()
+
+        def recovered_question(_: FakeClient, __: tuple[str, ...]) -> dict[str, object]:
+            delivery_observed.set()
+            return {
                 "result": {
                     "deliveryId": "delivery_q",
                     "messages": [
@@ -5440,14 +5570,28 @@ class ControllerTests(MilestoneRepo):
                         )
                     ],
                 }
-            },
+            }
+
+        responses: list[Response] = [
+            mutation("request_use", run={"id": "run_1"}),
+            {"result": {"run": {"id": "run_1"}}},
+            {"result": {"run": {"id": "run_1", "objective": objective}}},
+            recovered_task_readback,
+            _worker_start(self.root),
+            _worker_start_readback(self.root),
+            recovered_question,
         ]
-        result = resume(
-            self.root,
-            local_id,
-            client=FakeClient(responses),  # type: ignore[arg-type]
-            wait_timeout_ms=100,
-            require_context=False,
+        client = FakeClient(responses)
+        result = self._run_event_backed(
+            lambda: resume(
+                self.root,
+                local_id,
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=int(LIVENESS_TIMEOUT * 500),
+                require_context=False,
+            ),
+            delivery_observed,
+            description="recovered-packet question",
         )
         self.assertEqual(result["pendingQuestions"], ["question_1"])
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:

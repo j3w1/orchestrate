@@ -58,16 +58,52 @@ class ProjectSourceState(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+PROJECT_SOURCE_STRUCTURAL_ERRNOS: Final[frozenset[int]] = frozenset(
+    {
+        errno.ENOTDIR,
+        errno.ELOOP,
+        errno.ENAMETOOLONG,
+        errno.EISDIR,
+    }
+)
+PROJECT_SOURCE_ENVIRONMENTAL_ERRNOS: Final[frozenset[int]] = frozenset(
+    {
+        errno.EACCES,
+        errno.EPERM,
+        errno.EIO,
+        errno.ENFILE,
+        errno.EMFILE,
+        errno.ENOMEM,
+        errno.EINTR,
+    }
+)
+
+
 def project_source_error_state(exc: OSError) -> ProjectSourceState:
     """Partition source I/O errors by the evidence carried by their errno."""
 
-    if isinstance(exc, NotADirectoryError) or exc.errno in {errno.ENOTDIR, errno.ELOOP}:
+    if isinstance(exc, (NotADirectoryError, IsADirectoryError)) or exc.errno in PROJECT_SOURCE_STRUCTURAL_ERRNOS:
         return ProjectSourceState.CHANGED
     if isinstance(exc, FileNotFoundError) or exc.errno == errno.ENOENT:
         return ProjectSourceState.ABSENT
     # Permission, capacity, interruption, sharing, and unknown failures do not
     # prove a semantic path change. Unknown errnos therefore fail unavailable.
     return ProjectSourceState.UNAVAILABLE
+
+
+def project_source_failure_state(exc: OrchestrateError) -> ProjectSourceState | None:
+    """Recover the exact source disposition carried across a safe-I/O boundary."""
+
+    value = exc.data.get("sourceState") if exc.data is not None else None
+    try:
+        return ProjectSourceState(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _source_error(message: str, *, state: ProjectSourceState) -> OrchestrateError:
+    code = "source_identity_changed" if state == ProjectSourceState.CHANGED else "source_unavailable"
+    return OrchestrateError(message, code=code, data={"sourceState": state.value})
 
 
 def _relative_parts(relative: str) -> tuple[str, ...]:
@@ -115,17 +151,20 @@ def approved_project_path(root: Path, relative: str, *, require_file: bool = Tru
             source_state = project_source_error_state(exc)
             if source_state == ProjectSourceState.ABSENT:
                 if require_file:
-                    raise OrchestrateError(
+                    raise _source_error(
                         f"Required source is unavailable: {relative}",
-                        code="source_unavailable",
+                        state=source_state,
                     ) from exc
                 return current
             if source_state == ProjectSourceState.CHANGED:
-                raise OrchestrateError(
+                raise _source_error(
                     f"Required source no longer resolves as bound: {relative}",
-                    code="source_identity_changed",
+                    state=source_state,
                 ) from exc
-            raise OrchestrateError(f"Required source is unavailable: {relative}", code="source_unavailable") from exc
+            raise _source_error(
+                f"Required source is unavailable: {relative}",
+                state=source_state,
+            ) from exc
         if _is_reparse(info):
             raise OrchestrateError(
                 f"Symlink or reparse boundary is unresolved: {current.relative_to(canonical_root).as_posix()}",
@@ -136,7 +175,19 @@ def approved_project_path(root: Path, relative: str, *, require_file: bool = Tru
                 f"Required source has a non-directory ancestor: {relative}",
                 code="source_identity_changed",
             )
-    resolved = current.resolve()
+    try:
+        resolved = current.resolve()
+    except OSError as exc:
+        source_state = project_source_error_state(exc)
+        description = (
+            "no longer resolves as bound"
+            if source_state == ProjectSourceState.CHANGED
+            else "is unavailable"
+        )
+        raise _source_error(
+            f"Required source {description}: {relative}",
+            state=source_state,
+        ) from exc
     try:
         resolved.relative_to(canonical_root)
     except ValueError as exc:
@@ -144,8 +195,11 @@ def approved_project_path(root: Path, relative: str, *, require_file: bool = Tru
             f"Source resolves outside the project: {relative}",
             code="source_boundary_unresolved",
         ) from exc
-    if require_file and not resolved.is_file():
-        raise OrchestrateError(f"Required source is not a file: {relative}", code="source_unavailable")
+    if require_file and not stat.S_ISREG(info.st_mode):
+        raise _source_error(
+            f"Required source is not a file: {relative}",
+            state=ProjectSourceState.CHANGED,
+        )
     return resolved
 
 
@@ -155,6 +209,9 @@ def project_source_state(root: Path, relative: str) -> ProjectSourceState:
     try:
         candidate = approved_project_path(root, relative, require_file=False)
     except OrchestrateError as exc:
+        carried_state = project_source_failure_state(exc)
+        if carried_state is not None:
+            return carried_state
         if exc.code == "source_unavailable":
             return ProjectSourceState.UNAVAILABLE
         if exc.code == "source_identity_changed":
@@ -191,7 +248,10 @@ def _read_posix_handle(root: Path, parts: tuple[str, ...], relative: str) -> byt
             descriptors.append(current)
         info = os.fstat(current)
         if not stat.S_ISREG(info.st_mode):
-            raise OrchestrateError(f"Required source is not a file: {relative}", code="source_unavailable")
+            raise _source_error(
+                f"Required source is not a file: {relative}",
+                state=ProjectSourceState.CHANGED,
+            )
         if info.st_size > MAX_SOURCE_BYTES:
             raise OrchestrateError(f"Required source exceeds the bounded read limit: {relative}", code="source_too_large")
         chunks: list[bytes] = []
@@ -209,11 +269,11 @@ def _read_posix_handle(root: Path, parts: tuple[str, ...], relative: str) -> byt
     except OrchestrateError:
         raise
     except OSError as exc:
-        if project_source_error_state(exc) == ProjectSourceState.CHANGED:
-            code = "source_identity_changed"
-        else:
-            code = "source_unavailable"
-        raise OrchestrateError(f"Required source cannot be opened safely: {relative}", code=code) from exc
+        source_state = project_source_error_state(exc)
+        raise _source_error(
+            f"Required source cannot be opened safely: {relative}",
+            state=source_state,
+        ) from exc
     finally:
         for descriptor in reversed(descriptors):
             try:
@@ -301,7 +361,10 @@ def _read_windows_handle(root: Path, relative: str) -> bytes:
         if tag.FileAttributes & file_attribute_reparse_point:
             raise OrchestrateError(f"Symlink or reparse source is excluded: {relative}", code="source_boundary_unresolved")
         if tag.FileAttributes & file_attribute_directory:
-            raise OrchestrateError(f"Required source is not a file: {relative}", code="source_unavailable")
+            raise _source_error(
+                f"Required source is not a file: {relative}",
+                state=ProjectSourceState.CHANGED,
+            )
 
         needed = get_final_path(handle, None, 0, 0)
         if not needed:

@@ -16,6 +16,7 @@ from .safeio import (
     ProjectSourceState,
     approved_project_path,
     project_source_error_state,
+    project_source_failure_state,
     project_source_state,
     read_project_bytes,
 )
@@ -158,8 +159,8 @@ def _profile_candidate(
         value = json.loads(raw)
     except OrchestrateError as exc:
         if exc.code == "source_unavailable":
-            failed_state = project_source_state(root, PROFILE_NAME)
-            if failed_state in {ProjectSourceState.PRESENT, ProjectSourceState.UNAVAILABLE}:
+            failed_state = project_source_failure_state(exc)
+            if failed_state in {None, ProjectSourceState.UNAVAILABLE}:
                 raise OrchestrateError(
                     f"{PROFILE_NAME} is temporarily unavailable",
                     code="source_temporarily_unavailable",
@@ -414,8 +415,8 @@ def validate_profile(
                 _relative(root.resolve(), candidate)
             except OrchestrateError as exc:
                 if exc.code == "source_unavailable":
-                    source_state = project_source_state(root, entry)
-                    if source_state in {ProjectSourceState.PRESENT, ProjectSourceState.UNAVAILABLE}:
+                    source_state = project_source_failure_state(exc)
+                    if source_state in {None, ProjectSourceState.UNAVAILABLE}:
                         raise OrchestrateError(
                             f"Required profile source cannot currently be observed: {entry}",
                             code="source_temporarily_unavailable",

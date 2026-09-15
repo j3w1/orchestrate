@@ -18,6 +18,7 @@ from .safeio import (
     ProjectSourceState,
     approved_project_path,
     project_source_error_state,
+    project_source_failure_state,
     project_source_state,
 )
 from .sources import PreparedSourceSet, SourceRevalidation, read_project_text, read_source_text
@@ -264,12 +265,19 @@ def _query_source_identities(profile: ProjectProfile) -> dict[str, dict[str, Any
         except OrchestrateError as exc:
             if exc.code != "source_unavailable":
                 raise
-            source_state = project_source_state(profile.root, path)
-            if source_state in {ProjectSourceState.PRESENT, ProjectSourceState.UNAVAILABLE}:
+            source_state = project_source_failure_state(exc)
+            if source_state in {None, ProjectSourceState.UNAVAILABLE}:
                 raise OrchestrateError(
                     "A CE query source cannot currently be observed",
                     code="ce_query_source_unavailable",
-                    data={"sourcePath": path, "sourceState": source_state.value},
+                    data={
+                        "sourcePath": path,
+                        "sourceState": (
+                            ProjectSourceState.UNAVAILABLE.value
+                            if source_state is None
+                            else source_state.value
+                        ),
+                    },
                 ) from exc
             raise OrchestrateError(
                 "A CE query source is absent or changed",

@@ -28,7 +28,13 @@ from .readers import (
     resolve_ce_context_sources,
     resolve_ce_task_source,
 )
-from .safeio import ProjectSourceState, is_sensitive_source, project_source_state, read_project_bytes
+from .safeio import (
+    ProjectSourceState,
+    is_sensitive_source,
+    project_source_failure_state,
+    project_source_state,
+    read_project_bytes,
+)
 from .sources import (
     PreparedSourceSet,
     SourceAccess,
@@ -137,8 +143,8 @@ def _verify_reference_bytes(
         raw = read_project_bytes(profile.root, reference.path)
     except OrchestrateError as exc:
         if exc.code == "source_unavailable":
-            failed_state = project_source_state(profile.root, reference.path)
-            if failed_state in {ProjectSourceState.PRESENT, ProjectSourceState.UNAVAILABLE}:
+            failed_state = project_source_failure_state(exc)
+            if failed_state in {None, ProjectSourceState.UNAVAILABLE}:
                 raise OrchestrateError(
                     "Bound project source is temporarily unavailable",
                     code="source_temporarily_unavailable",

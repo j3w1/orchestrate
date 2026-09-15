@@ -28,6 +28,7 @@ from .safeio import (
     approved_project_path,
     is_sensitive_source,
     project_source_error_state,
+    project_source_failure_state,
     project_source_state,
     read_project_bytes,
 )
@@ -216,11 +217,11 @@ class PreparedSourceSet:
             try:
                 raw = read_project_bytes(root, path)
             except OrchestrateError as exc:
+                carried_state = project_source_failure_state(exc)
+                if carried_state is not None:
+                    return SourceRevalidation(carried_state, path)
                 if exc.code == "source_unavailable":
-                    state = project_source_state(root, path)
-                    if state == ProjectSourceState.PRESENT:
-                        state = ProjectSourceState.UNAVAILABLE
-                    return SourceRevalidation(state, path)
+                    return SourceRevalidation(ProjectSourceState.UNAVAILABLE, path)
                 if exc.code in {
                     "source_boundary_unresolved",
                     "source_identity_changed",
@@ -229,12 +230,7 @@ class PreparedSourceSet:
                     return SourceRevalidation(ProjectSourceState.CHANGED, path)
                 raise
             except OSError as exc:
-                state = project_source_error_state(exc)
-                if state == ProjectSourceState.UNAVAILABLE:
-                    state = project_source_state(root, path)
-                    if state == ProjectSourceState.PRESENT:
-                        state = ProjectSourceState.UNAVAILABLE
-                return SourceRevalidation(state, path)
+                return SourceRevalidation(project_source_error_state(exc), path)
             if {"sha256": _sha256(raw), "bytes": len(raw)} != expected:
                 return SourceRevalidation(ProjectSourceState.CHANGED, path)
         return SourceRevalidation(ProjectSourceState.PRESENT)
@@ -363,15 +359,7 @@ def _status_map(root: Path) -> dict[str, str]:
 def _assert_readable_source(root: Path, relative: str) -> tuple[Path, bytes]:
     try:
         raw = read_project_bytes(root, relative)
-    except OrchestrateError as exc:
-        if (
-            exc.code == "source_unavailable"
-            and project_source_state(root, relative) == ProjectSourceState.CHANGED
-        ):
-            raise OrchestrateError(
-                f"Required source identity changed before it could be read: {relative}",
-                code="source_identity_changed",
-            ) from exc
+    except OrchestrateError:
         raise
     except OSError as exc:
         state = project_source_error_state(exc)

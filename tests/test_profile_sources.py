@@ -23,6 +23,8 @@ from orchestrate.profile import (
 )
 from orchestrate.readers import _run_ce_query, read_project
 from orchestrate.safeio import (
+    PROJECT_SOURCE_ENVIRONMENTAL_ERRNOS,
+    PROJECT_SOURCE_STRUCTURAL_ERRNOS,
     ProjectSourceState,
     project_source_error_state,
     project_source_state,
@@ -221,31 +223,45 @@ class ProfileAndSourceTests(DisposableRepo):
         self.assertGreaterEqual(fault.interceptions, 1)
 
     def test_project_source_error_state_has_one_complete_errno_partition(self) -> None:
-        structural = (errno.ENOTDIR, errno.ELOOP)
-        environmental = (
-            errno.EACCES,
-            errno.EPERM,
-            errno.EIO,
-            errno.ENFILE,
-            errno.EMFILE,
-            errno.ENOMEM,
-            errno.EINTR,
+        definitive = {
+            errno.ENOENT: ProjectSourceState.ABSENT,
+            errno.ENOTDIR: ProjectSourceState.CHANGED,
+            errno.ELOOP: ProjectSourceState.CHANGED,
+            errno.ENAMETOOLONG: ProjectSourceState.CHANGED,
+            errno.EISDIR: ProjectSourceState.CHANGED,
+        }
+        environmental = frozenset(
+            {
+                errno.EACCES,
+                errno.EPERM,
+                errno.EIO,
+                errno.ENFILE,
+                errno.EMFILE,
+                errno.ENOMEM,
+                errno.EINTR,
+            }
         )
 
-        for error_number in structural:
+        self.assertEqual(
+            PROJECT_SOURCE_STRUCTURAL_ERRNOS,
+            frozenset(
+                error_number
+                for error_number, state in definitive.items()
+                if state == ProjectSourceState.CHANGED
+            ),
+        )
+        self.assertEqual(PROJECT_SOURCE_ENVIRONMENTAL_ERRNOS, environmental)
+        for error_number, expected_state in definitive.items():
             with self.subTest(error_number=error_number):
                 self.assertEqual(
-                    project_source_error_state(OSError(error_number, "structural")),
-                    ProjectSourceState.CHANGED,
+                    project_source_error_state(OSError(error_number, "definitive")),
+                    expected_state,
                 )
         self.assertEqual(
             project_source_error_state(NotADirectoryError()),
             ProjectSourceState.CHANGED,
         )
-        self.assertEqual(
-            project_source_error_state(OSError(errno.ENOENT, "absent")),
-            ProjectSourceState.ABSENT,
-        )
+        self.assertEqual(project_source_error_state(IsADirectoryError()), ProjectSourceState.CHANGED)
         self.assertEqual(
             project_source_error_state(FileNotFoundError()),
             ProjectSourceState.ABSENT,
@@ -477,6 +493,19 @@ class ProfileAndSourceTests(DisposableRepo):
         expected = (self.root / "AGENTS.md").read_bytes()
         with patch.object(Path, "read_bytes", side_effect=AssertionError("pathname reopened")):
             self.assertEqual(read_project_bytes(self.root, "AGENTS.md"), expected)
+
+    def test_source_handle_treats_file_replaced_by_directory_as_changed(self) -> None:
+        source = self.root / "bound-source.txt"
+        source.write_text("bound bytes\n", encoding="utf-8")
+        self.assertEqual(read_project_bytes(self.root, source.name), b"bound bytes\n")
+        source.unlink()
+        source.mkdir()
+
+        with self.assertRaises(OrchestrateError) as caught:
+            read_project_bytes(self.root, source.name)
+
+        self.assertEqual(caught.exception.code, "source_identity_changed")
+        self.assertEqual(caught.exception.data, {"sourceState": "changed"})
 
     def _write_ce_fixture(self, shard_tasks: list[list[str]]) -> tuple[ProjectProfile, list[dict[str, object]]]:
         (self.root / "docs" / "tasks").mkdir(parents=True)
