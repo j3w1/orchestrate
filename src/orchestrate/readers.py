@@ -189,7 +189,7 @@ def _require_tracked_query_sources(root: Path, paths: list[str]) -> None:
     for path in paths:
         try:
             tracked = subprocess.run(
-                ("git", "-C", os.fspath(root), "ls-files", "--error-unmatch", "--", path),
+                ("git", "-C", os.fspath(root), "ls-files", "-z", "--", path),
                 capture_output=True,
                 check=False,
                 timeout=30,
@@ -197,9 +197,11 @@ def _require_tracked_query_sources(root: Path, paths: list[str]) -> None:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise OrchestrateError("The CE query implementation cannot be inspected", code="ce_query_source_unavailable") from exc
         if tracked.returncode:
-            raise OrchestrateError("The CE query implementation is not a tracked source", code="ce_query_source_unavailable")
+            raise OrchestrateError("The CE query implementation cannot be inspected", code="ce_query_source_unavailable")
         if len(tracked.stdout) > MAX_GIT_PATH_BYTES:
             raise OrchestrateError("CE query source inspection exceeded its output boundary", code="ce_query_source_unavailable")
+        if tracked.stdout != path.encode("utf-8") + b"\0":
+            raise OrchestrateError("The CE query implementation is not a tracked source", code="ce_query_source_changed")
     if _git_source_state(root, paths):
         raise OrchestrateError("The CE query implementation or manifest is mutable", code="ce_query_source_changed")
 

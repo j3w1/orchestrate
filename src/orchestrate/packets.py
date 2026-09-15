@@ -69,6 +69,11 @@ def _sha256(value: object) -> bool:
     )
 
 
+def _named_sha256(value: object, name: str) -> bool:
+    prefix = f"{name}_sha256_"
+    return isinstance(value, str) and value.startswith(prefix) and _sha256(value[len(prefix):])
+
+
 def _git_oid(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -218,7 +223,7 @@ def decode_packet(packet_json: str) -> DecodedPacket:
         not isinstance(milestone, Mapping)
         or set(milestone) != {"candidateDigest", "contractDigest", "contract"}
         or not _sha256(milestone.get("candidateDigest"))
-        or not _sha256(milestone.get("contractDigest"))
+        or not _named_sha256(milestone.get("contractDigest"), "contract")
         or not isinstance(milestone.get("contract"), Mapping)
         or not _string(scope.get("taskKey"))
         or not _string(scope.get("role"))

@@ -12,7 +12,7 @@ from pathlib import Path, PureWindowsPath
 import re
 import subprocess
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from .errors import OrchestrateError
 from .profile import (
@@ -326,6 +326,39 @@ def _assert_readable_source(root: Path, relative: str) -> tuple[Path, bytes]:
     return root / relative, read_project_bytes(root, relative)
 
 
+def _git_source_presence(root: Path, kind: Literal["head", "index"], relative: str) -> bool:
+    arguments = (
+        ("ls-tree", "-z", "--full-tree", "HEAD", "--", relative)
+        if kind == "head"
+        else ("ls-files", "--stage", "-z", "--", relative)
+    )
+    try:
+        completed = subprocess.run(
+            ("git", "-C", os.fspath(root), *arguments),
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OrchestrateError("Git source inspection is unavailable", code="git_inspection_failed") from exc
+    if completed.returncode:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise OrchestrateError(f"Git source inspection failed: {detail}", code="git_inspection_failed")
+    if len(completed.stdout) > MAX_GIT_PATH_BYTES:
+        raise OrchestrateError("Git source inspection exceeded its output boundary", code="git_inspection_failed")
+    if kind == "index" and completed.stdout:
+        stages = {
+            entry.split(b"\t", 1)[0].rsplit(b" ", 1)[-1]
+            for entry in completed.stdout.rstrip(b"\0").split(b"\0")
+        }
+        if b"0" not in stages:
+            raise OrchestrateError(
+                "Git index source has no canonical stage-zero object",
+                code="source_binding_changed",
+            )
+    return bool(completed.stdout)
+
+
 def _head_blob(root: Path, relative: str) -> bytes | None:
     try:
         completed = subprocess.run(
@@ -336,9 +369,16 @@ def _head_blob(root: Path, relative: str) -> bytes | None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise OrchestrateError("Git source inspection is unavailable", code="git_inspection_failed") from exc
-    if len(completed.stdout) > MAX_SOURCE_BYTES:
-        raise OrchestrateError("Git source exceeds the bounded read limit", code="source_too_large")
-    return completed.stdout if completed.returncode == 0 else None
+    if completed.returncode == 0:
+        if len(completed.stdout) > MAX_SOURCE_BYTES:
+            raise OrchestrateError("Git source exceeds the bounded read limit", code="source_too_large")
+        return completed.stdout
+    if len(completed.stdout) > MAX_GIT_PATH_BYTES:
+        raise OrchestrateError("Git source inspection exceeded its output boundary", code="git_inspection_failed")
+    if not _git_source_presence(root, "head", relative):
+        return None
+    detail = completed.stderr.decode("utf-8", errors="replace").strip()
+    raise OrchestrateError(f"Git source inspection failed: {detail}", code="git_inspection_failed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,9 +400,16 @@ def _index_bytes(root: Path, relative: str) -> bytes | None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise OrchestrateError("Git source inspection is unavailable", code="git_inspection_failed") from exc
-    if len(completed.stdout) > MAX_SOURCE_BYTES:
-        raise OrchestrateError("Git source exceeds the bounded read limit", code="source_too_large")
-    return completed.stdout if completed.returncode == 0 else None
+    if completed.returncode == 0:
+        if len(completed.stdout) > MAX_SOURCE_BYTES:
+            raise OrchestrateError("Git source exceeds the bounded read limit", code="source_too_large")
+        return completed.stdout
+    if len(completed.stdout) > MAX_GIT_PATH_BYTES:
+        raise OrchestrateError("Git source inspection exceeded its output boundary", code="git_inspection_failed")
+    if not _git_source_presence(root, "index", relative):
+        return None
+    detail = completed.stderr.decode("utf-8", errors="replace").strip()
+    raise OrchestrateError(f"Git source inspection failed: {detail}", code="git_inspection_failed")
 
 
 def build_source_index(

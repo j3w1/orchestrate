@@ -19,11 +19,11 @@ from orchestrate.admission import (
 )
 from orchestrate.errors import OrchestrateError
 from orchestrate.packets import canonical_packet_json, expected_packet_id, make_packet, packet_spec
-from orchestrate.profile import INSTRUCTION_PATHSPECS, setup_project
+from orchestrate.profile import INSTRUCTION_PATHSPECS, ProjectProfile, setup_project
 from orchestrate.readers import read_project
 from orchestrate.safeio import read_project_bytes
 from orchestrate.sources import build_source_index
-from orchestrate.state import AdmissionEffectFence, StateStore
+from orchestrate.state import AdmissionEffectFence, RunRecord, StateStore
 
 
 LIVENESS_TIMEOUT = 120.0  # Outer deadlock detector, not a semantic progress budget.
@@ -184,6 +184,115 @@ class AdmissionTests(unittest.TestCase):
             packet_id=str(self.packet["packetId"]), client=client or PreflightClient(self.root, self.packet),
             environment={"ORCA_TERMINAL_HANDLE": "term_worker"}, platform="win32",  # type: ignore[arg-type]
         )
+
+    def _prepare_ce_preflight(
+        self,
+        root: Path,
+    ) -> tuple[ProjectProfile, RunRecord, dict[str, object], dict[str, object]]:
+        git(root, "init", "-q")
+        git(root, "config", "user.email", "fixture@example.invalid")
+        git(root, "config", "user.name", "Fixture")
+        (root / "docs" / "tasks").mkdir(parents=True)
+        (root / "docs" / "context").mkdir(parents=True)
+        (root / "docs" / "project-log").mkdir(parents=True)
+        (root / "scripts" / "quality").mkdir(parents=True)
+        (root / "AGENTS.md").write_text("Bound CE instruction.\n", encoding="utf-8")
+        (root / "docs" / "tasks" / "README.md").write_text(
+            "| [CE-1234](CE-1234.md) | active |\n",
+            encoding="utf-8",
+        )
+        (root / "docs" / "tasks" / "CE-1234.md").write_text(
+            "Context packet - Must read: [packet](../context/CE-1234.md)\n",
+            encoding="utf-8",
+        )
+        (root / "docs" / "context" / "CE-1234.md").write_text("Bound context.\n", encoding="utf-8")
+        (root / "package.json").write_text(
+            json.dumps({"scripts": {"project-log:query": "node scripts/quality/project-log.mjs query"}}),
+            encoding="utf-8",
+        )
+        (root / "scripts" / "quality" / "project-log.mjs").write_text(
+            "// benign packet-bound query fixture\n",
+            encoding="utf-8",
+        )
+        shard = {
+            "sequence": 1,
+            "path": "docs/project-log/shard-001.md",
+            "state": "closed",
+            "bytes": 8,
+            "sha256": "1" * 64,
+            "git_blob_sha": "1" * 40,
+            "entry_count": 1,
+            "first_heading": "Synthetic",
+            "last_heading": "Synthetic",
+            "task_ids": ["CE-1234"],
+            "legacy_start_byte": 0,
+            "legacy_end_byte_exclusive": 8,
+        }
+        (root / "docs" / "project-log" / "shard-001.md").write_text("# Entry\n", encoding="utf-8")
+        (root / "docs" / "project-log" / "manifest.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "kind": "ce-systems-project-log-manifest",
+                "agent_access": {
+                    "default_loading": "manifest-only",
+                    "closed_shards_preloaded": False,
+                    "query_command": "pnpm run project-log:query -- <term>",
+                },
+                "shards": [shard],
+            }),
+            encoding="utf-8",
+        )
+        git(root, "add", ".")
+        git(root, "commit", "-qm", "CE fixture")
+        profile = setup_project(root)
+        git(root, "add", ".orchestrate.json")
+        git(root, "commit", "-qm", "select fixture profile")
+        query_result: dict[str, object] = {
+            "term": "CE-1234",
+            "exact_task": "CE-1234",
+            "selected_shards": ["docs/project-log/shard-001.md"],
+            "matches": [{
+                "path": "docs/project-log/shard-001.md",
+                "sequence": 1,
+                "heading": "Synthetic",
+                "text": "sanitized synthetic match",
+            }],
+            "omitted_matches": 0,
+        }
+        with patch("orchestrate.readers._run_ce_query", return_value=query_result):
+            reader = read_project(profile, "Implement CE-1234")
+        sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+        with StateStore(root) as store:
+            run = store.create_run(
+                objective="Implement CE-1234",
+                profile_digest=profile.digest,
+                source_digest=sources.digest,
+            )
+            run = store.update_run(
+                run.local_id,
+                native_run_id="run_1",
+                task_id="task_1",
+                phase="awaiting_preflight",
+            )
+            packet = make_packet(
+                objective=run.objective,
+                profile=profile,
+                sources=sources,
+                launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+                python_executable=str(Path(sys.executable).resolve()),
+                run_id="run_1",
+                reader=reader,
+            )
+            store.save_packet(run.local_id, "task_1", canonical_packet_json(packet))
+            store.record_worker_resource_binding(
+                run.local_id,
+                dispatch_id="dispatch_1",
+                resource_id="terminal-resource-1",
+                terminal_handle="term_worker",
+                worktree_id=f"repo::{root.resolve()}",
+                readback={"fixture": "validated-start-readback"},
+            )
+        return profile, run, packet, query_result
 
     @requires_native_windows_admission
     def test_exact_preflight_is_immutable_and_replay_is_not_a_fresh_grant(self) -> None:
@@ -651,6 +760,104 @@ class AdmissionTests(unittest.TestCase):
                 "passed",
             )
             self.assertEqual(len(store.list_preflight_attempts(self.local_id, "task_1", "dispatch_1")), 1)
+
+    def test_nonzero_git_show_is_retryable_and_recovers_to_a_fresh_grant(self) -> None:
+        real_run = subprocess.run
+
+        def transient_show(
+            arguments: tuple[str, ...],
+            **keywords: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            if arguments[:4] == ("git", "-C", str(self.root), "show"):
+                return subprocess.CompletedProcess(arguments, 128, b"", b"fatal: transient Git failure")
+            return real_run(arguments, **keywords)
+
+        with patch("orchestrate.sources.subprocess.run", side_effect=transient_show):
+            with self.assertRaises(OrchestrateError) as transient:
+                self._run(PreflightClient(self.root, self.packet))
+        self.assertEqual(transient.exception.code, "preflight_retryable")
+        self.assertEqual(transient.exception.data["cause"], "git_inspection_failed")  # type: ignore[index]
+        with StateStore(self.root) as store:
+            self.assertIsNone(store.get_preflight(self.local_id, "task_1", "dispatch_1"))
+            attempts = store.list_preflight_attempts(self.local_id, "task_1", "dispatch_1")
+        self.assertEqual([(item["attemptOrdinal"], item["disposition"]) for item in attempts], [(1, "retryable")])
+
+        native = {
+            "terminalResourceId": "terminal-resource-1",
+            "terminalHandle": "term_worker",
+            "worktreeId": f"repo::{self.root.resolve()}",
+        }
+        with patch("orchestrate.admission._native_identity", return_value=native):
+            admitted = self._run(PreflightClient(self.root, self.packet))
+        self.assertEqual(admitted["editingGrant"], "fresh")
+
+    def test_untracked_ce_query_source_is_definitive_after_completed_index(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, run, packet, query_result = self._prepare_ce_preflight(root)
+            query_script = "scripts/quality/project-log.mjs"
+            real_run = subprocess.run
+            native = {
+                "terminalResourceId": "terminal-resource-1",
+                "terminalHandle": "term_worker",
+                "worktreeId": f"repo::{root.resolve()}",
+            }
+
+            def remove_query_source_after_completed_stage(*_: object, **__: object) -> dict[str, str]:
+                git(root, "rm", "--cached", "--", query_script)
+                return native
+
+            def synthetic_query(
+                arguments: tuple[str, ...],
+                **keywords: object,
+            ) -> subprocess.CompletedProcess[bytes]:
+                if arguments[0] == "pnpm":
+                    return subprocess.CompletedProcess(
+                        arguments,
+                        0,
+                        json.dumps(query_result).encode("utf-8"),
+                        b"",
+                    )
+                return real_run(arguments, **keywords)
+
+            client = PreflightClient(root, packet)
+            with (
+                patch("orchestrate.admission._native_identity", side_effect=remove_query_source_after_completed_stage),
+                patch("orchestrate.readers.subprocess.run", side_effect=synthetic_query),
+            ):
+                with self.assertRaises(OrchestrateError) as rejected:
+                    worker_preflight(
+                        root,
+                        run_id="run_1",
+                        task_id="task_1",
+                        dispatch_id="dispatch_1",
+                        packet_id=str(packet["packetId"]),
+                        client=client,
+                        environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                        platform="win32",
+                    )
+            self.assertEqual(rejected.exception.code, "preflight_rejected")
+            self.assertEqual(rejected.exception.data["cause"], "ce_query_source_changed")  # type: ignore[index]
+            self.assertEqual(client.calls, [])
+            with StateStore(root) as store:
+                observed = store.get_preflight(run.local_id, "task_1", "dispatch_1")
+                attempts = store.list_preflight_attempts(run.local_id, "task_1", "dispatch_1")
+            self.assertEqual(observed["outcome"], "rejected")  # type: ignore[index]
+            self.assertEqual(attempts[0]["disposition"], "definitive")
+
+            git(root, "add", "--", query_script)
+            with self.assertRaises(OrchestrateError) as restored:
+                worker_preflight(
+                    root,
+                    run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id="dispatch_1",
+                    packet_id=str(packet["packetId"]),
+                    client=PreflightClient(root, packet),
+                    environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                    platform="win32",
+                )
+            self.assertEqual(restored.exception.code, "preflight_already_rejected")
 
     def test_packet_declared_repo_routing_cannot_authorize_a_byte_read(self) -> None:
         private_path = "private-notes.txt"
