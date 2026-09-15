@@ -925,6 +925,63 @@ class AdmissionTests(unittest.TestCase):
                 )
             self.assertEqual(restored.exception.code, "preflight_already_rejected")
 
+    def test_non_directory_shard_ancestor_is_definitive_after_completed_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, run, packet, _query_result = self._prepare_ce_preflight(root)
+            shard_parent = root / "docs" / "project-log"
+            saved_parent = root / "docs" / "project-log-original"
+            native = {
+                "terminalResourceId": "terminal-resource-1",
+                "terminalHandle": "term_worker",
+                "worktreeId": f"repo::{root.resolve()}",
+            }
+
+            def replace_shard_parent_after_completed_stage(*_: object, **__: object) -> dict[str, str]:
+                shard_parent.rename(saved_parent)
+                shard_parent.write_bytes(b"not a directory\n")
+                return native
+
+            client = PreflightClient(root, packet)
+            with patch(
+                "orchestrate.admission._native_identity",
+                side_effect=replace_shard_parent_after_completed_stage,
+            ):
+                with self.assertRaises(OrchestrateError) as rejected:
+                    worker_preflight(
+                        root,
+                        run_id="run_1",
+                        task_id="task_1",
+                        dispatch_id="dispatch_1",
+                        packet_id=str(packet["packetId"]),
+                        client=client,
+                        environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                        platform="win32",
+                    )
+            self.assertEqual(rejected.exception.code, "preflight_rejected")
+            self.assertEqual(rejected.exception.data["cause"], "source_binding_changed")  # type: ignore[index]
+            self.assertEqual(client.calls, [])
+            with StateStore(root) as store:
+                observed = store.get_preflight(run.local_id, "task_1", "dispatch_1")
+                attempts = store.list_preflight_attempts(run.local_id, "task_1", "dispatch_1")
+            self.assertEqual(observed["outcome"], "rejected")  # type: ignore[index]
+            self.assertEqual(attempts[0]["disposition"], "definitive")
+
+            shard_parent.unlink()
+            saved_parent.rename(shard_parent)
+            with self.assertRaises(OrchestrateError) as restored:
+                worker_preflight(
+                    root,
+                    run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id="dispatch_1",
+                    packet_id=str(packet["packetId"]),
+                    client=PreflightClient(root, packet),
+                    environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                    platform="win32",
+                )
+            self.assertEqual(restored.exception.code, "preflight_already_rejected")
+
     def test_still_present_query_source_open_failure_is_retryable_after_native_readback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

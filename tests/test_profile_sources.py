@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ from orchestrate.profile import (
     setup_project,
 )
 from orchestrate.readers import _run_ce_query, read_project
-from orchestrate.safeio import read_project_bytes
+from orchestrate.safeio import ProjectSourceState, project_source_state, read_project_bytes
 from orchestrate.sources import build_source_index
 
 
@@ -185,6 +186,31 @@ class ProfileAndSourceTests(DisposableRepo):
         with self.assertRaises(OrchestrateError) as caught:
             build_source_index(profile, extra_sources={"linked/AGENTS.md"})
         self.assertEqual(caught.exception.code, "source_boundary_unresolved")
+
+    def test_source_state_distinguishes_non_directory_ancestor_from_environmental_failure(self) -> None:
+        ancestor = self.root / "nested"
+        ancestor.write_text("not a directory\n", encoding="utf-8")
+        self.assertEqual(
+            project_source_state(self.root, "nested/source.txt"),
+            ProjectSourceState.CHANGED,
+        )
+
+        ancestor.unlink()
+        ancestor.mkdir()
+        source = ancestor / "source.txt"
+        source.write_text("still present\n", encoding="utf-8")
+        real_lstat = Path.lstat
+
+        def unavailable_lstat(path: Path) -> os.stat_result:
+            if path == source:
+                raise PermissionError(errno.EACCES, "simulated metadata failure", path)
+            return real_lstat(path)
+
+        with patch("orchestrate.safeio.Path.lstat", new=unavailable_lstat):
+            self.assertEqual(
+                project_source_state(self.root, "nested/source.txt"),
+                ProjectSourceState.UNAVAILABLE,
+            )
 
     def test_env_variants_are_excluded_before_content_hashing(self) -> None:
         profile = setup_project(self.root)

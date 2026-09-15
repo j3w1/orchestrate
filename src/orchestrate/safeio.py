@@ -95,7 +95,7 @@ def approved_project_path(root: Path, relative: str, *, require_file: bool = Tru
     parts = _relative_parts(relative)
     canonical_root = root.resolve()
     current = canonical_root
-    for part in parts:
+    for index, part in enumerate(parts):
         current = current / part
         try:
             info = current.lstat()
@@ -103,12 +103,22 @@ def approved_project_path(root: Path, relative: str, *, require_file: bool = Tru
             if require_file:
                 raise OrchestrateError(f"Required source is unavailable: {relative}", code="source_unavailable")
             return current
+        except NotADirectoryError as exc:
+            raise OrchestrateError(
+                f"Required source has a non-directory ancestor: {relative}",
+                code="source_identity_changed",
+            ) from exc
         except OSError as exc:
             raise OrchestrateError(f"Required source is unavailable: {relative}", code="source_unavailable") from exc
         if _is_reparse(info):
             raise OrchestrateError(
                 f"Symlink or reparse boundary is unresolved: {current.relative_to(canonical_root).as_posix()}",
                 code="source_boundary_unresolved",
+            )
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            raise OrchestrateError(
+                f"Required source has a non-directory ancestor: {relative}",
+                code="source_identity_changed",
             )
     resolved = current.resolve()
     try:
@@ -131,6 +141,8 @@ def project_source_state(root: Path, relative: str) -> ProjectSourceState:
     except OrchestrateError as exc:
         if exc.code == "source_unavailable":
             return ProjectSourceState.UNAVAILABLE
+        if exc.code == "source_identity_changed":
+            return ProjectSourceState.CHANGED
         raise
     try:
         info = candidate.lstat()
