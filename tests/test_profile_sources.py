@@ -22,7 +22,12 @@ from orchestrate.profile import (
     setup_project,
 )
 from orchestrate.readers import _run_ce_query, read_project
-from orchestrate.safeio import ProjectSourceState, project_source_state, read_project_bytes
+from orchestrate.safeio import (
+    ProjectSourceState,
+    project_source_error_state,
+    project_source_state,
+    read_project_bytes,
+)
 from orchestrate.sources import build_source_index
 from tests.path_faults import ResolvedPathFault
 
@@ -214,6 +219,55 @@ class ProfileAndSourceTests(DisposableRepo):
                 ProjectSourceState.UNAVAILABLE,
             )
         self.assertGreaterEqual(fault.interceptions, 1)
+
+    def test_project_source_error_state_has_one_complete_errno_partition(self) -> None:
+        structural = (errno.ENOTDIR, errno.ELOOP)
+        environmental = (
+            errno.EACCES,
+            errno.EPERM,
+            errno.EIO,
+            errno.ENFILE,
+            errno.EMFILE,
+            errno.ENOMEM,
+            errno.EINTR,
+        )
+
+        for error_number in structural:
+            with self.subTest(error_number=error_number):
+                self.assertEqual(
+                    project_source_error_state(OSError(error_number, "structural")),
+                    ProjectSourceState.CHANGED,
+                )
+        self.assertEqual(
+            project_source_error_state(NotADirectoryError()),
+            ProjectSourceState.CHANGED,
+        )
+        self.assertEqual(
+            project_source_error_state(OSError(errno.ENOENT, "absent")),
+            ProjectSourceState.ABSENT,
+        )
+        self.assertEqual(
+            project_source_error_state(FileNotFoundError()),
+            ProjectSourceState.ABSENT,
+        )
+        for error_number in environmental:
+            with self.subTest(error_number=error_number):
+                self.assertEqual(
+                    project_source_error_state(OSError(error_number, "environmental")),
+                    ProjectSourceState.UNAVAILABLE,
+                )
+        for windows_error in (32, 33):  # sharing and lock violations map to EACCES
+            with self.subTest(windows_error=windows_error):
+                sharing_error = PermissionError(errno.EACCES, "sharing violation")
+                sharing_error.winerror = windows_error  # type: ignore[attr-defined]
+                self.assertEqual(
+                    project_source_error_state(sharing_error),
+                    ProjectSourceState.UNAVAILABLE,
+                )
+        self.assertEqual(
+            project_source_error_state(OSError(987654, "unknown")),
+            ProjectSourceState.UNAVAILABLE,
+        )
 
     def test_env_variants_are_excluded_before_content_hashing(self) -> None:
         profile = setup_project(self.root)

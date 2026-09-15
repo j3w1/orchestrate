@@ -59,12 +59,14 @@ class ProjectSourceState(str, Enum):
 
 
 def project_source_error_state(exc: OSError) -> ProjectSourceState:
-    """Classify path lookup failures without losing structural evidence."""
+    """Partition source I/O errors by the evidence carried by their errno."""
 
-    if isinstance(exc, NotADirectoryError) or exc.errno == errno.ENOTDIR:
+    if isinstance(exc, NotADirectoryError) or exc.errno in {errno.ENOTDIR, errno.ELOOP}:
         return ProjectSourceState.CHANGED
     if isinstance(exc, FileNotFoundError) or exc.errno == errno.ENOENT:
         return ProjectSourceState.ABSENT
+    # Permission, capacity, interruption, sharing, and unknown failures do not
+    # prove a semantic path change. Unknown errnos therefore fail unavailable.
     return ProjectSourceState.UNAVAILABLE
 
 
@@ -120,7 +122,7 @@ def approved_project_path(root: Path, relative: str, *, require_file: bool = Tru
                 return current
             if source_state == ProjectSourceState.CHANGED:
                 raise OrchestrateError(
-                    f"Required source has a non-directory ancestor: {relative}",
+                    f"Required source no longer resolves as bound: {relative}",
                     code="source_identity_changed",
                 ) from exc
             raise OrchestrateError(f"Required source is unavailable: {relative}", code="source_unavailable") from exc
@@ -207,9 +209,7 @@ def _read_posix_handle(root: Path, parts: tuple[str, ...], relative: str) -> byt
     except OrchestrateError:
         raise
     except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            code = "source_boundary_unresolved"
-        elif project_source_error_state(exc) == ProjectSourceState.CHANGED:
+        if project_source_error_state(exc) == ProjectSourceState.CHANGED:
             code = "source_identity_changed"
         else:
             code = "source_unavailable"
