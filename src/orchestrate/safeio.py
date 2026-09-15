@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+from enum import Enum
 import os
 from pathlib import Path
 import stat
@@ -46,6 +47,15 @@ SENSITIVE_DIRECTORIES = {
     ".ssh",
 }
 SENSITIVE_SUFFIXES = {".jks", ".key", ".keystore", ".p12", ".pem", ".pfx", ".tfstate", ".tfvars"}
+
+
+class ProjectSourceState(str, Enum):
+    """What a source-local metadata observation proves about one path."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    CHANGED = "changed"
+    UNAVAILABLE = "unavailable"
 
 
 def _relative_parts(relative: str) -> tuple[str, ...]:
@@ -111,6 +121,26 @@ def approved_project_path(root: Path, relative: str, *, require_file: bool = Tru
     if require_file and not resolved.is_file():
         raise OrchestrateError(f"Required source is not a file: {relative}", code="source_unavailable")
     return resolved
+
+
+def project_source_state(root: Path, relative: str) -> ProjectSourceState:
+    """Classify one path without using another source as an availability proxy."""
+
+    try:
+        candidate = approved_project_path(root, relative, require_file=False)
+    except OrchestrateError as exc:
+        if exc.code == "source_unavailable":
+            return ProjectSourceState.UNAVAILABLE
+        raise
+    try:
+        info = candidate.lstat()
+    except FileNotFoundError:
+        return ProjectSourceState.ABSENT
+    except OSError:
+        return ProjectSourceState.UNAVAILABLE
+    if _is_reparse(info) or not stat.S_ISREG(info.st_mode):
+        return ProjectSourceState.CHANGED
+    return ProjectSourceState.PRESENT
 
 
 def _read_posix_handle(root: Path, parts: tuple[str, ...], relative: str) -> bytes:

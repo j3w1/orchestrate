@@ -57,6 +57,8 @@ The hosted matrix for exact candidate `9ec68be` is historical `FAILED`: [run 349
 
 The hosted matrix for exact candidate `f61e226` is also historical `FAILED`: [run 34984041928](https://github.com/j3w1/orchestrate/actions/runs/34984041928) passed Ubuntu but failed Windows after 236 tests with 1 failure and 11 errors. All 12 failures were win32-only milestone/controller paths caused by the strict decoder rejecting the controller's canonical prefixed shared-contract digest in specialist and reviewer packets. This result is history for `f61e226`, not evidence for a later correction candidate.
 
+The hosted matrix for exact candidate `2d0ae0f` is historical `FAILED`: [run 34987878003](https://github.com/j3w1/orchestrate/actions/runs/34987878003) passed Ubuntu but failed Windows after 243 tests with one failure and no errors. The only failure was the new Git-object-read regression's exact path-string matcher failing to intercept the production `git show` call under Windows path spelling; all twelve previously failing Windows milestone/controller tests passed. This result is history for `2d0ae0f`, not evidence for a later correction candidate.
+
 An earlier hosted execution failed on both runners. Its failures were attributed before this correction: all Linux failures and two of three Windows failures reproduced against the accepted second-increment base, while one Windows failure came from that increment's added Git-argument assertion. Those results likewise do not fill a later candidate row.
 
 A dispatched worker's model turn failing to start was observed live. The controller contained the attempt with a single read-only readback and no resend or external effect. Recovery of such an attempt is an explicit owner decision.

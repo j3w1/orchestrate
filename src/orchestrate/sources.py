@@ -22,7 +22,14 @@ from .profile import (
     PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE,
     ProjectProfile,
 )
-from .safeio import MAX_SOURCE_BYTES, approved_project_path, is_sensitive_source, read_project_bytes
+from .safeio import (
+    MAX_SOURCE_BYTES,
+    ProjectSourceState,
+    approved_project_path,
+    is_sensitive_source,
+    project_source_state,
+    read_project_bytes,
+)
 
 
 SOURCE_INDEX_SCHEMA = "orchestrate-source-index/v1"
@@ -60,6 +67,14 @@ class SourceAccess(str, Enum):
     REFERENCE_ONLY = "reference-only"
     DIRECT_BYTES = "direct-bytes"
     INVENTORY_GUARDED_BYTES = "inventory-guarded-bytes"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRevalidation:
+    """Source-local result for a completed identity recheck."""
+
+    state: ProjectSourceState
+    path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,17 +204,32 @@ class PreparedSourceSet:
             }
         return result
 
-    def revalidate(self, root: Path, paths: set[str] | frozenset[str]) -> bool:
-        """Check current bytes against completed identities without reclassification."""
+    def revalidate(
+        self,
+        root: Path,
+        paths: set[str] | frozenset[str],
+    ) -> SourceRevalidation:
+        """Recheck completed identities while preserving absence vs unavailability."""
 
         for path, expected in self.identities(paths).items():
             try:
                 raw = read_project_bytes(root, path)
-            except OrchestrateError:
-                return False
+            except OrchestrateError as exc:
+                if exc.code == "source_unavailable":
+                    state = project_source_state(root, path)
+                    if state == ProjectSourceState.PRESENT:
+                        state = ProjectSourceState.UNAVAILABLE
+                    return SourceRevalidation(state, path)
+                if exc.code in {
+                    "source_boundary_unresolved",
+                    "source_identity_changed",
+                    "source_too_large",
+                }:
+                    return SourceRevalidation(ProjectSourceState.CHANGED, path)
+                raise
             if {"sha256": _sha256(raw), "bytes": len(raw)} != expected:
-                return False
-        return True
+                return SourceRevalidation(ProjectSourceState.CHANGED, path)
+        return SourceRevalidation(ProjectSourceState.PRESENT)
 
 
 def decode_source_records(value: object) -> tuple[SourceRecord, ...]:
@@ -457,8 +487,18 @@ def build_source_index(
     }
     records: list[dict[str, Any]] = []
     for relative in sorted(configured):
-        path = approved_project_path(root, relative, require_file=False)
-        if not path.exists():
+        path_state = project_source_state(root, relative)
+        if path_state == ProjectSourceState.UNAVAILABLE:
+            raise OrchestrateError(
+                f"Configured source cannot currently be observed: {relative}",
+                code="source_temporarily_unavailable",
+            )
+        if path_state == ProjectSourceState.CHANGED:
+            raise OrchestrateError(
+                f"Configured source identity changed: {relative}",
+                code="source_binding_changed",
+            )
+        if path_state == ProjectSourceState.ABSENT:
             records.append(
                 {
                     "path": relative,

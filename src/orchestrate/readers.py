@@ -14,8 +14,8 @@ from typing import Any
 
 from .errors import OrchestrateError
 from .profile import MAX_GIT_PATH_BYTES, ProjectProfile
-from .safeio import approved_project_path
-from .sources import PreparedSourceSet, read_project_text, read_source_text
+from .safeio import ProjectSourceState, approved_project_path, project_source_state
+from .sources import PreparedSourceSet, SourceRevalidation, read_project_text, read_source_text
 
 
 CE_TASK_ID = re.compile(r"\bCE-[0-9]{4}\b")
@@ -80,13 +80,24 @@ def _relative_target(profile: ProjectProfile, source: str, target: str) -> str |
         except OrchestrateError as exc:
             if exc.code == "source_boundary_unresolved":
                 raise
+            if exc.code == "source_unavailable":
+                raise OrchestrateError(
+                    f"Reader source cannot currently be observed: {relative}",
+                    code="source_temporarily_unavailable",
+                ) from exc
             continue
         try:
             candidate.relative_to(profile.root.resolve())
         except ValueError:
             continue
-        if candidate.is_file():
+        source_state = project_source_state(profile.root, relative)
+        if source_state == ProjectSourceState.PRESENT:
             return relative
+        if source_state == ProjectSourceState.UNAVAILABLE:
+            raise OrchestrateError(
+                f"Reader source cannot currently be observed: {relative}",
+                code="source_temporarily_unavailable",
+            )
         missing = missing or relative
     if missing is not None:
         return missing
@@ -98,8 +109,15 @@ def _line_targets(profile: ProjectProfile, source: str, line: str) -> list[str]:
     result: list[str] = []
     for value in values:
         relative = _relative_target(profile, source, value)
-        if relative and (profile.root / relative).is_file():
-            result.append(relative)
+        if relative:
+            source_state = project_source_state(profile.root, relative)
+            if source_state == ProjectSourceState.PRESENT:
+                result.append(relative)
+            elif source_state == ProjectSourceState.UNAVAILABLE:
+                raise OrchestrateError(
+                    f"Reader source cannot currently be observed: {relative}",
+                    code="source_temporarily_unavailable",
+                )
     return result
 
 
@@ -158,7 +176,19 @@ def _manifest_shards(value: object, task_id: str, root: Path) -> list[dict[str, 
         seen_paths.add(path)
         seen_sequences.add(shard["sequence"])
         if task_id in shard["task_ids"]:
-            approved_project_path(root, path)
+            source_state = project_source_state(root, path)
+            if source_state in {ProjectSourceState.ABSENT, ProjectSourceState.CHANGED}:
+                raise OrchestrateError(
+                    "A manifest-selected project-log shard is absent or changed",
+                    code="source_binding_changed",
+                    data={"sourcePath": path, "sourceState": source_state.value},
+                )
+            if source_state == ProjectSourceState.UNAVAILABLE:
+                raise OrchestrateError(
+                    "A manifest-selected project-log shard cannot currently be observed",
+                    code="source_temporarily_unavailable",
+                    data={"sourcePath": path, "sourceState": source_state.value},
+                )
             selected.append({**shard, "path": path})
     if not selected:
         raise OrchestrateError(
@@ -209,9 +239,50 @@ def _require_tracked_query_sources(root: Path, paths: list[str]) -> None:
 def _query_source_identities(profile: ProjectProfile) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for path in CE_QUERY_SOURCES:
-        raw = read_project_text(profile, path).encode("utf-8")
+        try:
+            raw = read_project_text(profile, path).encode("utf-8")
+        except OrchestrateError as exc:
+            if exc.code != "source_unavailable":
+                raise
+            source_state = project_source_state(profile.root, path)
+            if source_state in {ProjectSourceState.PRESENT, ProjectSourceState.UNAVAILABLE}:
+                raise OrchestrateError(
+                    "A CE query source cannot currently be observed",
+                    code="ce_query_source_unavailable",
+                    data={"sourcePath": path, "sourceState": source_state.value},
+                ) from exc
+            raise OrchestrateError(
+                "A CE query source is absent or changed",
+                code="ce_query_source_changed",
+                data={"sourcePath": path, "sourceState": source_state.value},
+            ) from exc
         result[path] = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
     return result
+
+
+def _require_matching_source_revalidation(
+    result: SourceRevalidation,
+    *,
+    boundary: str,
+) -> None:
+    if result.state == ProjectSourceState.PRESENT:
+        return
+    details = {
+        "sourcePath": result.path,
+        "sourceState": result.state.value,
+        "boundary": boundary,
+    }
+    if result.state == ProjectSourceState.UNAVAILABLE:
+        raise OrchestrateError(
+            f"The CE query source binding cannot currently be observed {boundary}",
+            code="ce_query_source_unavailable",
+            data=details,
+        )
+    raise OrchestrateError(
+        f"The CE query source binding changed {boundary}",
+        code="ce_query_source_changed",
+        data=details,
+    )
 
 
 def _run_ce_query(
@@ -245,12 +316,12 @@ def _run_ce_query(
         raise OrchestrateError("The CE query source binding changed before execution", code="ce_query_source_changed")
     _require_tracked_query_sources(profile.root, paths)
     baseline = _git_source_state(profile.root, paths)
-    current_before = (
-        prepared_sources.revalidate(profile.root, frozenset(paths))
-        if prepared_sources is not None
-        else _query_source_identities(profile) == expected
-    )
-    if not current_before:
+    if prepared_sources is not None:
+        _require_matching_source_revalidation(
+            prepared_sources.revalidate(profile.root, frozenset(paths)),
+            boundary="before execution",
+        )
+    elif _query_source_identities(profile) != expected:
         raise OrchestrateError("The CE query source binding changed before execution", code="ce_query_source_changed")
     arguments = (
         "pnpm",
@@ -283,19 +354,23 @@ def _run_ce_query(
         result = json.loads(completed.stdout.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OrchestrateError("The CE project-log query did not return strict JSON", code="ce_query_invalid") from exc
-    stable = {
-        "gitState": _git_source_state(profile.root, paths) == baseline,
-        "sourceIdentities": (
-            prepared_sources.revalidate(profile.root, frozenset(paths))
-            if prepared_sources is not None
-            else _query_source_identities(profile) == expected
-        ),
-    }
-    if not all(stable.values()):
+    git_state_stable = _git_source_state(profile.root, paths) == baseline
+    if not git_state_stable:
         raise OrchestrateError(
             "The CE query source binding changed during execution",
             code="ce_query_source_changed",
-            data={"stable": stable},
+            data={"stable": {"gitState": False, "sourceIdentities": None}},
+        )
+    if prepared_sources is not None:
+        _require_matching_source_revalidation(
+            prepared_sources.revalidate(profile.root, frozenset(paths)),
+            boundary="during execution",
+        )
+    elif _query_source_identities(profile) != expected:
+        raise OrchestrateError(
+            "The CE query source binding changed during execution",
+            code="ce_query_source_changed",
+            data={"stable": {"gitState": True, "sourceIdentities": False}},
         )
     if not isinstance(result, dict):
         raise OrchestrateError("The CE project-log query returned an unknown shape", code="ce_query_invalid")

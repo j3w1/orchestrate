@@ -20,7 +20,7 @@ from .packets import (
     decode_packet,
     packet_spec_from_json,
 )
-from .profile import PROFILE_NAME, ProjectProfile
+from .profile import ProjectProfile
 from .readers import (
     CE_QUERY_SCRIPT,
     ReaderResult,
@@ -28,7 +28,7 @@ from .readers import (
     resolve_ce_context_sources,
     resolve_ce_task_source,
 )
-from .safeio import approved_project_path, is_sensitive_source, read_project_bytes
+from .safeio import ProjectSourceState, is_sensitive_source, project_source_state, read_project_bytes
 from .sources import (
     PreparedSourceSet,
     SourceAccess,
@@ -115,20 +115,34 @@ def _verify_reference_bytes(
     record = reference.packet_record
     if record is None:
         raise OrchestrateError("Worker packet source identity is malformed", code="packet_identity_conflict")
-    candidate = approved_project_path(profile.root, reference.path, require_file=False)
+    source_state = project_source_state(profile.root, reference.path)
     if reference.access == SourceAccess.REFERENCE_ONLY:
-        if candidate.exists():
+        if source_state in {ProjectSourceState.PRESENT, ProjectSourceState.CHANGED}:
             raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed")
+        if source_state == ProjectSourceState.UNAVAILABLE:
+            raise OrchestrateError(
+                "Bound project source cannot currently be observed",
+                code="source_temporarily_unavailable",
+            )
         raw_by_path[reference.path] = None
         return
+    if source_state in {ProjectSourceState.ABSENT, ProjectSourceState.CHANGED}:
+        raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed")
+    if source_state == ProjectSourceState.UNAVAILABLE:
+        raise OrchestrateError(
+            "Bound project source cannot currently be observed",
+            code="source_temporarily_unavailable",
+        )
     try:
         raw = read_project_bytes(profile.root, reference.path)
     except OrchestrateError as exc:
-        if exc.code == "source_unavailable" and candidate.is_file():
-            raise OrchestrateError(
-                "Bound project source is temporarily unavailable",
-                code="source_temporarily_unavailable",
-            ) from exc
+        if exc.code == "source_unavailable":
+            failed_state = project_source_state(profile.root, reference.path)
+            if failed_state in {ProjectSourceState.PRESENT, ProjectSourceState.UNAVAILABLE}:
+                raise OrchestrateError(
+                    "Bound project source is temporarily unavailable",
+                    code="source_temporarily_unavailable",
+                ) from exc
         raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed") from exc
     identity = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
     if identity != {"sha256": record.sha256, "bytes": record.byte_count}:
@@ -256,10 +270,15 @@ def _prepare_packet_sources(
     unacknowledged: list[str] = []
     for reference in guarded:
         if reference.path not in current_set:
-            candidate = approved_project_path(profile.root, reference.path, require_file=False)
-            if candidate.exists():
+            source_state = project_source_state(profile.root, reference.path)
+            if source_state == ProjectSourceState.PRESENT:
                 unacknowledged.append(reference.path)
                 continue
+            if source_state == ProjectSourceState.UNAVAILABLE:
+                raise OrchestrateError(
+                    "Packet-bound instruction cannot currently be observed",
+                    code="source_temporarily_unavailable",
+                )
         _verify_reference_bytes(profile, reference, raw_by_path)
     if unacknowledged:
         raise OrchestrateError(
@@ -614,19 +633,13 @@ def _native_identity(
     }
 
 
-def _retryable_preflight_failure(root: Path, exc: Exception) -> bool:
+def _retryable_preflight_failure(exc: Exception) -> bool:
     if isinstance(exc, OrcaCommandError):
         return True
     if isinstance(exc, OSError):
         return True
     if isinstance(exc, OrchestrateError):
-        if exc.code in _RETRYABLE_PREFLIGHT_CODES:
-            return True
-        # A no-follow profile read can fail because another Windows process
-        # briefly owns an incompatible handle. A genuinely missing profile is
-        # classified earlier as profile_missing and remains definitive.
-        if exc.code == "source_unavailable" and (root / PROFILE_NAME).is_file():
-            return True
+        return exc.code in _RETRYABLE_PREFLIGHT_CODES
     return False
 
 
@@ -818,7 +831,7 @@ def worker_preflight(
                 mismatch: dict[str, Any] = {"code": code, "message": _bounded_exception_message(exc)}
                 if isinstance(exc, OrchestrateError) and exc.data is not None:
                     mismatch["details"] = exc.data
-                retryable = _retryable_preflight_failure(root, exc)
+                retryable = _retryable_preflight_failure(exc)
                 rejected = {
                     "schema": PREFLIGHT_SCHEMA,
                     "outcome": "rejected",

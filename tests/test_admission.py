@@ -763,18 +763,29 @@ class AdmissionTests(unittest.TestCase):
 
     def test_nonzero_git_show_is_retryable_and_recovers_to_a_fresh_grant(self) -> None:
         real_run = subprocess.run
+        alternate_root_spelling = os.fspath(self.root) + os.sep + "."
+        intercepted: list[tuple[str, ...]] = []
 
         def transient_show(
             arguments: tuple[str, ...],
             **keywords: object,
         ) -> subprocess.CompletedProcess[bytes]:
-            if arguments[:4] == ("git", "-C", str(self.root), "show"):
+            if (
+                len(arguments) >= 4
+                and arguments[0] == "git"
+                and arguments[1] == "-C"
+                and Path(arguments[2]).resolve() == Path(alternate_root_spelling).resolve()
+                and arguments[3] == "show"
+            ):
+                intercepted.append(arguments)
                 return subprocess.CompletedProcess(arguments, 128, b"", b"fatal: transient Git failure")
             return real_run(arguments, **keywords)
 
+        self.assertNotEqual(alternate_root_spelling, os.fspath(self.root.resolve()))
         with patch("orchestrate.sources.subprocess.run", side_effect=transient_show):
             with self.assertRaises(OrchestrateError) as transient:
                 self._run(PreflightClient(self.root, self.packet))
+        self.assertGreaterEqual(len(intercepted), 1)
         self.assertEqual(transient.exception.code, "preflight_retryable")
         self.assertEqual(transient.exception.data["cause"], "git_inspection_failed")  # type: ignore[index]
         with StateStore(self.root) as store:
@@ -858,6 +869,149 @@ class AdmissionTests(unittest.TestCase):
                     platform="win32",
                 )
             self.assertEqual(restored.exception.code, "preflight_already_rejected")
+
+    def test_missing_manifest_selected_shard_is_definitive_after_completed_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, run, packet, _query_result = self._prepare_ce_preflight(root)
+            shard = root / "docs" / "project-log" / "shard-001.md"
+            original = shard.read_bytes()
+            native = {
+                "terminalResourceId": "terminal-resource-1",
+                "terminalHandle": "term_worker",
+                "worktreeId": f"repo::{root.resolve()}",
+            }
+
+            def remove_shard_after_completed_stage(*_: object, **__: object) -> dict[str, str]:
+                shard.unlink()
+                return native
+
+            client = PreflightClient(root, packet)
+            with patch(
+                "orchestrate.admission._native_identity",
+                side_effect=remove_shard_after_completed_stage,
+            ):
+                with self.assertRaises(OrchestrateError) as rejected:
+                    worker_preflight(
+                        root,
+                        run_id="run_1",
+                        task_id="task_1",
+                        dispatch_id="dispatch_1",
+                        packet_id=str(packet["packetId"]),
+                        client=client,
+                        environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                        platform="win32",
+                    )
+            self.assertEqual(rejected.exception.code, "preflight_rejected")
+            self.assertEqual(rejected.exception.data["cause"], "source_binding_changed")  # type: ignore[index]
+            self.assertEqual(client.calls, [])
+            with StateStore(root) as store:
+                observed = store.get_preflight(run.local_id, "task_1", "dispatch_1")
+                attempts = store.list_preflight_attempts(run.local_id, "task_1", "dispatch_1")
+            self.assertEqual(observed["outcome"], "rejected")  # type: ignore[index]
+            self.assertEqual(attempts[0]["disposition"], "definitive")
+
+            shard.write_bytes(original)
+            with self.assertRaises(OrchestrateError) as restored:
+                worker_preflight(
+                    root,
+                    run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id="dispatch_1",
+                    packet_id=str(packet["packetId"]),
+                    client=PreflightClient(root, packet),
+                    environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                    platform="win32",
+                )
+            self.assertEqual(restored.exception.code, "preflight_already_rejected")
+
+    def test_still_present_query_source_open_failure_is_retryable_after_native_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, run, packet, query_result = self._prepare_ce_preflight(root)
+            query_script = "scripts/quality/project-log.mjs"
+            real_run = subprocess.run
+            native = {
+                "terminalResourceId": "terminal-resource-1",
+                "terminalHandle": "term_worker",
+                "worktreeId": f"repo::{root.resolve()}",
+            }
+
+            def transient_open(current_root: Path, relative: str) -> bytes:
+                if relative == query_script:
+                    self.assertTrue((current_root / relative).is_file())
+                    raise OrchestrateError(
+                        "simulated sharing failure",
+                        code="source_unavailable",
+                    )
+                return read_project_bytes(current_root, relative)
+
+            def synthetic_query(
+                arguments: tuple[str, ...],
+                **keywords: object,
+            ) -> subprocess.CompletedProcess[bytes]:
+                if arguments[0] == "pnpm":
+                    return subprocess.CompletedProcess(
+                        arguments,
+                        0,
+                        json.dumps(query_result).encode("utf-8"),
+                        b"",
+                    )
+                return real_run(arguments, **keywords)
+
+            client = PreflightClient(root, packet)
+            with (
+                patch("orchestrate.admission._native_identity", return_value=native),
+                patch("orchestrate.sources.read_project_bytes", side_effect=transient_open),
+                patch("orchestrate.readers.subprocess.run", side_effect=synthetic_query),
+            ):
+                with self.assertRaises(OrchestrateError) as transient:
+                    worker_preflight(
+                        root,
+                        run_id="run_1",
+                        task_id="task_1",
+                        dispatch_id="dispatch_1",
+                        packet_id=str(packet["packetId"]),
+                        client=client,
+                        environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                        platform="win32",
+                    )
+            self.assertEqual(transient.exception.code, "preflight_retryable")
+            self.assertEqual(transient.exception.data["cause"], "ce_query_source_unavailable")  # type: ignore[index]
+            self.assertEqual(client.calls, [])
+            with StateStore(root) as store:
+                self.assertIsNone(store.get_preflight(run.local_id, "task_1", "dispatch_1"))
+                attempts = store.list_preflight_attempts(run.local_id, "task_1", "dispatch_1")
+            self.assertEqual(
+                [(item["attemptOrdinal"], item["disposition"]) for item in attempts],
+                [(1, "retryable")],
+            )
+
+            with (
+                patch("orchestrate.admission._native_identity", return_value=native),
+                patch("orchestrate.readers.subprocess.run", side_effect=synthetic_query),
+            ):
+                admitted = worker_preflight(
+                    root,
+                    run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id="dispatch_1",
+                    packet_id=str(packet["packetId"]),
+                    client=PreflightClient(root, packet),
+                    environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                    platform="win32",
+                )
+            self.assertEqual(admitted["status"], "admitted")
+            self.assertEqual(admitted["editingGrant"], "fresh")
+            with StateStore(root) as store:
+                self.assertEqual(
+                    store.get_preflight(run.local_id, "task_1", "dispatch_1")["outcome"],  # type: ignore[index]
+                    "passed",
+                )
+                self.assertEqual(
+                    len(store.list_preflight_attempts(run.local_id, "task_1", "dispatch_1")),
+                    1,
+                )
 
     def test_packet_declared_repo_routing_cannot_authorize_a_byte_read(self) -> None:
         private_path = "private-notes.txt"

@@ -12,7 +12,12 @@ from typing import Any
 import uuid
 
 from .errors import OrchestrateError
-from .safeio import approved_project_path, read_project_bytes
+from .safeio import (
+    ProjectSourceState,
+    approved_project_path,
+    project_source_state,
+    read_project_bytes,
+)
 from .state import RunLock, make_private_state_directory, project_key, require_private_state_target, state_home, utc_now
 
 
@@ -136,14 +141,29 @@ def _profile_candidate(
     require_sources: bool = True,
 ) -> tuple[bytes, dict[str, Any]]:
     path = root / PROFILE_NAME
-    if not path.is_file():
+    source_state = project_source_state(root, PROFILE_NAME)
+    if source_state in {ProjectSourceState.ABSENT, ProjectSourceState.CHANGED}:
         raise OrchestrateError(
             f"{PROFILE_NAME} is missing; run 'orchestrate setup' first",
             code="profile_missing",
         )
+    if source_state == ProjectSourceState.UNAVAILABLE:
+        raise OrchestrateError(
+            f"{PROFILE_NAME} cannot currently be observed",
+            code="source_temporarily_unavailable",
+        )
     try:
         raw = read_project_bytes(root, PROFILE_NAME)
         value = json.loads(raw)
+    except OrchestrateError as exc:
+        if exc.code == "source_unavailable":
+            failed_state = project_source_state(root, PROFILE_NAME)
+            if failed_state in {ProjectSourceState.PRESENT, ProjectSourceState.UNAVAILABLE}:
+                raise OrchestrateError(
+                    f"{PROFILE_NAME} is temporarily unavailable",
+                    code="source_temporarily_unavailable",
+                ) from exc
+        raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OrchestrateError(f"Cannot read {path}: {exc}", code="profile_unreadable") from exc
     return raw, validate_profile(value, root=root, require_sources=require_sources)
@@ -384,9 +404,22 @@ def validate_profile(
                     require_file=require_sources and key != "candidateSources",
                 )
                 _relative(root.resolve(), candidate)
-            except OrchestrateError:
+            except OrchestrateError as exc:
+                if exc.code == "source_unavailable":
+                    source_state = project_source_state(root, entry)
+                    if source_state in {ProjectSourceState.PRESENT, ProjectSourceState.UNAVAILABLE}:
+                        raise OrchestrateError(
+                            f"Required profile source cannot currently be observed: {entry}",
+                            code="source_temporarily_unavailable",
+                        ) from exc
                 raise
-            if (root / entry).exists() and not candidate.is_file():
+            source_state = project_source_state(root, entry)
+            if source_state == ProjectSourceState.UNAVAILABLE:
+                raise OrchestrateError(
+                    f"Required profile source cannot currently be observed: {entry}",
+                    code="source_temporarily_unavailable",
+                )
+            if source_state == ProjectSourceState.CHANGED:
                 raise OrchestrateError(
                     f"Required profile source is unavailable: {entry}",
                     code="profile_source_unavailable",
@@ -417,9 +450,14 @@ class ProjectProfile:
         current = instruction_inventory(self.root)
         unacknowledged: list[str] = []
         for relative in sorted(set(self.value["instructions"]) - set(current)):
-            path = approved_project_path(self.root, relative, require_file=False)
-            if path.is_file():
+            source_state = project_source_state(self.root, relative)
+            if source_state == ProjectSourceState.PRESENT:
                 unacknowledged.append(relative)
+            elif source_state == ProjectSourceState.UNAVAILABLE:
+                raise OrchestrateError(
+                    f"Selected instruction cannot currently be observed: {relative}",
+                    code="source_temporarily_unavailable",
+                )
         if (
             unacknowledged
             and self.selection_source != PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE
