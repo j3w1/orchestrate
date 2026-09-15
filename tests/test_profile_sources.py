@@ -496,7 +496,7 @@ class ProfileAndSourceTests(DisposableRepo):
 
     def test_source_handle_treats_file_replaced_by_directory_as_changed(self) -> None:
         source = self.root / "bound-source.txt"
-        source.write_text("bound bytes\n", encoding="utf-8")
+        source.write_bytes(b"bound bytes\n")
         self.assertEqual(read_project_bytes(self.root, source.name), b"bound bytes\n")
         source.unlink()
         source.mkdir()
