@@ -236,6 +236,41 @@ def _git_source_state(root: Path, paths: list[str]) -> bytes:
     return completed.stdout
 
 
+def _git_source_delta(root: Path, paths: list[str]) -> bool:
+    """Prove a tracked byte or executable-bit delta after safe source access."""
+
+    for cached in (False, True):
+        arguments = ["git", "-C", os.fspath(root), "diff"]
+        if cached:
+            arguments.append("--cached")
+        arguments.extend(("--raw", "-z", "--no-renames", "--", *paths))
+        try:
+            completed = subprocess.run(
+                tuple(arguments),
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise OrchestrateError(
+                "CE query source binding could not be inspected",
+                code="ce_query_source_unavailable",
+            ) from exc
+        if completed.returncode:
+            raise OrchestrateError(
+                "CE query source binding could not be inspected",
+                code="ce_query_source_unavailable",
+            )
+        if len(completed.stdout) > MAX_GIT_PATH_BYTES:
+            raise OrchestrateError(
+                "CE query source inspection exceeded its output boundary",
+                code="ce_query_source_unavailable",
+            )
+        if completed.stdout:
+            return True
+    return False
+
+
 def _require_tracked_query_sources(root: Path, paths: list[str]) -> None:
     for path in paths:
         try:
@@ -253,8 +288,6 @@ def _require_tracked_query_sources(root: Path, paths: list[str]) -> None:
             raise OrchestrateError("CE query source inspection exceeded its output boundary", code="ce_query_source_unavailable")
         if tracked.stdout != path.encode("utf-8") + b"\0":
             raise OrchestrateError("The CE query implementation is not a tracked source", code="ce_query_source_changed")
-    if _git_source_state(root, paths):
-        raise OrchestrateError("The CE query implementation or manifest is mutable", code="ce_query_source_changed")
 
 
 def _query_source_identities(profile: ProjectProfile) -> dict[str, dict[str, Any]]:
@@ -326,6 +359,25 @@ def _require_matching_source_revalidation(
     )
 
 
+def _revalidate_query_sources(
+    profile: ProjectProfile,
+    expected: Mapping[str, Mapping[str, Any]],
+    prepared_sources: PreparedSourceSet | None,
+    *,
+    boundary: str,
+) -> None:
+    if prepared_sources is not None:
+        _require_matching_source_revalidation(
+            prepared_sources.revalidate(profile.root, frozenset(CE_QUERY_SOURCES)),
+            boundary=boundary,
+        )
+    elif _query_source_identities(profile) != expected:
+        raise OrchestrateError(
+            f"The CE query source binding changed {boundary}",
+            code="ce_query_source_changed",
+        )
+
+
 def _run_ce_query(
     profile: ProjectProfile,
     task_id: str,
@@ -355,15 +407,19 @@ def _run_ce_query(
     }
     if captured_identities != expected:
         raise OrchestrateError("The CE query source binding changed before execution", code="ce_query_source_changed")
-    _require_tracked_query_sources(profile.root, paths)
     baseline = _git_source_state(profile.root, paths)
-    if prepared_sources is not None:
-        _require_matching_source_revalidation(
-            prepared_sources.revalidate(profile.root, frozenset(paths)),
-            boundary="before execution",
+    _revalidate_query_sources(
+        profile,
+        expected,
+        prepared_sources,
+        boundary="before execution",
+    )
+    _require_tracked_query_sources(profile.root, paths)
+    if baseline and _git_source_delta(profile.root, paths):
+        raise OrchestrateError(
+            "The CE query implementation or manifest has a tracked byte or executable-bit change",
+            code="ce_query_source_changed",
         )
-    elif _query_source_identities(profile) != expected:
-        raise OrchestrateError("The CE query source binding changed before execution", code="ce_query_source_changed")
     arguments = (
         "pnpm",
         "--silent",
@@ -395,23 +451,19 @@ def _run_ce_query(
         result = json.loads(completed.stdout.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OrchestrateError("The CE project-log query did not return strict JSON", code="ce_query_invalid") from exc
-    git_state_stable = _git_source_state(profile.root, paths) == baseline
-    if not git_state_stable:
+    current_git_state = _git_source_state(profile.root, paths)
+    _revalidate_query_sources(
+        profile,
+        expected,
+        prepared_sources,
+        boundary="during execution",
+    )
+    _require_tracked_query_sources(profile.root, paths)
+    if current_git_state and _git_source_delta(profile.root, paths):
         raise OrchestrateError(
             "The CE query source binding changed during execution",
             code="ce_query_source_changed",
-            data={"stable": {"gitState": False, "sourceIdentities": None}},
-        )
-    if prepared_sources is not None:
-        _require_matching_source_revalidation(
-            prepared_sources.revalidate(profile.root, frozenset(paths)),
-            boundary="during execution",
-        )
-    elif _query_source_identities(profile) != expected:
-        raise OrchestrateError(
-            "The CE query source binding changed during execution",
-            code="ce_query_source_changed",
-            data={"stable": {"gitState": True, "sourceIdentities": False}},
+            data={"stable": {"gitState": False, "sourceIdentities": True}},
         )
     if not isinstance(result, dict):
         raise OrchestrateError("The CE project-log query returned an unknown shape", code="ce_query_invalid")

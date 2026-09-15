@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import json
 import os
 from pathlib import Path
@@ -191,6 +193,8 @@ class AdmissionTests(unittest.TestCase):
     def _prepare_ce_preflight(
         self,
         root: Path,
+        *,
+        executable_query: bool = False,
     ) -> tuple[ProjectProfile, RunRecord, dict[str, object], dict[str, object]]:
         git(root, "init", "-q")
         git(root, "config", "user.email", "fixture@example.invalid")
@@ -217,6 +221,8 @@ class AdmissionTests(unittest.TestCase):
             "// benign packet-bound query fixture\n",
             encoding="utf-8",
         )
+        if executable_query:
+            (root / "scripts" / "quality" / "project-log.mjs").chmod(0o755)
         shard = {
             "sequence": 1,
             "path": "docs/project-log/shard-001.md",
@@ -1768,6 +1774,223 @@ class AdmissionTests(unittest.TestCase):
                     len(store.list_preflight_attempts(run.local_id, "task_1", "dispatch_1")),
                     1,
                 )
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX permission denial semantics")
+    def test_actual_query_source_permission_denial_is_retryable_after_completed_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, run, packet, query_result = self._prepare_ce_preflight(
+                root,
+                executable_query=True,
+            )
+            query_script = root / "scripts" / "quality" / "project-log.mjs"
+            original = query_script.read_bytes()
+            original_mode = stat.S_IMODE(query_script.stat().st_mode)
+            real_run = subprocess.run
+            denied_errno: int | None = None
+            status_after_denial = b""
+            query_calls: list[tuple[str, ...]] = []
+            native = {
+                "terminalResourceId": "terminal-resource-1",
+                "terminalHandle": "term_worker",
+                "worktreeId": f"repo::{root.resolve()}",
+            }
+
+            def deny_after_completed_stage(*_: object, **__: object) -> dict[str, str]:
+                nonlocal denied_errno, status_after_denial
+                query_script.chmod(0)
+                try:
+                    descriptor = os.open(query_script, os.O_RDONLY)
+                except OSError as exc:
+                    denied_errno = exc.errno
+                else:
+                    os.close(descriptor)
+                status_after_denial = real_run(
+                    (
+                        "git",
+                        "-C",
+                        os.fspath(root),
+                        "status",
+                        "--porcelain=v1",
+                        "-z",
+                        "--",
+                        "scripts/quality/project-log.mjs",
+                    ),
+                    capture_output=True,
+                    check=True,
+                ).stdout
+                return native
+
+            def synthetic_query(
+                arguments: tuple[str, ...],
+                **keywords: object,
+            ) -> subprocess.CompletedProcess[bytes]:
+                if arguments[0] == "pnpm":
+                    query_calls.append(arguments)
+                    return subprocess.CompletedProcess(
+                        arguments,
+                        0,
+                        json.dumps(query_result).encode("utf-8"),
+                        b"",
+                    )
+                return real_run(arguments, **keywords)
+
+            client = PreflightClient(root, packet)
+            try:
+                with (
+                    patch(
+                        "orchestrate.admission._native_identity",
+                        side_effect=deny_after_completed_stage,
+                    ),
+                    patch("orchestrate.readers.subprocess.run", side_effect=synthetic_query),
+                ):
+                    with self.assertRaises(OrchestrateError) as transient:
+                        worker_preflight(
+                            root,
+                            run_id="run_1",
+                            task_id="task_1",
+                            dispatch_id="dispatch_1",
+                            packet_id=str(packet["packetId"]),
+                            client=client,
+                            environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                            platform="win32",
+                        )
+            finally:
+                query_script.chmod(original_mode)
+
+            self.assertEqual(denied_errno, errno.EACCES)
+            self.assertTrue(status_after_denial)
+            self.assertEqual(query_script.read_bytes(), original)
+            self.assertEqual(transient.exception.code, "preflight_retryable")
+            self.assertEqual(
+                transient.exception.data["cause"],  # type: ignore[index]
+                "ce_query_source_unavailable",
+            )
+            self.assertEqual(query_calls, [])
+            self.assertEqual(client.calls, [])
+            with StateStore(root) as store:
+                self.assertIsNone(store.get_preflight(run.local_id, "task_1", "dispatch_1"))
+                attempts = store.list_preflight_attempts(run.local_id, "task_1", "dispatch_1")
+            self.assertEqual(
+                [(item["attemptOrdinal"], item["disposition"]) for item in attempts],
+                [(1, "retryable")],
+            )
+
+            with (
+                patch("orchestrate.admission._native_identity", return_value=native),
+                patch("orchestrate.readers.subprocess.run", side_effect=synthetic_query),
+            ):
+                admitted = worker_preflight(
+                    root,
+                    run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id="dispatch_1",
+                    packet_id=str(packet["packetId"]),
+                    client=PreflightClient(root, packet),
+                    environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                    platform="win32",
+                )
+            self.assertEqual(admitted["status"], "admitted")
+            self.assertEqual(admitted["editingGrant"], "fresh")
+
+    def _assert_query_source_mutation_is_definitive(
+        self,
+        mutate: Callable[[Path, bytes], None],
+        *,
+        executable_query: bool = False,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, run, packet, query_result = self._prepare_ce_preflight(
+                root,
+                executable_query=executable_query,
+            )
+            query_script = root / "scripts" / "quality" / "project-log.mjs"
+            original = query_script.read_bytes()
+            original_mode = stat.S_IMODE(query_script.stat().st_mode)
+            real_run = subprocess.run
+            native = {
+                "terminalResourceId": "terminal-resource-1",
+                "terminalHandle": "term_worker",
+                "worktreeId": f"repo::{root.resolve()}",
+            }
+
+            def mutate_after_completed_stage(*_: object, **__: object) -> dict[str, str]:
+                mutate(query_script, original)
+                return native
+
+            def synthetic_query(
+                arguments: tuple[str, ...],
+                **keywords: object,
+            ) -> subprocess.CompletedProcess[bytes]:
+                if arguments[0] == "pnpm":
+                    return subprocess.CompletedProcess(
+                        arguments,
+                        0,
+                        json.dumps(query_result).encode("utf-8"),
+                        b"",
+                    )
+                return real_run(arguments, **keywords)
+
+            try:
+                with (
+                    patch(
+                        "orchestrate.admission._native_identity",
+                        side_effect=mutate_after_completed_stage,
+                    ),
+                    patch("orchestrate.readers.subprocess.run", side_effect=synthetic_query),
+                ):
+                    with self.assertRaises(OrchestrateError) as rejected:
+                        worker_preflight(
+                            root,
+                            run_id="run_1",
+                            task_id="task_1",
+                            dispatch_id="dispatch_1",
+                            packet_id=str(packet["packetId"]),
+                            client=PreflightClient(root, packet),
+                            environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                            platform="win32",
+                        )
+                with StateStore(root) as store:
+                    observed = store.get_preflight(run.local_id, "task_1", "dispatch_1")
+                    attempts = store.list_preflight_attempts(run.local_id, "task_1", "dispatch_1")
+            finally:
+                query_script.write_bytes(original)
+                query_script.chmod(original_mode)
+
+            self.assertEqual(rejected.exception.code, "preflight_rejected")
+            self.assertEqual(
+                rejected.exception.data["cause"],  # type: ignore[index]
+                "ce_query_source_changed",
+            )
+            self.assertEqual(observed["outcome"], "rejected")  # type: ignore[index]
+            self.assertEqual(attempts[0]["disposition"], "definitive")
+            with self.assertRaises(OrchestrateError) as restored:
+                worker_preflight(
+                    root,
+                    run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id="dispatch_1",
+                    packet_id=str(packet["packetId"]),
+                    client=PreflightClient(root, packet),
+                    environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                    platform="win32",
+                )
+            self.assertEqual(restored.exception.code, "preflight_already_rejected")
+
+    def test_query_source_byte_change_after_completed_stage_is_definitive(self) -> None:
+        self._assert_query_source_mutation_is_definitive(
+            lambda path, original: path.write_bytes(
+                original + b"// changed after completed stage\n"
+            )
+        )
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX tracked executable-bit semantics")
+    def test_tracked_query_source_executable_bit_change_is_definitive(self) -> None:
+        self._assert_query_source_mutation_is_definitive(
+            lambda path, _original: path.chmod(0o644),
+            executable_query=True,
+        )
 
     def test_packet_declared_repo_routing_cannot_authorize_a_byte_read(self) -> None:
         private_path = "private-notes.txt"
