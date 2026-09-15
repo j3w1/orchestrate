@@ -222,13 +222,14 @@ class ProfileAndSourceTests(DisposableRepo):
             )
         self.assertGreaterEqual(fault.interceptions, 1)
 
-    def test_project_source_error_state_has_one_complete_errno_partition(self) -> None:
+    def test_project_source_open_error_partition_preserves_environmental_fallback(self) -> None:
         definitive = {
             errno.ENOENT: ProjectSourceState.ABSENT,
             errno.ENOTDIR: ProjectSourceState.CHANGED,
             errno.ELOOP: ProjectSourceState.CHANGED,
             errno.ENAMETOOLONG: ProjectSourceState.CHANGED,
             errno.EISDIR: ProjectSourceState.CHANGED,
+            errno.ENXIO: ProjectSourceState.CHANGED,
         }
         environmental = frozenset(
             {
@@ -284,6 +285,9 @@ class ProfileAndSourceTests(DisposableRepo):
             project_source_error_state(OSError(987654, "unknown")),
             ProjectSourceState.UNAVAILABLE,
         )
+        # This partition applies only when open yields no node evidence.
+        # Successful non-regular opens are definitive through fd-backed type
+        # proof, as covered by the public directory/socket/FIFO substitutions.
 
     def test_env_variants_are_excluded_before_content_hashing(self) -> None:
         profile = setup_project(self.root)

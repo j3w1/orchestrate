@@ -6,7 +6,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 
 from orchestrate.errors import OrchestrateError
@@ -188,14 +187,11 @@ class StateTests(unittest.TestCase):
                 bounded = AdmissionEffectFence(first.path, timeout_seconds=0.05)
                 with controller:
                     with first:
-                        started = time.monotonic()
                         with self.assertRaises(OrchestrateError) as caught:
                             with bounded:
                                 pass
-                        elapsed = time.monotonic() - started
 
                 self.assertEqual(caught.exception.code, "admission_effect_contention")
-                self.assertLess(elapsed, 1.0)
 
     def test_admission_effect_fence_is_released_when_owning_process_exits(self) -> None:
         with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:

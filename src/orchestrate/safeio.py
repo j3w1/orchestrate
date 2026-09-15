@@ -64,6 +64,7 @@ PROJECT_SOURCE_STRUCTURAL_ERRNOS: Final[frozenset[int]] = frozenset(
         errno.ELOOP,
         errno.ENAMETOOLONG,
         errno.EISDIR,
+        errno.ENXIO,
     }
 )
 PROJECT_SOURCE_ENVIRONMENTAL_ERRNOS: Final[frozenset[int]] = frozenset(
@@ -229,24 +230,49 @@ def project_source_state(root: Path, relative: str) -> ProjectSourceState:
 def _read_posix_handle(root: Path, parts: tuple[str, ...], relative: str) -> bytes:
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
+    non_blocking = getattr(os, "O_NONBLOCK", 0)
     close_on_exec = getattr(os, "O_CLOEXEC", 0)
-    if not no_follow or not directory:
+    if not no_follow or not directory or not non_blocking:
         raise OrchestrateError(
             "This host cannot provide no-follow project source reads",
             code="source_boundary_unresolved",
         )
     descriptors: list[int] = []
     try:
-        current = os.open(os.fspath(root.resolve()), os.O_RDONLY | directory | close_on_exec)
+        try:
+            canonical_root = root.resolve()
+            current = os.open(os.fspath(canonical_root), os.O_RDONLY | directory | close_on_exec)
+        except OSError as exc:
+            raise _source_error(
+                f"Required source cannot be opened safely: {relative}",
+                state=project_source_error_state(exc),
+            ) from exc
         descriptors.append(current)
         for index, part in enumerate(parts):
             final = index == len(parts) - 1
             flags = os.O_RDONLY | no_follow | close_on_exec
-            if not final:
+            if final:
+                # A FIFO substituted for a bound regular file must not turn
+                # source admission into an unbounded open. The resulting fd
+                # pins whichever inode was opened for the type proof below.
+                flags |= non_blocking
+            else:
                 flags |= directory
-            current = os.open(part, flags, dir_fd=current)
+            try:
+                current = os.open(part, flags, dir_fd=current)
+            except OSError as exc:
+                raise _source_error(
+                    f"Required source cannot be opened safely: {relative}",
+                    state=project_source_error_state(exc),
+                ) from exc
             descriptors.append(current)
-        info = os.fstat(current)
+        try:
+            info = os.fstat(current)
+        except OSError as exc:
+            raise _source_error(
+                f"Required source identity cannot be observed: {relative}",
+                state=ProjectSourceState.UNAVAILABLE,
+            ) from exc
         if not stat.S_ISREG(info.st_mode):
             raise _source_error(
                 f"Required source is not a file: {relative}",
@@ -257,7 +283,15 @@ def _read_posix_handle(root: Path, parts: tuple[str, ...], relative: str) -> byt
         chunks: list[bytes] = []
         remaining = MAX_SOURCE_BYTES + 1
         while remaining:
-            chunk = os.read(current, min(64 * 1024, remaining))
+            try:
+                chunk = os.read(current, min(64 * 1024, remaining))
+            except OSError as exc:
+                # The fd already proved and pinned a regular inode. A later
+                # read failure is availability evidence, never a path update.
+                raise _source_error(
+                    f"Required source cannot be read: {relative}",
+                    state=ProjectSourceState.UNAVAILABLE,
+                ) from exc
             if not chunk:
                 break
             chunks.append(chunk)
@@ -268,12 +302,6 @@ def _read_posix_handle(root: Path, parts: tuple[str, ...], relative: str) -> byt
         return raw
     except OrchestrateError:
         raise
-    except OSError as exc:
-        source_state = project_source_error_state(exc)
-        raise _source_error(
-            f"Required source cannot be opened safely: {relative}",
-            state=source_state,
-        ) from exc
     finally:
         for descriptor in reversed(descriptors):
             try:

@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -294,6 +296,211 @@ class AdmissionTests(unittest.TestCase):
                 readback={"fixture": "validated-start-readback"},
             )
         return profile, run, packet, query_result
+
+    def _assert_query_source_node_substitution_is_definitive(self, node_type: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, run, packet, query_result = self._prepare_ce_preflight(root)
+            query_script = root / "scripts" / "quality" / "project-log.mjs"
+            saved_script = query_script.with_name("project-log.mjs-bound-regular")
+            real_open = os.open
+            real_run = subprocess.run
+            native = {
+                "terminalResourceId": "terminal-resource-1",
+                "terminalHandle": "term_worker",
+                "worktreeId": f"repo::{root.resolve()}",
+            }
+            bound_socket: socket.socket | None = None
+            substituted = False
+            substitution_exists = False
+            substitution_mode: int | None = None
+            armed = False
+
+            def make_substitution() -> None:
+                nonlocal bound_socket, substituted, substitution_exists, substitution_mode
+                if substituted:
+                    return
+                query_script.rename(saved_script)
+                if node_type == "directory":
+                    query_script.mkdir()
+                elif node_type == "symlink":
+                    query_script.symlink_to(saved_script.name)
+                elif node_type == "socket":
+                    bound_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    bound_socket.bind(os.fspath(query_script))
+                elif node_type == "fifo":
+                    os.mkfifo(query_script)
+                else:  # pragma: no cover - test helper contract
+                    raise AssertionError(node_type)
+                substituted = True
+                substitution_exists = query_script.exists()
+                substitution_mode = query_script.lstat().st_mode
+
+            def arm_after_completed_stage(*_: object, **__: object) -> dict[str, str]:
+                nonlocal armed
+                armed = True
+                if sys.platform == "win32":
+                    make_substitution()
+                return native
+
+            def substitute_at_bound_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                if armed and not substituted and path == query_script.name and dir_fd is not None:
+                    make_substitution()
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            def synthetic_query(
+                arguments: tuple[str, ...],
+                **keywords: object,
+            ) -> subprocess.CompletedProcess[bytes]:
+                if arguments[0] == "pnpm":
+                    return subprocess.CompletedProcess(
+                        arguments,
+                        0,
+                        json.dumps(query_result).encode("utf-8"),
+                        b"",
+                    )
+                return real_run(arguments, **keywords)
+
+            client = PreflightClient(root, packet)
+            caught: list[BaseException] = []
+            finished = threading.Event()
+
+            def invoke_preflight() -> None:
+                try:
+                    worker_preflight(
+                        root,
+                        run_id="run_1",
+                        task_id="task_1",
+                        dispatch_id="dispatch_1",
+                        packet_id=str(packet["packetId"]),
+                        client=client,
+                        environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                        platform="win32",
+                    )
+                except BaseException as exc:
+                    caught.append(exc)
+                finally:
+                    finished.set()
+
+            completed_without_rescue = True
+            try:
+                with (
+                    patch(
+                        "orchestrate.admission._native_identity",
+                        side_effect=arm_after_completed_stage,
+                    ),
+                    patch("orchestrate.safeio.os.open", new=substitute_at_bound_open),
+                    patch("orchestrate.readers.subprocess.run", side_effect=synthetic_query),
+                ):
+                    if node_type == "fifo":
+                        worker = threading.Thread(target=invoke_preflight, daemon=True)
+                        worker.start()
+                        completed_without_rescue = finished.wait(LIVENESS_TIMEOUT)
+                        if not completed_without_rescue:
+                            # Release a regressed blocking FIFO open so the
+                            # daemon can settle before this test reports why.
+                            writer = os.open(query_script, os.O_WRONLY | os.O_NONBLOCK)
+                            os.close(writer)
+                            worker.join(timeout=LIVENESS_TIMEOUT)
+                    else:
+                        invoke_preflight()
+                self.assertTrue(finished.is_set(), "worker preflight did not settle after FIFO-open rescue")
+                self.assertTrue(completed_without_rescue, "FIFO substitution blocked project-source admission")
+                self.assertEqual(len(caught), 1)
+                self.assertIsInstance(caught[0], OrchestrateError)
+                rejected = caught[0]
+                assert isinstance(rejected, OrchestrateError)
+                with StateStore(root) as store:
+                    observed = store.get_preflight(run.local_id, "task_1", "dispatch_1")
+                    attempts = store.list_preflight_attempts(run.local_id, "task_1", "dispatch_1")
+            finally:
+                if bound_socket is not None:
+                    bound_socket.close()
+                if substituted:
+                    if query_script.is_dir() and not query_script.is_symlink():
+                        query_script.rmdir()
+                    else:
+                        query_script.unlink()
+                if saved_script.exists():
+                    saved_script.rename(query_script)
+
+            expected_type = {
+                "directory": stat.S_ISDIR,
+                "symlink": stat.S_ISLNK,
+                "socket": stat.S_ISSOCK,
+                "fifo": stat.S_ISFIFO,
+            }[node_type]
+            self.assertTrue(substitution_exists)
+            self.assertIsNotNone(substitution_mode)
+            self.assertTrue(expected_type(substitution_mode))  # type: ignore[arg-type]
+            self.assertEqual(client.calls, [])
+
+            restored_code: str | None = None
+            restored_grant: object = None
+            with (
+                patch("orchestrate.admission._native_identity", return_value=native),
+                patch("orchestrate.readers.subprocess.run", side_effect=synthetic_query),
+            ):
+                try:
+                    restored = worker_preflight(
+                        root,
+                        run_id="run_1",
+                        task_id="task_1",
+                        dispatch_id="dispatch_1",
+                        packet_id=str(packet["packetId"]),
+                        client=PreflightClient(root, packet),
+                        environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                        platform="win32",
+                    )
+                    restored_grant = restored.get("editingGrant")
+                except OrchestrateError as restored_error:
+                    restored_code = restored_error.code
+
+            self.assertEqual(
+                (
+                    rejected.code,
+                    observed.get("outcome") if observed is not None else None,
+                    attempts[0]["disposition"],
+                    restored_code,
+                    restored_grant,
+                ),
+                (
+                    "preflight_rejected",
+                    "rejected",
+                    "definitive",
+                    "preflight_already_rejected",
+                    None,
+                ),
+            )
+
+    def test_bound_query_source_directory_substitution_is_definitive(self) -> None:
+        self._assert_query_source_node_substitution_is_definitive("directory")
+
+    def test_bound_query_source_symlink_substitution_is_definitive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target"
+            link = Path(directory) / "link"
+            target.write_bytes(b"target")
+            try:
+                link.symlink_to(target.name)
+            except OSError as exc:
+                self.skipTest(f"file symlink unavailable: {exc}")
+            self.assertTrue(link.exists())
+        self._assert_query_source_node_substitution_is_definitive("symlink")
+
+    @unittest.skipIf(os.name == "nt", "requires a POSIX AF_UNIX pathname socket")
+    def test_bound_query_source_socket_substitution_is_definitive(self) -> None:
+        self._assert_query_source_node_substitution_is_definitive("socket")
+
+    @unittest.skipIf(os.name == "nt", "requires a POSIX FIFO")
+    def test_bound_query_source_fifo_substitution_is_definitive_without_blocking(self) -> None:
+        self._assert_query_source_node_substitution_is_definitive("fifo")
 
     @requires_native_windows_admission
     def test_exact_preflight_is_immutable_and_replay_is_not_a_fresh_grant(self) -> None:
