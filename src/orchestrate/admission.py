@@ -15,20 +15,22 @@ from .errors import OrchestrateError
 from .orca import JsonObject, OrcaClient, OrcaCommandError
 from .orca_compat import WorkerShowShapeError, worker_input_accepted_readback
 from .packets import (
-    PACKET_SCHEMA,
+    DecodedPacket,
     PREFLIGHT_SCHEMA,
-    canonical_packet_json,
-    expected_packet_id,
+    decode_packet,
     packet_spec_from_json,
 )
-from .profile import (
-    INSTRUCTION_NAMES,
-    PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE,
-    ProjectProfile,
-)
+from .profile import ProjectProfile
 from .readers import CE_QUERY_SCRIPT, ReaderResult, read_project
 from .safeio import approved_project_path, read_project_bytes
-from .sources import SourceIndex, build_source_index
+from .sources import (
+    PreparedSourceSet,
+    SourceAccess,
+    SourceIndex,
+    SourceReference,
+    build_source_index,
+    classify_source_reference,
+)
 from .state import RunRecord, StateStore, utc_now
 
 
@@ -39,6 +41,22 @@ class PacketValidation:
     sources: SourceIndex
     routing_digest: str
     packet_json_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionAttemptIdentity:
+    run_id: str
+    task_id: str
+    dispatch_id: str
+    packet_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPacketSources:
+    decoded: DecodedPacket
+    prepared: PreparedSourceSet
+    sources: SourceIndex
+    attempt: AdmissionAttemptIdentity | None
 
 
 def _digest(value: object) -> str:
@@ -71,99 +89,121 @@ def _operational_profile(profile: ProjectProfile) -> dict[str, Any]:
     }
 
 
-def _verify_packet_source_bytes(
+def _verify_reference_bytes(
     profile: ProjectProfile,
-    packet: Mapping[str, Any],
-) -> dict[str, dict[str, Any]]:
-    """Compare packet bytes without reading unacknowledged instruction sources.
+    reference: SourceReference,
+    raw_by_path: dict[str, bytes | None],
+) -> None:
+    record = reference.packet_record
+    if record is None:
+        raise OrchestrateError("Worker packet source identity is malformed", code="packet_identity_conflict")
+    candidate = approved_project_path(profile.root, reference.path, require_file=False)
+    if reference.access == SourceAccess.REFERENCE_ONLY:
+        if candidate.exists():
+            raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed")
+        raw_by_path[reference.path] = None
+        return
+    try:
+        raw = read_project_bytes(profile.root, reference.path)
+    except OrchestrateError as exc:
+        raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed") from exc
+    identity = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+    if identity != {"sha256": record.sha256, "bytes": record.byte_count}:
+        raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed")
+    raw_by_path[reference.path] = raw
 
-    Non-instruction sources and explicitly acknowledged selected instructions
-    are safe to verify before the bounded Git inventory. Every other
-    instruction-class source waits for that inventory to prove that Git still
-    exposes it as conventional authority.
-    """
 
-    records = packet.get("sources")
+def _prepare_packet_sources(
+    profile: ProjectProfile,
+    decoded: DecodedPacket,
+    *,
+    attempt: AdmissionAttemptIdentity | None = None,
+) -> PreparedPacketSources:
+    """Complete source eligibility, bytes, inventory, and index exactly once."""
+
+    packet = decoded.value
     if (
         packet.get("profileDigest") != profile.digest
         or packet.get("operationalProfile") != _operational_profile(profile)
-        or not isinstance(records, list)
+        or (
+            attempt is not None
+            and (
+                packet.get("packetId") != attempt.packet_id
+                or packet.get("native", {}).get("runId") != attempt.run_id
+            )
+        )
     ):
         raise OrchestrateError("Bound operational profile changed", code="source_binding_changed")
-    prepared: list[tuple[str, str | None, int]] = []
-    seen: set[str] = set()
-    for record in records:
-        if not isinstance(record, Mapping):
-            raise OrchestrateError("Worker packet source identity is malformed", code="packet_identity_conflict")
-        path = record.get("path")
-        expected_sha = record.get("sha256")
-        expected_bytes = record.get("bytes")
-        if (
-            not isinstance(path, str)
-            or not path
-            or path in seen
-            or (expected_sha is not None and not isinstance(expected_sha, str))
-            or type(expected_bytes) is not int
-            or expected_bytes < 0
-        ):
-            raise OrchestrateError("Worker packet source identity is malformed", code="packet_identity_conflict")
-        seen.add(path)
-        prepared.append((path, expected_sha, expected_bytes))
+    packet_reader = packet["reader"]
+    query_paths = {"package.json", CE_QUERY_SCRIPT, "docs/project-log/manifest.json"}
+    record_paths = {record.path for record in decoded.source_records}
+    if packet_reader.get("kind") == "ce-gd" and not query_paths.issubset(record_paths):
+        raise OrchestrateError("Worker packet omits the CE query source identity", code="packet_identity_conflict")
 
-    selected_instructions = set(profile.value["instructions"])
-    acknowledged_instructions = (
-        selected_instructions
-        if profile.selection_source == PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE
-        else set()
-    )
-    identities: dict[str, dict[str, Any]] = {}
+    routing = packet_reader["routing"]
+    reader_routed = {
+        *profile.value["instructions"],
+        *profile.value["taskEntrypoints"],
+        *profile.value["commandManifests"],
+    }
+    for field in ("authority", "tasks", "contextPackets"):
+        values = routing.get(field)
+        if isinstance(values, list):
+            reader_routed.update(item for item in values if isinstance(item, str))
+    for field in ("registry", "task", "logManifest"):
+        value = routing.get(field)
+        if isinstance(value, str):
+            reader_routed.add(value)
+    if packet_reader.get("kind") == "ce-gd":
+        reader_routed.add(CE_QUERY_SCRIPT)
 
-    def is_instruction_source(path: str) -> bool:
-        return path in selected_instructions or Path(path).name in INSTRUCTION_NAMES
-
-    def verify(prepared_source: tuple[str, str | None, int]) -> None:
-        path, expected_sha, expected_bytes = prepared_source
-        candidate = approved_project_path(profile.root, path, require_file=False)
-        if expected_sha is None:
-            if candidate.exists() or expected_bytes != 0:
-                raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed")
-            identity = {"sha256": None, "bytes": 0}
-        else:
-            try:
-                raw = read_project_bytes(profile.root, path)
-            except OrchestrateError as exc:
-                raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed") from exc
-            identity = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
-            if identity != {"sha256": expected_sha, "bytes": expected_bytes}:
-                raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed")
-        identities[path] = identity
-
-    for prepared_source in prepared:
-        path = prepared_source[0]
-        if not is_instruction_source(path) or path in acknowledged_instructions:
-            verify(prepared_source)
-
-    current_instructions = set(profile.require_instruction_acknowledgment())
-    unacknowledged_packet_instructions = sorted(
-        path
-        for path, _expected_sha, _expected_bytes in prepared
-        if (
-            is_instruction_source(path)
-            and path not in current_instructions
-            and path not in acknowledged_instructions
+    references = tuple(
+        classify_source_reference(
+            profile,
+            record.path,
+            packet_record=record,
+            reader_routed=record.path in reader_routed,
+            packet_bound=True,
         )
+        for record in decoded.source_records
     )
-    if unacknowledged_packet_instructions:
+    raw_by_path: dict[str, bytes | None] = {}
+    guarded: list[SourceReference] = []
+    for reference in references:
+        if reference.access == SourceAccess.INVENTORY_GUARDED_BYTES:
+            guarded.append(reference)
+        else:
+            _verify_reference_bytes(profile, reference, raw_by_path)
+
+    # Directly eligible bytes are checked first, preserving the pre-subprocess
+    # rejection guarantee for acknowledged selected sources. The one bounded
+    # inventory is then completed for the source-index wire identity and every
+    # inventory-guarded source.
+    current_instructions = tuple(profile.require_instruction_acknowledgment())
+    current_set = set(current_instructions)
+    unacknowledged: list[str] = []
+    for reference in guarded:
+        if reference.path not in current_set:
+            candidate = approved_project_path(profile.root, reference.path, require_file=False)
+            if candidate.exists():
+                unacknowledged.append(reference.path)
+                continue
+        _verify_reference_bytes(profile, reference, raw_by_path)
+    if unacknowledged:
         raise OrchestrateError(
             "Packet-bound instructions outside the current conventional inventory require explicit selection and acknowledgment; review .orchestrate.json and rerun 'orchestrate setup --acknowledge-profile'",
             code="instruction_acknowledgment_required",
-            data={"packetInstructionPaths": unacknowledged_packet_instructions},
+            data={"packetInstructionPaths": sorted(unacknowledged)},
         )
-    for prepared_source in prepared:
-        path = prepared_source[0]
-        if is_instruction_source(path) and path not in acknowledged_instructions:
-            verify(prepared_source)
-    return identities
+
+    prepared = PreparedSourceSet.create(references, current_instructions, raw_by_path)
+    sources = build_source_index(
+        profile,
+        extra_sources=set(record_paths),
+        prepared=prepared,
+    )
+    _verify_source_index(profile, packet, sources)
+    return PreparedPacketSources(decoded, prepared, sources, attempt)
 
 
 def _verify_source_index(
@@ -193,17 +233,14 @@ def validate_packet_sources(
     profile: ProjectProfile,
     run: RunRecord,
     packet_json: str,
+    *,
+    decoded: DecodedPacket | None = None,
+    prepared_stage: PreparedPacketSources | None = None,
 ) -> PacketValidation:
-    """Rebuild every bound source/routing interpretation and compare it to v3."""
+    """Consume the completed source stage and validate reader routing."""
 
-    try:
-        packet = json.loads(packet_json)
-    except json.JSONDecodeError as exc:
-        raise OrchestrateError("Stored worker packet is invalid JSON", code="packet_identity_conflict") from exc
-    if not isinstance(packet, dict) or packet.get("schema") != PACKET_SCHEMA:
-        raise OrchestrateError("A legacy packet cannot grant a new worker admission", code="preflight_packet_unsupported")
-    if canonical_packet_json(packet) != packet_json or packet.get("packetId") != expected_packet_id(packet):
-        raise OrchestrateError("Worker packet canonical identity is invalid", code="packet_identity_conflict")
+    decoded = decode_packet(packet_json) if decoded is None else decoded
+    packet = decoded.value
     admission = packet.get("admission")
     if not isinstance(admission, Mapping) or admission.get("schema") != PREFLIGHT_SCHEMA:
         raise OrchestrateError("Worker packet omits the mandatory preflight contract", code="preflight_packet_unsupported")
@@ -233,9 +270,7 @@ def validate_packet_sources(
             or not isinstance(milestone.get("contract"), Mapping)
         ):
             raise OrchestrateError("Milestone packet identity is malformed", code="packet_identity_conflict")
-    identities = _verify_packet_source_bytes(profile, packet)
-    pre_sources = build_source_index(profile, extra_sources=set(identities))
-    _verify_source_index(profile, packet, pre_sources)
+    stage = _prepare_packet_sources(profile, decoded) if prepared_stage is None else prepared_stage
     packet_reader = packet.get("reader")
     if (
         not isinstance(packet_reader, Mapping)
@@ -244,8 +279,8 @@ def validate_packet_sources(
         raise OrchestrateError("Worker packet reader identity is malformed", code="packet_identity_conflict")
     query_paths = {"package.json", CE_QUERY_SCRIPT, "docs/project-log/manifest.json"}
     expected_query_sources = (
-        {path: identities[path] for path in query_paths}
-        if packet_reader.get("kind") == "ce-gd" and query_paths.issubset(identities)
+        stage.prepared.identities(query_paths)
+        if packet_reader.get("kind") == "ce-gd" and query_paths.issubset(stage.prepared.paths)
         else None
     )
     if packet_reader.get("kind") == "ce-gd" and expected_query_sources is None:
@@ -254,9 +289,13 @@ def validate_packet_sources(
         profile,
         run.objective,
         expected_ce_query_sources=expected_query_sources,
+        prepared_sources=stage.prepared,
     )
-    sources = build_source_index(profile, extra_sources=set(reader.consulted_paths) | set(identities))
-    _verify_source_index(profile, packet, sources)
+    if not set(reader.consulted_paths).issubset(stage.prepared.paths):
+        raise OrchestrateError(
+            "Reader routing escaped the completed packet source stage",
+            code="packet_identity_conflict",
+        )
     actual_reader = {"kind": reader.kind, "routing": reader.routing}
     if (
         packet.get("reader") != actual_reader
@@ -265,7 +304,7 @@ def validate_packet_sources(
     return PacketValidation(
         packet,
         reader,
-        sources,
+        stage.sources,
         _digest(actual_reader),
         hashlib.sha256(packet_json.encode("utf-8")).hexdigest(),
     )
@@ -443,10 +482,9 @@ def worker_preflight(
     environment: Mapping[str, str] | None = None,
     platform: str | None = None,
 ) -> JsonObject:
-    profile = ProjectProfile._load_for_packet_source_preflight(root)
     env = os.environ if environment is None else environment
     selected_platform = sys.platform if platform is None else platform
-    with StateStore(profile.root) as store:
+    with StateStore(root) as store:
         run = store.get_run(run_id)
         # Controller ownership deliberately does not cover this fence: the first
         # worker preflight may run before worker-start returns to implement/resume.
@@ -461,6 +499,7 @@ def worker_preflight(
                 raise OrchestrateError("This Dispatch already has an immutable preflight observation; no fresh editing grant was issued", code=code)
             native: dict[str, Any] | None = None
             validation: PacketValidation | None = None
+            profile: ProjectProfile | None = None
             try:
                 milestone_task = store.connection.execute(
                     "SELECT task_key FROM milestone_task_bindings WHERE run_local_id = ? AND task_id = ?",
@@ -481,16 +520,19 @@ def worker_preflight(
                         data={"boundDispatchId": run.dispatch_id, "otherObservations": foreign},
                     )
                 packet_json = store.get_packet_json(run.local_id, task_id)
-                packet = store.get_packet(run.local_id, task_id)
-                if packet.get("packetId") != packet_id:
+                decoded = decode_packet(packet_json)
+                packet = decoded.value
+                attempt = AdmissionAttemptIdentity(run_id, task_id, dispatch_id, packet_id)
+                if packet.get("packetId") != attempt.packet_id:
                     raise OrchestrateError("Supplied packet ID does not match the immutable Task packet", code="packet_identity_conflict")
-                _verify_packet_source_bytes(profile, packet)
+                profile = ProjectProfile._load_for_packet_source_preflight(root)
+                prepared_stage = _prepare_packet_sources(profile, decoded, attempt=attempt)
                 native = _native_identity(
                     client,
                     profile=profile,
                     run=run,
-                    task_id=task_id,
-                    dispatch_id=dispatch_id,
+                    task_id=attempt.task_id,
+                    dispatch_id=attempt.dispatch_id,
                     packet_json=packet_json,
                     packet=packet,
                     environment=env,
@@ -526,7 +568,7 @@ def worker_preflight(
                         else None
                     )
                 if bound_identity is not None and bound_identity != (
-                    dispatch_id,
+                    attempt.dispatch_id,
                     native.get("terminalResourceId"),
                     native.get("terminalHandle"),
                     native.get("worktreeId"),
@@ -535,7 +577,13 @@ def worker_preflight(
                         "Worker preflight live resource identity conflicts with its immutable controller binding",
                         code="preflight_identity_conflict",
                     )
-                validation = validate_packet_sources(profile, run, packet_json)
+                validation = validate_packet_sources(
+                    profile,
+                    run,
+                    packet_json,
+                    decoded=decoded,
+                    prepared_stage=prepared_stage,
+                )
                 observation = {
                     "schema": PREFLIGHT_SCHEMA,
                     "outcome": "passed",

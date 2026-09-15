@@ -15,7 +15,7 @@ from typing import Any
 from .errors import OrchestrateError
 from .profile import ProjectProfile
 from .safeio import approved_project_path
-from .sources import read_project_text, read_source_text
+from .sources import PreparedSourceSet, read_project_text, read_source_text
 
 
 CE_TASK_ID = re.compile(r"\bCE-[0-9]{4}\b")
@@ -41,8 +41,27 @@ class ReaderResult:
     consulted_paths: frozenset[str]
 
 
-def _configured_text(profile: ProjectProfile, key: str) -> dict[str, str]:
-    return {relative: read_source_text(profile, relative) for relative in profile.value[key]}
+def _source_text(
+    profile: ProjectProfile,
+    relative: str,
+    prepared_sources: PreparedSourceSet | None,
+    *,
+    configured: bool = False,
+) -> str:
+    if prepared_sources is not None:
+        return prepared_sources.text(relative)
+    return read_source_text(profile, relative) if configured else read_project_text(profile, relative)
+
+
+def _configured_text(
+    profile: ProjectProfile,
+    key: str,
+    prepared_sources: PreparedSourceSet | None,
+) -> dict[str, str]:
+    return {
+        relative: _source_text(profile, relative, prepared_sources, configured=True)
+        for relative in profile.value[key]
+    }
 
 
 def _relative_target(profile: ProjectProfile, source: str, target: str) -> str | None:
@@ -189,6 +208,7 @@ def _run_ce_query(
     package_text: str,
     script_text: str,
     expected_source_identities: Mapping[str, Mapping[str, Any]] | None = None,
+    prepared_sources: PreparedSourceSet | None = None,
 ) -> dict[str, Any]:
     paths = list(CE_QUERY_SOURCES)
     captured = {
@@ -211,7 +231,12 @@ def _run_ce_query(
         raise OrchestrateError("The CE query source binding changed before execution", code="ce_query_source_changed")
     _require_tracked_query_sources(profile.root, paths)
     baseline = _git_source_state(profile.root, paths)
-    if _query_source_identities(profile) != expected:
+    current_before = (
+        prepared_sources.revalidate(profile.root, frozenset(paths))
+        if prepared_sources is not None
+        else _query_source_identities(profile) == expected
+    )
+    if not current_before:
         raise OrchestrateError("The CE query source binding changed before execution", code="ce_query_source_changed")
     arguments = (
         "pnpm",
@@ -246,7 +271,11 @@ def _run_ce_query(
         raise OrchestrateError("The CE project-log query did not return strict JSON", code="ce_query_invalid") from exc
     stable = {
         "gitState": _git_source_state(profile.root, paths) == baseline,
-        "sourceIdentities": _query_source_identities(profile) == expected,
+        "sourceIdentities": (
+            prepared_sources.revalidate(profile.root, frozenset(paths))
+            if prepared_sources is not None
+            else _query_source_identities(profile) == expected
+        ),
     }
     if not all(stable.values()):
         raise OrchestrateError(
@@ -299,6 +328,7 @@ def _read_ce(
     instructions: dict[str, str],
     manifests: dict[str, str],
     expected_query_sources: Mapping[str, Mapping[str, Any]] | None,
+    prepared_sources: PreparedSourceSet | None,
 ) -> ReaderResult:
     if objective is None:
         raise OrchestrateError("The CE reader requires an exact authorized CE task in the objective", code="ce_task_missing")
@@ -316,7 +346,7 @@ def _read_ce(
             "The CE reader requires the task registry and project-log manifest entrypoints",
             code="ce_entrypoints_missing",
         )
-    registry = read_source_text(profile, registry_path)
+    registry = _source_text(profile, registry_path, prepared_sources, configured=True)
     matching_lines = [line for line in registry.splitlines() if task_id in set(CE_TASK_ID.findall(line))]
     task_targets = sorted({target for line in matching_lines for target in _line_targets(profile, registry_path, line)})
     if len(task_targets) != 1:
@@ -325,7 +355,7 @@ def _read_ce(
             code="ce_task_unresolved",
         )
     task_path = task_targets[0]
-    task_text = read_project_text(profile, task_path)
+    task_text = _source_text(profile, task_path, prepared_sources)
     context_lines = [
         line for line in task_text.splitlines()
         if "context" in line.lower() and ("packet" in line.lower() or "must read" in line.lower())
@@ -336,9 +366,12 @@ def _read_ce(
             f"The CE task {task_id} has no resolvable required Context packet",
             code="ce_context_unresolved",
         )
-    context_documents = {path: read_project_text(profile, path) for path in context_targets}
+    context_documents = {
+        path: _source_text(profile, path, prepared_sources)
+        for path in context_targets
+    }
 
-    raw_manifest = read_source_text(profile, manifest_path)
+    raw_manifest = _source_text(profile, manifest_path, prepared_sources, configured=True)
     try:
         manifest_value = json.loads(raw_manifest)
     except json.JSONDecodeError as exc:
@@ -357,7 +390,7 @@ def _read_ce(
     scripts = package.get("scripts") if isinstance(package, dict) else None
     if not isinstance(scripts, dict) or scripts.get("project-log:query") != CE_QUERY_PACKAGE_SCRIPT:
         raise OrchestrateError("The CE project-log query command is not exactly bound", code="ce_query_authority_missing")
-    script_text = read_project_text(profile, CE_QUERY_SCRIPT)
+    script_text = _source_text(profile, CE_QUERY_SCRIPT, prepared_sources)
     query_result = _validate_ce_query(
         _run_ce_query(
             profile,
@@ -366,6 +399,7 @@ def _read_ce(
             package_text=package_text,
             script_text=script_text,
             expected_source_identities=expected_query_sources,
+            prepared_sources=prepared_sources,
         ),
         task_id,
         selected_shards,
@@ -410,23 +444,35 @@ def read_project(
     objective: str | None = None,
     *,
     expected_ce_query_sources: Mapping[str, Mapping[str, Any]] | None = None,
+    prepared_sources: PreparedSourceSet | None = None,
 ) -> ReaderResult:
-    current_instructions = profile.require_instruction_acknowledgment()
+    current_instructions = (
+        prepared_sources.instruction_inventory
+        if prepared_sources is not None
+        else profile.require_instruction_acknowledgment()
+    )
     instruction_paths = sorted({
         *profile.value["instructions"],
         *current_instructions,
     })
     instructions = {
-        relative: read_project_text(profile, relative)
+        relative: _source_text(profile, relative, prepared_sources)
         for relative in instruction_paths
     }
-    manifests = _configured_text(profile, "commandManifests")
+    manifests = _configured_text(profile, "commandManifests", prepared_sources)
     kind = profile.value["reader"]["kind"]
     if kind == "ce-gd":
-        return _read_ce(profile, objective, instructions, manifests, expected_ce_query_sources)
+        return _read_ce(
+            profile,
+            objective,
+            instructions,
+            manifests,
+            expected_ce_query_sources,
+            prepared_sources,
+        )
     if kind != "repo":
         raise OrchestrateError(f"Unsupported reader: {kind}", code="profile_reader_invalid")
-    tasks = _configured_text(profile, "taskEntrypoints")
+    tasks = _configured_text(profile, "taskEntrypoints", prepared_sources)
     consulted = frozenset({*instructions, *tasks, *manifests})
     return ReaderResult(
         "repo",

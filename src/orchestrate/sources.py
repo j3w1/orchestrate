@@ -2,20 +2,264 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
+from types import MappingProxyType
 from typing import Any
 
 from .errors import OrchestrateError
-from .profile import INSTRUCTION_NAMES, PROFILE_NAME, ProjectProfile
+from .profile import (
+    INSTRUCTION_NAMES,
+    PROFILE_NAME,
+    PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE,
+    ProjectProfile,
+)
 from .safeio import approved_project_path, is_sensitive_source, read_project_bytes
 
 
 SOURCE_INDEX_SCHEMA = "orchestrate-source-index/v1"
+SOURCE_RECORD_FIELDS = frozenset(
+    {
+        "path",
+        "state",
+        "sha256",
+        "bytes",
+        "headSha256",
+        "indexSha256",
+        "authority",
+    }
+)
+SOURCE_AUTHORITIES = frozenset({"consulted", "candidate-restrict-only", "unavailable"})
+SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+class SourceKind(str, Enum):
+    """Why a path belongs to the bounded source snapshot."""
+
+    PROFILE = "profile"
+    INSTRUCTION = "instruction"
+    TASK_ENTRYPOINT = "task-entrypoint"
+    COMMAND_MANIFEST = "command-manifest"
+    CANDIDATE = "candidate"
+    READER_ROUTED = "reader-routed"
+    PACKET_BOUND = "packet-bound"
+
+
+class SourceAccess(str, Enum):
+    """Whether a reference may be consumed, and which proof must precede it."""
+
+    REFERENCE_ONLY = "reference-only"
+    DIRECT_BYTES = "direct-bytes"
+    INVENTORY_GUARDED_BYTES = "inventory-guarded-bytes"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRecord:
+    """Strict in-memory decoding of the unchanged source-index/v1 wire record."""
+
+    path: str
+    state: str
+    sha256: str | None
+    byte_count: int
+    head_sha256: str | None
+    index_sha256: str | None
+    authority: str
+
+    @classmethod
+    def from_wire(cls, value: object) -> "SourceRecord":
+        if not isinstance(value, Mapping) or set(value) != SOURCE_RECORD_FIELDS:
+            raise OrchestrateError(
+                "Worker packet source identity is malformed",
+                code="packet_identity_conflict",
+            )
+        path = value.get("path")
+        state = value.get("state")
+        sha256 = value.get("sha256")
+        byte_count = value.get("bytes")
+        head_sha256 = value.get("headSha256")
+        index_sha256 = value.get("indexSha256")
+        authority = value.get("authority")
+        hash_values = (sha256, head_sha256, index_sha256)
+        if (
+            not isinstance(path, str)
+            or not path
+            or "\\" in path
+            or Path(path).is_absolute()
+            or path != Path(path).as_posix()
+            or any(part in {"", ".", ".."} for part in Path(path).parts)
+            or not isinstance(state, str)
+            or not state
+            or any(
+                item is not None
+                and (not isinstance(item, str) or SHA256.fullmatch(item) is None)
+                for item in hash_values
+            )
+            or type(byte_count) is not int
+            or byte_count < 0
+            or authority not in SOURCE_AUTHORITIES
+            or (sha256 is None and byte_count != 0)
+            or (sha256 is None and authority != "unavailable")
+            or (sha256 is not None and authority == "unavailable")
+        ):
+            raise OrchestrateError(
+                "Worker packet source identity is malformed",
+                code="packet_identity_conflict",
+            )
+        return cls(
+            path,
+            state,
+            sha256,
+            byte_count,
+            head_sha256,
+            index_sha256,
+            authority,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "state": self.state,
+            "sha256": self.sha256,
+            "bytes": self.byte_count,
+            "headSha256": self.head_sha256,
+            "indexSha256": self.index_sha256,
+            "authority": self.authority,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SourceReference:
+    """One path's membership and byte-read eligibility, derived once."""
+
+    path: str
+    kinds: frozenset[SourceKind]
+    access: SourceAccess
+    packet_record: SourceRecord | None
+
+    @property
+    def instruction_class(self) -> bool:
+        return SourceKind.INSTRUCTION in self.kinds
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSourceSet:
+    """Completed packet-source stage consumed by indexing and the reader."""
+
+    references: tuple[SourceReference, ...]
+    instruction_inventory: tuple[str, ...]
+    raw_by_path: Mapping[str, bytes | None]
+
+    @classmethod
+    def create(
+        cls,
+        references: tuple[SourceReference, ...],
+        instruction_inventory: tuple[str, ...],
+        raw_by_path: Mapping[str, bytes | None],
+    ) -> "PreparedSourceSet":
+        return cls(references, instruction_inventory, MappingProxyType(dict(raw_by_path)))
+
+    @property
+    def paths(self) -> frozenset[str]:
+        return frozenset(reference.path for reference in self.references)
+
+    def text(self, path: str) -> str:
+        if path not in self.raw_by_path:
+            raise OrchestrateError(
+                f"Reader requested a source outside the completed packet stage: {path}",
+                code="packet_identity_conflict",
+            )
+        raw = self.raw_by_path[path]
+        if raw is None:
+            raise OrchestrateError(f"Required source is unavailable: {path}", code="source_unavailable")
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise OrchestrateError(f"Configured source is not UTF-8: {path}", code="source_encoding") from exc
+
+    def identities(self, paths: set[str] | frozenset[str]) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for path in sorted(paths):
+            if path not in self.raw_by_path:
+                raise OrchestrateError(
+                    f"Source identity was not completed before its consumer: {path}",
+                    code="packet_identity_conflict",
+                )
+            raw = self.raw_by_path[path]
+            result[path] = {
+                "sha256": _sha256(raw) if raw is not None else None,
+                "bytes": len(raw) if raw is not None else 0,
+            }
+        return result
+
+    def revalidate(self, root: Path, paths: set[str] | frozenset[str]) -> bool:
+        """Check current bytes against completed identities without reclassification."""
+
+        for path, expected in self.identities(paths).items():
+            try:
+                raw = read_project_bytes(root, path)
+            except OrchestrateError:
+                return False
+            if {"sha256": _sha256(raw), "bytes": len(raw)} != expected:
+                return False
+        return True
+
+
+def decode_source_records(value: object) -> tuple[SourceRecord, ...]:
+    if not isinstance(value, list):
+        raise OrchestrateError("Worker packet source identity is malformed", code="packet_identity_conflict")
+    records = tuple(SourceRecord.from_wire(item) for item in value)
+    paths = [record.path for record in records]
+    if len(paths) != len(set(paths)):
+        raise OrchestrateError("Worker packet source identity is malformed", code="packet_identity_conflict")
+    return records
+
+
+def classify_source_reference(
+    profile: ProjectProfile,
+    path: str,
+    *,
+    packet_record: SourceRecord | None = None,
+    reader_routed: bool = False,
+    packet_bound: bool = False,
+) -> SourceReference:
+    """Derive source membership and read permission in one shared model."""
+
+    kinds: set[SourceKind] = set()
+    if path == PROFILE_NAME:
+        kinds.add(SourceKind.PROFILE)
+    if path in profile.value["instructions"] or Path(path).name in INSTRUCTION_NAMES:
+        kinds.add(SourceKind.INSTRUCTION)
+    if path in profile.value["taskEntrypoints"]:
+        kinds.add(SourceKind.TASK_ENTRYPOINT)
+    if path in profile.value["commandManifests"]:
+        kinds.add(SourceKind.COMMAND_MANIFEST)
+    if path in profile.value.get("candidateSources", []):
+        kinds.add(SourceKind.CANDIDATE)
+    if reader_routed:
+        kinds.add(SourceKind.READER_ROUTED)
+    if packet_bound:
+        kinds.add(SourceKind.PACKET_BOUND)
+    if packet_record is not None and packet_record.sha256 is None:
+        access = SourceAccess.REFERENCE_ONLY
+    elif SourceKind.INSTRUCTION not in kinds:
+        access = SourceAccess.DIRECT_BYTES
+    elif (
+        path in profile.value["instructions"]
+        and profile.selection_source == PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE
+    ):
+        access = SourceAccess.DIRECT_BYTES
+    else:
+        access = SourceAccess.INVENTORY_GUARDED_BYTES
+    return SourceReference(path, frozenset(kinds), access, packet_record)
+
+
 def _git(root: Path, *arguments: str, allow_failure: bool = False) -> str:
     completed = subprocess.run(("git", "-C", os.fspath(root), *arguments), capture_output=True, check=False)
     if completed.returncode and not allow_failure:
@@ -95,7 +339,12 @@ def _index_bytes(root: Path, relative: str) -> bytes | None:
     return completed.stdout if completed.returncode == 0 else None
 
 
-def build_source_index(profile: ProjectProfile, *, extra_sources: set[str] | None = None) -> SourceIndex:
+def build_source_index(
+    profile: ProjectProfile,
+    *,
+    extra_sources: set[str] | None = None,
+    prepared: PreparedSourceSet | None = None,
+) -> SourceIndex:
     root = profile.root
     for relative in profile.value["instructions"]:
         if is_sensitive_source(relative):
@@ -103,7 +352,11 @@ def build_source_index(profile: ProjectProfile, *, extra_sources: set[str] | Non
                 f"Secret-bearing source is excluded: {relative}",
                 code="secret_source_excluded",
             )
-    instructions = set(profile.require_instruction_acknowledgment())
+    instructions = set(
+        prepared.instruction_inventory
+        if prepared is not None
+        else profile.require_instruction_acknowledgment()
+    )
     status = _status_map(root)
     configured = {
         *profile.value["instructions"],
@@ -113,6 +366,16 @@ def build_source_index(profile: ProjectProfile, *, extra_sources: set[str] | Non
         PROFILE_NAME,
         *(extra_sources or set()),
         *profile.value.get("candidateSources", []),
+    }
+    prepared_references = {
+        reference.path: reference
+        for reference in (prepared.references if prepared is not None else ())
+    }
+    references = {
+        relative: prepared_references.get(relative) or classify_source_reference(
+            profile, relative, reader_routed=relative in (extra_sources or set())
+        )
+        for relative in configured
     }
     records: list[dict[str, Any]] = []
     for relative in sorted(configured):
@@ -134,12 +397,16 @@ def build_source_index(profile: ProjectProfile, *, extra_sources: set[str] | Non
                 }
             )
             continue
-        _, raw = _assert_readable_source(root, relative)
+        if prepared is not None and relative in prepared.raw_by_path:
+            raw = prepared.raw_by_path[relative]
+            if raw is None:
+                _, raw = _assert_readable_source(root, relative)
+        else:
+            _, raw = _assert_readable_source(root, relative)
         head = _head_blob(root, relative)
         changed_authority = relative == PROFILE_NAME and head != raw
         changed_instruction = (
-            relative in profile.value["instructions"]
-            or Path(relative).name in INSTRUCTION_NAMES
+            references[relative].instruction_class
         ) and (head is None or head != raw)
         records.append(
             {

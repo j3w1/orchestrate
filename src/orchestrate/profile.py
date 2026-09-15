@@ -429,13 +429,14 @@ class ProjectProfile:
 
     @classmethod
     def _load_for_packet_source_preflight(cls, root: Path) -> "ProjectProfile":
-        """Load source metadata for the pre-subprocess check without reading instructions.
+        """Load profile references without requiring referenced sources to exist.
 
-        The caller must require instruction acknowledgment before it reads any
-        selected instruction bytes.
+        The caller has already decoded the canonical packet and must establish
+        source eligibility inside the attempt fence before consuming any
+        selected source bytes.
         """
 
-        return cls._load_selected(root, require_sources=True)
+        return cls._load_selected(root, require_sources=False)
 
     @classmethod
     def _load_selected(

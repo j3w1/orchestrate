@@ -11,11 +11,17 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from orchestrate.admission import joined_preflight_status, other_dispatch_observations, worker_preflight
+from orchestrate.admission import (
+    joined_preflight_status,
+    other_dispatch_observations,
+    validate_packet_sources,
+    worker_preflight,
+)
 from orchestrate.errors import OrchestrateError
-from orchestrate.packets import canonical_packet_json, make_packet, packet_spec
+from orchestrate.packets import canonical_packet_json, expected_packet_id, make_packet, packet_spec
 from orchestrate.profile import INSTRUCTION_PATHSPECS, setup_project
 from orchestrate.readers import read_project
+from orchestrate.safeio import read_project_bytes
 from orchestrate.sources import build_source_index
 from orchestrate.state import AdmissionEffectFence, StateStore
 
@@ -519,6 +525,109 @@ class AdmissionTests(unittest.TestCase):
         with StateStore(self.root) as store:
             observed = store.get_preflight(self.local_id, "task_1", "dispatch_1")
         self.assertEqual(observed["outcome"], "rejected")  # type: ignore[index]
+
+    def test_missing_selected_source_is_rejected_durably_before_native_readback(self) -> None:
+        source = self.root / "AGENTS.md"
+        original = source.read_bytes()
+        source.unlink()
+        client = PreflightClient(self.root, self.packet)
+
+        with self.assertRaises(OrchestrateError) as rejected:
+            self._run(client)
+
+        self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(rejected.exception.data["cause"], "source_binding_changed")  # type: ignore[index]
+        self.assertEqual(client.calls, [])
+        with StateStore(self.root) as store:
+            observed = store.get_preflight(self.local_id, "task_1", "dispatch_1")
+        self.assertEqual(observed["outcome"], "rejected")  # type: ignore[index]
+        self.assertEqual(observed["mismatches"][0]["code"], "source_binding_changed")  # type: ignore[index]
+
+        source.write_bytes(original)
+        restored_client = PreflightClient(self.root, self.packet)
+        with self.assertRaises(OrchestrateError) as restored:
+            self._run(restored_client)
+        self.assertEqual(restored.exception.code, "preflight_already_rejected")
+        self.assertEqual(restored_client.calls, [])
+
+    def test_strict_packet_decode_requires_every_source_record_field(self) -> None:
+        from orchestrate.packets import decode_packet
+
+        mandatory_fields = {
+            "path", "state", "sha256", "bytes", "headSha256", "indexSha256", "authority",
+        }
+        for field in sorted(mandatory_fields):
+            with self.subTest(field=field):
+                malformed = json.loads(json.dumps(self.packet))
+                malformed["sources"][0].pop(field)
+                malformed["packetId"] = expected_packet_id(malformed)
+                with self.assertRaises(OrchestrateError) as rejected:
+                    decode_packet(canonical_packet_json(malformed))
+                self.assertEqual(rejected.exception.code, "packet_identity_conflict")
+
+    def test_reader_and_index_consume_the_single_completed_source_stage(self) -> None:
+        with StateStore(self.root) as store:
+            run = store.get_run(self.local_id)
+            packet_json = store.get_packet_json(self.local_id, "task_1")
+
+        with (
+            patch("orchestrate.admission.read_project_bytes", wraps=read_project_bytes) as source_reads,
+            patch("orchestrate.sources.read_project_bytes", side_effect=AssertionError("source index reopened bytes")),
+            patch("orchestrate.readers.read_project_text", side_effect=AssertionError("reader reopened bytes")),
+            patch("orchestrate.admission.build_source_index", wraps=build_source_index) as index_builds,
+        ):
+            validation = validate_packet_sources(self.profile, run, packet_json)
+
+        expected_paths = {
+            record["path"]
+            for record in self.packet["sources"]
+            if record["sha256"] is not None
+        }
+        observed_paths = [call.args[1] for call in source_reads.call_args_list]
+        self.assertCountEqual(observed_paths, expected_paths)
+        self.assertEqual(len(observed_paths), len(expected_paths))
+        self.assertEqual(index_builds.call_count, 1)
+        self.assertEqual(validation.sources.digest, self.packet["sourceDigest"])
+
+    def test_malformed_source_record_is_durably_rejected_before_profile_or_source_io(self) -> None:
+        malformed = json.loads(json.dumps(self.packet))
+        malformed["sources"][0].pop("authority")
+        malformed["packetId"] = expected_packet_id(malformed)
+        malformed_json = canonical_packet_json(malformed)
+        with StateStore(self.root) as store:
+            store.connection.execute(
+                "UPDATE packets SET packet_json = ? WHERE run_local_id = ? AND task_id = ?",
+                (malformed_json, self.local_id, "task_1"),
+            )
+        client = PreflightClient(self.root, malformed)
+
+        with (
+            patch("orchestrate.profile.read_project_bytes", side_effect=AssertionError("profile source read")) as profile_read,
+            patch("orchestrate.admission.read_project_bytes", side_effect=AssertionError("project source read")) as source_read,
+            patch("subprocess.run", side_effect=AssertionError("subprocess")) as subprocess_call,
+            self.assertRaises(OrchestrateError) as rejected,
+        ):
+            worker_preflight(
+                self.root,
+                run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                packet_id=str(malformed["packetId"]),
+                client=client,
+                environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                platform="win32",
+            )
+
+        self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(rejected.exception.data["cause"], "packet_identity_conflict")  # type: ignore[index]
+        profile_read.assert_not_called()
+        source_read.assert_not_called()
+        subprocess_call.assert_not_called()
+        self.assertEqual(client.calls, [])
+        with StateStore(self.root) as store:
+            observed = store.get_preflight(self.local_id, "task_1", "dispatch_1")
+        self.assertEqual(observed["outcome"], "rejected")  # type: ignore[index]
+        self.assertEqual(observed["mismatches"][0]["code"], "packet_identity_conflict")  # type: ignore[index]
 
     def test_acknowledged_selected_instruction_drift_rejects_before_any_subprocess(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
