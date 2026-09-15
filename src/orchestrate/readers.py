@@ -13,7 +13,7 @@ import subprocess
 from typing import Any
 
 from .errors import OrchestrateError
-from .profile import ProjectProfile
+from .profile import MAX_GIT_PATH_BYTES, ProjectProfile
 from .safeio import approved_project_path
 from .sources import PreparedSourceSet, read_project_text, read_source_text
 
@@ -169,25 +169,37 @@ def _manifest_shards(value: object, task_id: str, root: Path) -> list[dict[str, 
 
 
 def _git_source_state(root: Path, paths: list[str]) -> bytes:
-    completed = subprocess.run(
-        ("git", "-C", os.fspath(root), "status", "--porcelain=v1", "-z", "--", *paths),
-        capture_output=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            ("git", "-C", os.fspath(root), "status", "--porcelain=v1", "-z", "--", *paths),
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OrchestrateError("CE query source binding could not be inspected", code="ce_query_source_unavailable") from exc
     if completed.returncode:
         raise OrchestrateError("CE query source binding could not be inspected", code="ce_query_source_unavailable")
+    if len(completed.stdout) > MAX_GIT_PATH_BYTES:
+        raise OrchestrateError("CE query source inspection exceeded its output boundary", code="ce_query_source_unavailable")
     return completed.stdout
 
 
 def _require_tracked_query_sources(root: Path, paths: list[str]) -> None:
     for path in paths:
-        tracked = subprocess.run(
-            ("git", "-C", os.fspath(root), "ls-files", "--error-unmatch", "--", path),
-            capture_output=True,
-            check=False,
-        )
+        try:
+            tracked = subprocess.run(
+                ("git", "-C", os.fspath(root), "ls-files", "--error-unmatch", "--", path),
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise OrchestrateError("The CE query implementation cannot be inspected", code="ce_query_source_unavailable") from exc
         if tracked.returncode:
             raise OrchestrateError("The CE query implementation is not a tracked source", code="ce_query_source_unavailable")
+        if len(tracked.stdout) > MAX_GIT_PATH_BYTES:
+            raise OrchestrateError("CE query source inspection exceeded its output boundary", code="ce_query_source_unavailable")
     if _git_source_state(root, paths):
         raise OrchestrateError("The CE query implementation or manifest is mutable", code="ce_query_source_changed")
 
@@ -322,14 +334,13 @@ def _validate_ce_query(result: object, task_id: str, shards: list[dict[str, Any]
     return result
 
 
-def _read_ce(
+def resolve_ce_task_source(
     profile: ProjectProfile,
     objective: str | None,
-    instructions: dict[str, str],
-    manifests: dict[str, str],
-    expected_query_sources: Mapping[str, Mapping[str, Any]] | None,
-    prepared_sources: PreparedSourceSet | None,
-) -> ReaderResult:
+    registry: str,
+) -> tuple[str, str]:
+    """Resolve the one CE task path from the configured registry text."""
+
     if objective is None:
         raise OrchestrateError("The CE reader requires an exact authorized CE task in the objective", code="ce_task_missing")
     task_ids = sorted(set(CE_TASK_ID.findall(objective)))
@@ -339,14 +350,6 @@ def _read_ce(
         raise OrchestrateError("The CE objective must name exactly one CE task", code="ce_task_ambiguous")
     task_id = task_ids[0]
     registry_path = "docs/tasks/README.md"
-    manifest_path = "docs/project-log/manifest.json"
-    configured = set(profile.value["taskEntrypoints"])
-    if not {registry_path, manifest_path}.issubset(configured):
-        raise OrchestrateError(
-            "The CE reader requires the task registry and project-log manifest entrypoints",
-            code="ce_entrypoints_missing",
-        )
-    registry = _source_text(profile, registry_path, prepared_sources, configured=True)
     matching_lines = [line for line in registry.splitlines() if task_id in set(CE_TASK_ID.findall(line))]
     task_targets = sorted({target for line in matching_lines for target in _line_targets(profile, registry_path, line)})
     if len(task_targets) != 1:
@@ -354,8 +357,17 @@ def _read_ce(
             f"The CE registry did not resolve exactly one source for {task_id}",
             code="ce_task_unresolved",
         )
-    task_path = task_targets[0]
-    task_text = _source_text(profile, task_path, prepared_sources)
+    return task_id, task_targets[0]
+
+
+def resolve_ce_context_sources(
+    profile: ProjectProfile,
+    task_id: str,
+    task_path: str,
+    task_text: str,
+) -> list[str]:
+    """Resolve required context paths from the already-authorized task text."""
+
     context_lines = [
         line for line in task_text.splitlines()
         if "context" in line.lower() and ("packet" in line.lower() or "must read" in line.lower())
@@ -366,6 +378,29 @@ def _read_ce(
             f"The CE task {task_id} has no resolvable required Context packet",
             code="ce_context_unresolved",
         )
+    return context_targets
+
+
+def _read_ce(
+    profile: ProjectProfile,
+    objective: str | None,
+    instructions: dict[str, str],
+    manifests: dict[str, str],
+    expected_query_sources: Mapping[str, Mapping[str, Any]] | None,
+    prepared_sources: PreparedSourceSet | None,
+) -> ReaderResult:
+    registry_path = "docs/tasks/README.md"
+    manifest_path = "docs/project-log/manifest.json"
+    configured = set(profile.value["taskEntrypoints"])
+    if not {registry_path, manifest_path}.issubset(configured):
+        raise OrchestrateError(
+            "The CE reader requires the task registry and project-log manifest entrypoints",
+            code="ce_entrypoints_missing",
+        )
+    registry = _source_text(profile, registry_path, prepared_sources, configured=True)
+    task_id, task_path = resolve_ce_task_source(profile, objective, registry)
+    task_text = _source_text(profile, task_path, prepared_sources)
+    context_targets = resolve_ce_context_sources(profile, task_id, task_path, task_text)
     context_documents = {
         path: _source_text(profile, path, prepared_sources)
         for path in context_targets

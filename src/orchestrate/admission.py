@@ -20,8 +20,14 @@ from .packets import (
     decode_packet,
     packet_spec_from_json,
 )
-from .profile import ProjectProfile
-from .readers import CE_QUERY_SCRIPT, ReaderResult, read_project
+from .profile import PROFILE_NAME, ProjectProfile
+from .readers import (
+    CE_QUERY_SCRIPT,
+    ReaderResult,
+    read_project,
+    resolve_ce_context_sources,
+    resolve_ce_task_source,
+)
 from .safeio import approved_project_path, is_sensitive_source, read_project_bytes
 from .sources import (
     PreparedSourceSet,
@@ -58,6 +64,17 @@ class PreparedPacketSources:
     prepared: PreparedSourceSet
     sources: SourceIndex
     attempt: AdmissionAttemptIdentity | None
+
+
+_RETRYABLE_PREFLIGHT_CODES = frozenset(
+    {
+        "ce_query_source_unavailable",
+        "ce_query_unavailable",
+        "git_inspection_failed",
+        "orca_command_failed",
+        "source_temporarily_unavailable",
+    }
+)
 
 
 def _digest(value: object) -> str:
@@ -107,6 +124,11 @@ def _verify_reference_bytes(
     try:
         raw = read_project_bytes(profile.root, reference.path)
     except OrchestrateError as exc:
+        if exc.code == "source_unavailable" and candidate.is_file():
+            raise OrchestrateError(
+                "Bound project source is temporarily unavailable",
+                code="source_temporarily_unavailable",
+            ) from exc
         raise OrchestrateError("Bound project source bytes changed", code="source_binding_changed") from exc
     identity = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
     if identity != {"sha256": record.sha256, "bytes": record.byte_count}:
@@ -119,6 +141,7 @@ def _prepare_packet_sources(
     decoded: DecodedPacket,
     *,
     attempt: AdmissionAttemptIdentity | None = None,
+    milestone_sources: set[str] | None = None,
 ) -> PreparedPacketSources:
     """Complete source eligibility, bytes, inventory, and index exactly once."""
 
@@ -136,55 +159,89 @@ def _prepare_packet_sources(
     ):
         raise OrchestrateError("Bound operational profile changed", code="source_binding_changed")
     packet_reader = packet["reader"]
+    if packet_reader.get("kind") != profile.value["reader"]["kind"]:
+        raise OrchestrateError("Worker packet reader identity is malformed", code="packet_identity_conflict")
     query_paths = {"package.json", CE_QUERY_SCRIPT, "docs/project-log/manifest.json"}
     record_paths = {record.path for record in decoded.source_records}
     if packet_reader.get("kind") == "ce-gd" and not query_paths.issubset(record_paths):
         raise OrchestrateError("Worker packet omits the CE query source identity", code="packet_identity_conflict")
 
     routing = packet_reader["routing"]
-    reader_routed = {
-        *profile.value["instructions"],
-        *profile.value["taskEntrypoints"],
-        *profile.value["commandManifests"],
-    }
-    for field in ("authority", "tasks", "contextPackets"):
-        values = routing.get(field)
-        if isinstance(values, list):
-            reader_routed.update(item for item in values if isinstance(item, str))
-    for field in ("registry", "task", "logManifest"):
-        value = routing.get(field)
-        if isinstance(value, str):
-            reader_routed.add(value)
-    if packet_reader.get("kind") == "ce-gd":
+    reader_routed: set[str] = set()
+    if packet_reader.get("kind") == "repo":
+        if (
+            set(routing) != {"authority", "tasks"}
+            or not all(
+                isinstance(routing.get(field), list)
+                and all(isinstance(item, str) for item in routing[field])
+                for field in ("authority", "tasks")
+            )
+        ):
+            raise OrchestrateError("Worker packet reader routing is malformed", code="packet_identity_conflict")
+        # Repo-reader routes must already belong through profile or instruction
+        # membership. Packet routing alone never grants byte-read eligibility.
+    else:
+        if (
+            set(routing)
+            != {
+                "taskId",
+                "registry",
+                "task",
+                "contextPackets",
+                "logManifest",
+                "logs",
+                "logShards",
+                "projectLogQuery",
+            }
+            or routing.get("registry") != "docs/tasks/README.md"
+            or routing.get("logManifest") != "docs/project-log/manifest.json"
+            or routing.get("registry") not in profile.value["taskEntrypoints"]
+            or routing.get("logManifest") not in profile.value["taskEntrypoints"]
+            or not isinstance(routing.get("task"), str)
+            or not isinstance(routing.get("contextPackets"), list)
+            or not all(isinstance(item, str) for item in routing["contextPackets"])
+        ):
+            raise OrchestrateError("Worker packet reader routing is malformed", code="packet_identity_conflict")
+        # The fixed query script belongs to the selected CE reader. Dynamic task
+        # and context membership is derived below from configured source text,
+        # never from the packet's claimed routing.
         reader_routed.add(CE_QUERY_SCRIPT)
 
-    references = tuple(
-        classify_source_reference(
+    references_by_path = {
+        record.path: classify_source_reference(
             profile,
             record.path,
             packet_record=record,
             reader_routed=record.path in reader_routed,
+            milestone_plan=record.path in (milestone_sources or set()),
             packet_bound=True,
         )
         for record in decoded.source_records
-    )
-    for reference in references:
+    }
+    deferred: dict[str, SourceReference] = {}
+    for reference in references_by_path.values():
         memberships = reference.kinds - {SourceKind.PACKET_BOUND}
-        if (
-            not memberships
-            or is_sensitive_source(reference.path)
-            or (
-                reference.access == SourceAccess.REFERENCE_ONLY
-                and SourceKind.CANDIDATE not in memberships
-            )
+        if is_sensitive_source(reference.path) or (
+            reference.access == SourceAccess.REFERENCE_ONLY
+            and SourceKind.CANDIDATE not in memberships
         ):
+            raise OrchestrateError(
+                "Worker packet source eligibility is malformed",
+                code="packet_identity_conflict",
+            )
+        if not memberships:
+            if packet_reader.get("kind") == "ce-gd":
+                deferred[reference.path] = reference
+                continue
             raise OrchestrateError(
                 "Worker packet source eligibility is malformed",
                 code="packet_identity_conflict",
             )
     raw_by_path: dict[str, bytes | None] = {}
     guarded: list[SourceReference] = []
-    for reference in references:
+    for reference in references_by_path.values():
+        if reference.path in deferred:
+            continue
         if reference.access == SourceAccess.INVENTORY_GUARDED_BYTES:
             guarded.append(reference)
         else:
@@ -211,10 +268,76 @@ def _prepare_packet_sources(
             data={"packetInstructionPaths": sorted(unacknowledged)},
         )
 
+    if packet_reader.get("kind") == "ce-gd":
+        def source_text(path: str) -> str:
+            raw = raw_by_path.get(path)
+            if raw is None:
+                raise OrchestrateError(
+                    f"Worker packet omits an authority-derived reader source: {path}",
+                    code="packet_identity_conflict",
+                )
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise OrchestrateError(
+                    f"Configured source is not UTF-8: {path}",
+                    code="source_encoding",
+                ) from exc
+
+        def authorize_reader_path(path: str) -> str:
+            reference = references_by_path.get(path)
+            if reference is None:
+                raise OrchestrateError(
+                    f"Worker packet omits an authority-derived reader source: {path}",
+                    code="packet_identity_conflict",
+                )
+            if path in deferred:
+                reference = classify_source_reference(
+                    profile,
+                    path,
+                    packet_record=reference.packet_record,
+                    reader_routed=True,
+                    packet_bound=True,
+                )
+                references_by_path[path] = reference
+                _verify_reference_bytes(profile, reference, raw_by_path)
+                deferred.pop(path)
+            return source_text(path)
+
+        registry_path = "docs/tasks/README.md"
+        task_id, task_path = resolve_ce_task_source(
+            profile,
+            packet.get("objective"),
+            source_text(registry_path),
+        )
+        if routing.get("taskId") != task_id or routing.get("task") != task_path:
+            raise OrchestrateError(
+                "Worker packet reader routing conflicts with the configured task registry",
+                code="source_binding_changed",
+            )
+        task_text = authorize_reader_path(task_path)
+        context_paths = resolve_ce_context_sources(profile, task_id, task_path, task_text)
+        if routing.get("contextPackets") != context_paths:
+            raise OrchestrateError(
+                "Worker packet reader routing conflicts with the bound task source",
+                code="source_binding_changed",
+            )
+        for context_path in context_paths:
+            authorize_reader_path(context_path)
+        if deferred:
+            raise OrchestrateError(
+                "Worker packet source eligibility is malformed",
+                code="packet_identity_conflict",
+                data={"unboundPacketSources": sorted(deferred)},
+            )
+
+    references = tuple(references_by_path[record.path] for record in decoded.source_records)
+
     prepared = PreparedSourceSet.create(references, current_instructions, raw_by_path)
     sources = build_source_index(
         profile,
         extra_sources=set(record_paths),
+        milestone_sources=milestone_sources,
         prepared=prepared,
     )
     _verify_source_index(profile, packet, sources)
@@ -251,6 +374,7 @@ def validate_packet_sources(
     *,
     decoded: DecodedPacket | None = None,
     prepared_stage: PreparedPacketSources | None = None,
+    milestone_sources: set[str] | None = None,
 ) -> PacketValidation:
     """Consume the completed source stage and validate reader routing."""
 
@@ -285,7 +409,11 @@ def validate_packet_sources(
             or not isinstance(milestone.get("contract"), Mapping)
         ):
             raise OrchestrateError("Milestone packet identity is malformed", code="packet_identity_conflict")
-    stage = _prepare_packet_sources(profile, decoded) if prepared_stage is None else prepared_stage
+    stage = (
+        _prepare_packet_sources(profile, decoded, milestone_sources=milestone_sources)
+        if prepared_stage is None
+        else prepared_stage
+    )
     packet_reader = packet.get("reader")
     if (
         not isinstance(packet_reader, Mapping)
@@ -486,6 +614,26 @@ def _native_identity(
     }
 
 
+def _retryable_preflight_failure(root: Path, exc: Exception) -> bool:
+    if isinstance(exc, OrcaCommandError):
+        return True
+    if isinstance(exc, OSError):
+        return True
+    if isinstance(exc, OrchestrateError):
+        if exc.code in _RETRYABLE_PREFLIGHT_CODES:
+            return True
+        # A no-follow profile read can fail because another Windows process
+        # briefly owns an incompatible handle. A genuinely missing profile is
+        # classified earlier as profile_missing and remains definitive.
+        if exc.code == "source_unavailable" and (root / PROFILE_NAME).is_file():
+            return True
+    return False
+
+
+def _bounded_exception_message(exc: Exception) -> str:
+    return str(exc)[:8192]
+
+
 def worker_preflight(
     root: Path,
     *,
@@ -541,7 +689,21 @@ def worker_preflight(
                 if packet.get("packetId") != attempt.packet_id:
                     raise OrchestrateError("Supplied packet ID does not match the immutable Task packet", code="packet_identity_conflict")
                 profile = ProjectProfile._load_for_packet_source_preflight(root)
-                prepared_stage = _prepare_packet_sources(profile, decoded, attempt=attempt)
+                milestone_plan = store.connection.execute(
+                    "SELECT relative_path FROM milestone_plan_bindings WHERE run_local_id = ?",
+                    (run.local_id,),
+                ).fetchone()
+                milestone_sources = (
+                    {str(milestone_plan["relative_path"])}
+                    if milestone_plan is not None
+                    else set()
+                )
+                prepared_stage = _prepare_packet_sources(
+                    profile,
+                    decoded,
+                    attempt=attempt,
+                    milestone_sources=milestone_sources,
+                )
                 native = _native_identity(
                     client,
                     profile=profile,
@@ -598,6 +760,7 @@ def worker_preflight(
                     packet_json,
                     decoded=decoded,
                     prepared_stage=prepared_stage,
+                    milestone_sources=milestone_sources,
                 )
                 observation = {
                     "schema": PREFLIGHT_SCHEMA,
@@ -630,15 +793,32 @@ def worker_preflight(
                 if not created:
                     raise OrchestrateError("Preflight observation already exists; no fresh editing grant was issued", code="preflight_already_recorded")
                 return {"schema": PREFLIGHT_SCHEMA, "status": "admitted", "editingGrant": "fresh", "observation": observation}
-            except (KeyError, TypeError, ValueError, OrchestrateError, OrcaCommandError) as exc:
+            except Exception as exc:
                 code = (
                     exc.code
                     if isinstance(exc, (OrchestrateError, OrcaCommandError))
-                    else "preflight_contract_invalid"
+                    else (
+                        "preflight_environment_unavailable"
+                        if isinstance(exc, OSError)
+                        else "preflight_contract_invalid"
+                    )
                 )
-                mismatch: dict[str, Any] = {"code": code, "message": str(exc)}
+                if code == "preflight_already_recorded":
+                    recorded = store.get_preflight(run.local_id, task_id, dispatch_id)
+                    recorded_outcome = recorded.get("outcome") if recorded is not None else None
+                    recorded_code = (
+                        "preflight_already_passed"
+                        if recorded_outcome == "passed"
+                        else "preflight_already_rejected"
+                    )
+                    raise OrchestrateError(
+                        "This Dispatch already has an immutable preflight observation; no fresh editing grant was issued",
+                        code=recorded_code,
+                    ) from exc
+                mismatch: dict[str, Any] = {"code": code, "message": _bounded_exception_message(exc)}
                 if isinstance(exc, OrchestrateError) and exc.data is not None:
                     mismatch["details"] = exc.data
+                retryable = _retryable_preflight_failure(root, exc)
                 rejected = {
                     "schema": PREFLIGHT_SCHEMA,
                     "outcome": "rejected",
@@ -651,13 +831,25 @@ def worker_preflight(
                     "limitations": ["No managed editing admission was established."],
                     "mismatches": [mismatch],
                 }
-                store.record_preflight(
+                store.record_preflight_attempt(
                     run.local_id,
                     run_id=run_id,
                     task_id=task_id,
                     dispatch_id=dispatch_id,
+                    disposition="retryable" if retryable else "definitive",
                     observation=rejected,
+                    conclusive=not retryable,
                 )
+                if retryable:
+                    raise OrchestrateError(
+                        "Worker preflight encountered a retryable environmental failure",
+                        code="preflight_retryable",
+                        data={
+                            "cause": code,
+                            "disposition": "retryable",
+                            "mismatches": rejected["mismatches"],
+                        },
+                    ) from exc
                 raise OrchestrateError(
                     "Worker preflight was rejected",
                     code="preflight_rejected",

@@ -701,6 +701,7 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
     if run.task_id and run.dispatch_id:
         try:
             observation = store.get_preflight(run.local_id, run.task_id, run.dispatch_id)
+            attempts = store.list_preflight_attempts(run.local_id, run.task_id, run.dispatch_id)
             other_observations = other_dispatch_observations(store, run.local_id, run.task_id, run.dispatch_id)
         except OrchestrateError as exc:
             admission_detail = {"status": "conflicting", "code": exc.code, "message": str(exc)}
@@ -711,6 +712,17 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
                     "mismatches": observation.get("mismatches", []),
                     "limitations": observation.get("limitations", []),
                     "observedAt": observation.get("observedAt"),
+                }
+            elif attempts:
+                latest_attempt = attempts[-1]
+                attempted = latest_attempt["observation"]
+                admission_detail = {
+                    "outcome": attempted.get("outcome"),
+                    "disposition": latest_attempt["disposition"],
+                    "attemptOrdinal": latest_attempt["attemptOrdinal"],
+                    "mismatches": attempted.get("mismatches", []),
+                    "limitations": attempted.get("limitations", []),
+                    "observedAt": attempted.get("observedAt"),
                 }
             elif other_observations:
                 admission_detail = {
@@ -869,9 +881,17 @@ def _run_source_index(
     milestone_path: str | None,
 ) -> SourceIndex:
     consulted = set(getattr(reader, "consulted_paths"))
-    if milestone_path is not None:
-        consulted.add(milestone_path)
-    return build_source_index(profile, extra_sources=consulted)
+    milestone_sources = {milestone_path} if milestone_path is not None else set()
+    return build_source_index(
+        profile,
+        extra_sources=consulted,
+        milestone_sources=milestone_sources,
+    )
+
+
+def _run_milestone_sources(store: StateStore, run: RunRecord) -> set[str]:
+    path = _milestone_plan_path(store, run)
+    return {path} if path is not None else set()
 
 
 def _create_task_and_packet(client: OrcaClient, store: StateStore, run: RunRecord, profile: ProjectProfile) -> RunRecord:
@@ -1317,7 +1337,12 @@ def _start_worker(
     *,
     worktree_id: str | None,
 ) -> RunRecord:
-    validation = validate_packet_sources(profile, run, packet_json)
+    validation = validate_packet_sources(
+        profile,
+        run,
+        packet_json,
+        milestone_sources=_run_milestone_sources(store, run),
+    )
     launch = validation.packet["admission"]["launch"]
     arguments = [
         "orchestration",
@@ -2189,7 +2214,12 @@ def _start_milestone_worker(
             data={"taskKey": task.key, "requestId": unresolved["request_id"], "status": unresolved["status"]},
         )
     task_run = replace(run, task_id=binding.task_id, dispatch_id=None)
-    validate_packet_sources(profile, task_run, packet_json)
+    validate_packet_sources(
+        profile,
+        task_run,
+        packet_json,
+        milestone_sources=_run_milestone_sources(store, run),
+    )
     selector = f"path:{profile.root.resolve()}"
     arguments = [
         "orchestration",
@@ -3042,7 +3072,12 @@ def _milestone_source_binding(
                     code="packet_identity_conflict",
                 )
             task_run = replace(run, task_id=row["task_id"], dispatch_id=dispatch_id)
-            validation = validate_packet_sources(profile, task_run, packet_json)
+            validation = validate_packet_sources(
+                profile,
+                task_run,
+                packet_json,
+                milestone_sources=_run_milestone_sources(store, run),
+            )
             packet_value = validation.packet
             packet_id = packet_value.get("packetId")
             scope = packet_value.get("scope")
@@ -3568,7 +3603,12 @@ def resume(
             recovering_worker_start = any(row["operation"] == "worker-start" for row in unsettled)
             if prepared_start:
                 _require_profile_selection(profile)
-                validate_packet_sources(profile, run, _ensure_packet(store, run, profile))
+                validate_packet_sources(
+                    profile,
+                    run,
+                    _ensure_packet(store, run, profile),
+                    milestone_sources=_run_milestone_sources(store, run),
+                )
             if run.dispatch_id and not recovering_worker_start:
                 # Retry/replay can itself issue native effects or apply a stored
                 # reply/ack locally. Keep that complete interval ordered against

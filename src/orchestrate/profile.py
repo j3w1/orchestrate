@@ -74,11 +74,15 @@ def find_project_root(start: Path) -> Path:
 
 
 def _git_bytes(root: Path, *arguments: str) -> bytes:
-    completed = subprocess.run(
-        ("git", "-C", os.fspath(root), *arguments),
-        capture_output=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            ("git", "-C", os.fspath(root), *arguments),
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OrchestrateError("Git instruction inventory is unavailable", code="git_inspection_failed") from exc
     if completed.returncode:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
         raise OrchestrateError(f"Git instruction inventory failed: {detail}", code="git_inspection_failed")

@@ -8,7 +8,7 @@ from enum import Enum
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import subprocess
 from types import MappingProxyType
@@ -17,11 +17,12 @@ from typing import Any
 from .errors import OrchestrateError
 from .profile import (
     INSTRUCTION_NAMES,
+    MAX_GIT_PATH_BYTES,
     PROFILE_NAME,
     PROFILE_SELECTION_ACKNOWLEDGMENT_SOURCE,
     ProjectProfile,
 )
-from .safeio import approved_project_path, is_sensitive_source, read_project_bytes
+from .safeio import MAX_SOURCE_BYTES, approved_project_path, is_sensitive_source, read_project_bytes
 
 
 SOURCE_INDEX_SCHEMA = "orchestrate-source-index/v1"
@@ -49,6 +50,7 @@ class SourceKind(str, Enum):
     COMMAND_MANIFEST = "command-manifest"
     CANDIDATE = "candidate"
     READER_ROUTED = "reader-routed"
+    MILESTONE_PLAN = "milestone-plan"
     PACKET_BOUND = "packet-bound"
 
 
@@ -91,6 +93,7 @@ class SourceRecord:
             not isinstance(path, str)
             or not path
             or "\\" in path
+            or PureWindowsPath(path).drive
             or Path(path).is_absolute()
             or path != Path(path).as_posix()
             or any(part in {"", ".", ".."} for part in Path(path).parts)
@@ -121,18 +124,6 @@ class SourceRecord:
             index_sha256,
             authority,
         )
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "path": self.path,
-            "state": self.state,
-            "sha256": self.sha256,
-            "bytes": self.byte_count,
-            "headSha256": self.head_sha256,
-            "indexSha256": self.index_sha256,
-            "authority": self.authority,
-        }
-
 
 @dataclass(frozen=True, slots=True)
 class SourceReference:
@@ -227,6 +218,7 @@ def classify_source_reference(
     *,
     packet_record: SourceRecord | None = None,
     reader_routed: bool = False,
+    milestone_plan: bool = False,
     packet_bound: bool = False,
 ) -> SourceReference:
     """Derive source membership and read permission in one shared model."""
@@ -244,6 +236,8 @@ def classify_source_reference(
         kinds.add(SourceKind.CANDIDATE)
     if reader_routed:
         kinds.add(SourceKind.READER_ROUTED)
+    if milestone_plan:
+        kinds.add(SourceKind.MILESTONE_PLAN)
     if packet_bound:
         kinds.add(SourceKind.PACKET_BOUND)
     if packet_record is not None and packet_record.sha256 is None:
@@ -261,10 +255,20 @@ def classify_source_reference(
 
 
 def _git(root: Path, *arguments: str, allow_failure: bool = False) -> str:
-    completed = subprocess.run(("git", "-C", os.fspath(root), *arguments), capture_output=True, check=False)
+    try:
+        completed = subprocess.run(
+            ("git", "-C", os.fspath(root), *arguments),
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OrchestrateError("Git inspection is unavailable", code="git_inspection_failed") from exc
     if completed.returncode and not allow_failure:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
         raise OrchestrateError(f"Git inspection failed: {detail}", code="git_inspection_failed")
+    if len(completed.stdout) > MAX_GIT_PATH_BYTES:
+        raise OrchestrateError("Git inspection exceeded its output boundary", code="git_inspection_failed")
     try:
         return completed.stdout.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
@@ -272,10 +276,20 @@ def _git(root: Path, *arguments: str, allow_failure: bool = False) -> str:
 
 
 def _git_bytes(root: Path, *arguments: str) -> bytes:
-    completed = subprocess.run(("git", "-C", os.fspath(root), *arguments), capture_output=True, check=False)
+    try:
+        completed = subprocess.run(
+            ("git", "-C", os.fspath(root), *arguments),
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OrchestrateError("Git inspection is unavailable", code="git_inspection_failed") from exc
     if completed.returncode:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
         raise OrchestrateError(f"Git inspection failed: {detail}", code="git_inspection_failed")
+    if len(completed.stdout) > MAX_GIT_PATH_BYTES:
+        raise OrchestrateError("Git inspection exceeded its output boundary", code="git_inspection_failed")
     return completed.stdout
 
 
@@ -313,11 +327,17 @@ def _assert_readable_source(root: Path, relative: str) -> tuple[Path, bytes]:
 
 
 def _head_blob(root: Path, relative: str) -> bytes | None:
-    completed = subprocess.run(
-        ("git", "-C", os.fspath(root), "show", f"HEAD:{relative}"),
-        capture_output=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            ("git", "-C", os.fspath(root), "show", f"HEAD:{relative}"),
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OrchestrateError("Git source inspection is unavailable", code="git_inspection_failed") from exc
+    if len(completed.stdout) > MAX_SOURCE_BYTES:
+        raise OrchestrateError("Git source exceeds the bounded read limit", code="source_too_large")
     return completed.stdout if completed.returncode == 0 else None
 
 
@@ -331,11 +351,17 @@ class SourceIndex:
 
 
 def _index_bytes(root: Path, relative: str) -> bytes | None:
-    completed = subprocess.run(
-        ("git", "-C", os.fspath(root), "show", f":{relative}"),
-        capture_output=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            ("git", "-C", os.fspath(root), "show", f":{relative}"),
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OrchestrateError("Git source inspection is unavailable", code="git_inspection_failed") from exc
+    if len(completed.stdout) > MAX_SOURCE_BYTES:
+        raise OrchestrateError("Git source exceeds the bounded read limit", code="source_too_large")
     return completed.stdout if completed.returncode == 0 else None
 
 
@@ -343,6 +369,7 @@ def build_source_index(
     profile: ProjectProfile,
     *,
     extra_sources: set[str] | None = None,
+    milestone_sources: set[str] | None = None,
     prepared: PreparedSourceSet | None = None,
 ) -> SourceIndex:
     root = profile.root
@@ -365,6 +392,7 @@ def build_source_index(
         *profile.value["commandManifests"],
         PROFILE_NAME,
         *(extra_sources or set()),
+        *(milestone_sources or set()),
         *profile.value.get("candidateSources", []),
     }
     prepared_references = {
@@ -373,7 +401,10 @@ def build_source_index(
     }
     references = {
         relative: prepared_references.get(relative) or classify_source_reference(
-            profile, relative, reader_routed=relative in (extra_sources or set())
+            profile,
+            relative,
+            reader_routed=relative in (extra_sources or set()),
+            milestone_plan=relative in (milestone_sources or set()),
         )
         for relative in configured
     }
@@ -400,7 +431,10 @@ def build_source_index(
         if prepared is not None and relative in prepared.raw_by_path:
             raw = prepared.raw_by_path[relative]
             if raw is None:
-                _, raw = _assert_readable_source(root, relative)
+                raise OrchestrateError(
+                    "A reference-only packet source became available during validation",
+                    code="source_binding_changed",
+                )
         else:
             _, raw = _assert_readable_source(root, relative)
         head = _head_blob(root, relative)

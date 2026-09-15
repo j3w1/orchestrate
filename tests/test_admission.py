@@ -565,6 +565,16 @@ class AdmissionTests(unittest.TestCase):
                     decode_packet(canonical_packet_json(malformed))
                 self.assertEqual(rejected.exception.code, "packet_identity_conflict")
 
+    def test_strict_packet_decode_rejects_drive_relative_source_paths(self) -> None:
+        from orchestrate.packets import decode_packet
+
+        malformed = json.loads(json.dumps(self.packet))
+        malformed["sources"][0]["path"] = "C:AGENTS.md"
+        malformed["packetId"] = expected_packet_id(malformed)
+        with self.assertRaises(OrchestrateError) as rejected:
+            decode_packet(canonical_packet_json(malformed))
+        self.assertEqual(rejected.exception.code, "packet_identity_conflict")
+
     def test_strict_packet_decode_rejects_duplicate_keys_and_nonfinite_numbers(self) -> None:
         from orchestrate.packets import decode_packet
 
@@ -579,11 +589,112 @@ class AdmissionTests(unittest.TestCase):
             '  "unresolvedDecisions": [NaN]',
             1,
         )
-        for malformed in (duplicate, nonfinite):
+        overflow = packet_json.replace(
+            '  "unresolvedDecisions": []',
+            '  "unresolvedDecisions": [1e999]',
+            1,
+        )
+        for malformed in (duplicate, nonfinite, overflow):
             with self.subTest(malformed=malformed[-80:]):
                 with self.assertRaises(OrchestrateError) as rejected:
                     decode_packet(malformed)
                 self.assertEqual(rejected.exception.code, "packet_identity_conflict")
+
+    def test_nested_packet_decode_failure_is_durable_and_definitive(self) -> None:
+        with StateStore(self.root) as store:
+            original = store.get_packet_json(self.local_id, "task_1")
+            store.connection.execute(
+                "UPDATE packets SET packet_json = ? WHERE run_local_id = ? AND task_id = ?",
+                ("[" * 60_000 + "]" * 60_000, self.local_id, "task_1"),
+            )
+
+        with self.assertRaises(OrchestrateError) as rejected:
+            self._run(PreflightClient(self.root, self.packet))
+        self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(rejected.exception.data["cause"], "packet_identity_conflict")  # type: ignore[index]
+
+        with StateStore(self.root) as store:
+            observed = store.get_preflight(self.local_id, "task_1", "dispatch_1")
+            attempts = store.list_preflight_attempts(self.local_id, "task_1", "dispatch_1")
+            store.connection.execute(
+                "UPDATE packets SET packet_json = ? WHERE run_local_id = ? AND task_id = ?",
+                (original, self.local_id, "task_1"),
+            )
+        self.assertEqual(observed["outcome"], "rejected")  # type: ignore[index]
+        self.assertEqual(attempts[0]["disposition"], "definitive")
+        with self.assertRaises(OrchestrateError) as restored:
+            self._run(PreflightClient(self.root, self.packet))
+        self.assertEqual(restored.exception.code, "preflight_already_rejected")
+
+    def test_missing_git_records_retryable_attempt_without_burning_dispatch(self) -> None:
+        with patch("orchestrate.profile.subprocess.run", side_effect=FileNotFoundError("git unavailable")):
+            with self.assertRaises(OrchestrateError) as transient:
+                self._run(PreflightClient(self.root, self.packet))
+        self.assertEqual(transient.exception.code, "preflight_retryable")
+        self.assertEqual(transient.exception.data["disposition"], "retryable")  # type: ignore[index]
+        with StateStore(self.root) as store:
+            self.assertIsNone(store.get_preflight(self.local_id, "task_1", "dispatch_1"))
+            attempts = store.list_preflight_attempts(self.local_id, "task_1", "dispatch_1")
+        self.assertEqual([(item["attemptOrdinal"], item["disposition"]) for item in attempts], [(1, "retryable")])
+
+        native = {
+            "terminalResourceId": "terminal-resource-1",
+            "terminalHandle": "term_worker",
+            "worktreeId": f"repo::{self.root.resolve()}",
+        }
+        with patch("orchestrate.admission._native_identity", return_value=native):
+            admitted = self._run(PreflightClient(self.root, self.packet))
+        self.assertEqual(admitted["editingGrant"], "fresh")
+        with StateStore(self.root) as store:
+            self.assertEqual(
+                store.get_preflight(self.local_id, "task_1", "dispatch_1")["outcome"],  # type: ignore[index]
+                "passed",
+            )
+            self.assertEqual(len(store.list_preflight_attempts(self.local_id, "task_1", "dispatch_1")), 1)
+
+    def test_packet_declared_repo_routing_cannot_authorize_a_byte_read(self) -> None:
+        private_path = "private-notes.txt"
+        (self.root / private_path).write_text("not reader-routed authority\n", encoding="utf-8")
+        objective = "Implement bounded change"
+        reader = read_project(self.profile, objective)
+        sources = build_source_index(
+            self.profile,
+            extra_sources={*reader.consulted_paths, private_path},
+        )
+        tampered = make_packet(
+            objective=objective,
+            profile=self.profile,
+            sources=sources,
+            launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+            python_executable=str(Path(sys.executable).resolve()),
+            run_id="run_1",
+            reader=reader,
+        )
+        tampered["reader"]["routing"]["authority"].append(private_path)
+        tampered["packetId"] = expected_packet_id(tampered)
+        with StateStore(self.root) as store:
+            store.connection.execute(
+                "UPDATE packets SET packet_json = ? WHERE run_local_id = ? AND task_id = ?",
+                (canonical_packet_json(tampered), self.local_id, "task_1"),
+            )
+
+        client = PreflightClient(self.root, tampered)
+        with patch("orchestrate.admission.read_project_bytes", wraps=read_project_bytes) as source_reads:
+            with self.assertRaises(OrchestrateError) as rejected:
+                worker_preflight(
+                    self.root,
+                    run_id="run_1",
+                    task_id="task_1",
+                    dispatch_id="dispatch_1",
+                    packet_id=str(tampered["packetId"]),
+                    client=client,
+                    environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                    platform="win32",
+                )
+        self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(rejected.exception.data["cause"], "packet_identity_conflict")  # type: ignore[index]
+        self.assertNotIn(private_path, [call.args[1] for call in source_reads.call_args_list])
+        self.assertEqual(client.calls, [])
 
     def test_reader_and_index_consume_the_single_completed_source_stage(self) -> None:
         with StateStore(self.root) as store:
@@ -608,6 +719,63 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(len(observed_paths), len(expected_paths))
         self.assertEqual(index_builds.call_count, 1)
         self.assertEqual(validation.sources.digest, self.packet["sourceDigest"])
+
+    def test_reference_only_source_created_after_check_is_never_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git(root, "init", "-q")
+            git(root, "config", "user.email", "fixture@example.invalid")
+            git(root, "config", "user.name", "Fixture")
+            (root / "AGENTS.md").write_text("Bound instruction.\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+            git(root, "add", ".")
+            git(root, "commit", "-qm", "fixture")
+            setup_project(root)
+            profile_value = json.loads((root / ".orchestrate.json").read_text(encoding="utf-8"))
+            profile_value["candidateSources"] = ["appearing.txt"]
+            (root / ".orchestrate.json").write_text(
+                json.dumps(profile_value, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            profile = setup_project(root, acknowledge_profile=True)
+            reader = read_project(profile, "Inspect the bounded candidate")
+            sources = build_source_index(profile, extra_sources=set(reader.consulted_paths))
+            with StateStore(root) as store:
+                run = store.create_run(
+                    objective="Inspect the bounded candidate",
+                    profile_digest=profile.digest,
+                    source_digest=sources.digest,
+                )
+                run = store.update_run(run.local_id, native_run_id="run_1")
+            packet = make_packet(
+                objective=run.objective,
+                profile=profile,
+                sources=sources,
+                launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+                python_executable=str(Path(sys.executable).resolve()),
+                run_id="run_1",
+                reader=reader,
+            )
+            original_inventory = profile.require_instruction_acknowledgment
+
+            def create_after_reference_check() -> tuple[str, ...]:
+                result = original_inventory()
+                (root / "appearing.txt").write_text("appeared after eligibility\n", encoding="utf-8")
+                return result
+
+            with (
+                patch(
+                    "orchestrate.admission.ProjectProfile.require_instruction_acknowledgment",
+                    side_effect=create_after_reference_check,
+                ),
+                patch(
+                    "orchestrate.sources.read_project_bytes",
+                    side_effect=AssertionError("reference-only source bytes were consumed"),
+                ),
+                self.assertRaises(OrchestrateError) as rejected,
+            ):
+                validate_packet_sources(profile, run, canonical_packet_json(packet))
+            self.assertEqual(rejected.exception.code, "source_binding_changed")
 
     def test_malformed_source_record_is_durably_rejected_before_profile_or_source_io(self) -> None:
         malformed = json.loads(json.dumps(self.packet))
@@ -838,6 +1006,38 @@ class AdmissionTests(unittest.TestCase):
                     worktree_id=f"repo::{root.resolve()}",
                     readback={"fixture": "validated-start-readback"},
                 )
+
+            with patch("orchestrate.readers._run_ce_query", return_value=query_result):
+                validated = validate_packet_sources(
+                    profile,
+                    run,
+                    canonical_packet_json(packet),
+                )
+            self.assertEqual(validated.sources.digest, packet["sourceDigest"])
+
+            private_path = "private-notes.txt"
+            (root / private_path).write_text("not selected by the CE registry\n", encoding="utf-8")
+            tampered_sources = build_source_index(
+                profile,
+                extra_sources={*reader.consulted_paths, private_path},
+            )
+            tampered = make_packet(
+                objective=run.objective,
+                profile=profile,
+                sources=tampered_sources,
+                launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+                python_executable=str(Path(sys.executable).resolve()),
+                run_id="run_1",
+                reader=reader,
+            )
+            tampered["reader"]["routing"]["task"] = private_path
+            tampered["packetId"] = expected_packet_id(tampered)
+            with patch("orchestrate.admission.read_project_bytes", wraps=read_project_bytes) as source_reads:
+                with self.assertRaises(OrchestrateError) as routed:
+                    validate_packet_sources(profile, run, canonical_packet_json(tampered))
+            self.assertEqual(routed.exception.code, "source_binding_changed")
+            self.assertNotIn(private_path, [call.args[1] for call in source_reads.call_args_list])
+            (root / private_path).unlink()
 
             query_script.write_text("// changed clean query implementation\n", encoding="utf-8")
             git(root, "add", "scripts/quality/project-log.mjs")

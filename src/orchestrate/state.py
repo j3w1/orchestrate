@@ -78,6 +78,18 @@ REQUIRED_STATE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
             "created_at",
         }
     ),
+    "preflight_attempt_observations": frozenset(
+        {
+            "run_local_id",
+            "run_id",
+            "task_id",
+            "dispatch_id",
+            "attempt_ordinal",
+            "disposition",
+            "observation_json",
+            "created_at",
+        }
+    ),
     "deliveries": frozenset(
         {"run_local_id", "delivery_id", "response_json", "acked", "created_at"}
     ),
@@ -540,6 +552,17 @@ class StateStore(AbstractContextManager["StateStore"]):
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (run_local_id, task_id, dispatch_id)
             );
+            CREATE TABLE IF NOT EXISTS preflight_attempt_observations (
+                run_local_id TEXT NOT NULL REFERENCES runs(local_id),
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                dispatch_id TEXT NOT NULL,
+                attempt_ordinal INTEGER NOT NULL,
+                disposition TEXT NOT NULL,
+                observation_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (run_local_id, task_id, dispatch_id, attempt_ordinal)
+            );
             CREATE TABLE IF NOT EXISTS deliveries (
                 run_local_id TEXT NOT NULL REFERENCES runs(local_id),
                 delivery_id TEXT NOT NULL,
@@ -977,6 +1000,97 @@ class StateStore(AbstractContextManager["StateStore"]):
                 (run_local_id, run_id, task_id, dispatch_id, outcome, encoded, utc_now()),
             )
         return observation, True
+
+    def record_preflight_attempt(
+        self,
+        run_local_id: str,
+        *,
+        run_id: str,
+        task_id: str,
+        dispatch_id: str,
+        disposition: str,
+        observation: dict[str, Any],
+        conclusive: bool = False,
+    ) -> dict[str, Any]:
+        """Append one immutable failed-attempt observation.
+
+        Retryable environmental failures live here without occupying the one
+        conclusive admission row for the Dispatch. A definitive failure appends
+        its attempt and inserts its immutable rejection in this same transaction.
+        """
+
+        if disposition not in {"definitive", "retryable"}:
+            raise ValueError("Preflight attempt disposition must be definitive or retryable")
+        if conclusive and disposition != "definitive":
+            raise ValueError("Only a definitive failed attempt may be conclusive")
+        if observation.get("outcome") != "rejected":
+            raise ValueError("A failed-attempt observation must be rejected")
+        encoded = json.dumps(observation, sort_keys=True, separators=(",", ":"))
+        with self.transaction():
+            row = self.connection.execute(
+                """SELECT COALESCE(MAX(attempt_ordinal), 0) AS latest
+                   FROM preflight_attempt_observations
+                   WHERE run_local_id = ? AND task_id = ? AND dispatch_id = ?""",
+                (run_local_id, task_id, dispatch_id),
+            ).fetchone()
+            ordinal = int(row["latest"]) + 1
+            self.connection.execute(
+                """INSERT INTO preflight_attempt_observations
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_local_id,
+                    run_id,
+                    task_id,
+                    dispatch_id,
+                    ordinal,
+                    disposition,
+                    encoded,
+                    utc_now(),
+                ),
+            )
+            if conclusive:
+                existing = self.connection.execute(
+                    """SELECT observation_json FROM preflight_observations
+                       WHERE run_local_id = ? AND task_id = ? AND dispatch_id = ?""",
+                    (run_local_id, task_id, dispatch_id),
+                ).fetchone()
+                if existing is None:
+                    self.connection.execute(
+                        "INSERT INTO preflight_observations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            run_local_id,
+                            run_id,
+                            task_id,
+                            dispatch_id,
+                            "rejected",
+                            encoded,
+                            utc_now(),
+                        ),
+                    )
+        return {**observation, "attemptOrdinal": ordinal, "disposition": disposition}
+
+    def list_preflight_attempts(
+        self,
+        run_local_id: str,
+        task_id: str,
+        dispatch_id: str,
+    ) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """SELECT attempt_ordinal, disposition, observation_json, created_at
+               FROM preflight_attempt_observations
+               WHERE run_local_id = ? AND task_id = ? AND dispatch_id = ?
+               ORDER BY attempt_ordinal""",
+            (run_local_id, task_id, dispatch_id),
+        ).fetchall()
+        return [
+            {
+                "attemptOrdinal": row["attempt_ordinal"],
+                "disposition": row["disposition"],
+                "createdAt": row["created_at"],
+                "observation": self._decode_preflight(row["observation_json"]),
+            }
+            for row in rows
+        ]
 
     @staticmethod
     def _decode_preflight(encoded: object) -> dict[str, Any]:

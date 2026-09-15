@@ -1329,6 +1329,29 @@ class MilestoneRepo(unittest.TestCase):
 
 
 class ControllerTests(MilestoneRepo):
+    def test_public_implement_prelaunch_accepts_bound_milestone_plan_source(self) -> None:
+        objective = "Validate the bound milestone plan before native launch"
+        plan = self._write_milestone_plan(objective)
+
+        class PrelaunchReached(RuntimeError):
+            pass
+
+        class PrelaunchProbe(MilestoneClient):
+            def _launch(self, task_id: str, arguments: tuple[str, ...]) -> OrcaJsonResponse:
+                raise PrelaunchReached(f"validated {task_id}")
+
+        client = PrelaunchProbe(self.root)
+        with self.assertRaisesRegex(PrelaunchReached, "validated task_1"):
+            implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertTrue(any(call[:2] == ("orchestration", "worker-start") for call in client.calls))
+
     @requires_native_windows_admission
     def test_production_controller_executes_tracked_native_milestone_plan(self) -> None:
         objective = "Integrate the exact bounded milestone"
@@ -3092,17 +3115,30 @@ class ControllerTests(MilestoneRepo):
             }
         responses.append(pending_delivery)
         client = FakeClient(responses)
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                implement,
-                self.root,
-                objective,
-                client=client,  # type: ignore[arg-type]
-                wait_timeout_ms=int(LIVENESS_TIMEOUT * 1000),
-                require_context=False,
-            )
-            report = future.result(timeout=LIVENESS_TIMEOUT)
-            self.assertTrue(delivery_observed.is_set())
+        completed = threading.Event()
+        outcome: dict[str, object] = {}
+
+        def run_implementation() -> None:
+            try:
+                outcome["report"] = implement(
+                    self.root,
+                    objective,
+                    client=client,  # type: ignore[arg-type]
+                    wait_timeout_ms=int(LIVENESS_TIMEOUT * 500),
+                    require_context=False,
+                )
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=run_implementation, daemon=True)
+        worker.start()
+        self.assertTrue(completed.wait(LIVENESS_TIMEOUT), "pending-question fixture exceeded its outer liveness bound")
+        if "error" in outcome:
+            raise outcome["error"]  # type: ignore[misc]
+        report = outcome["report"]
+        self.assertTrue(delivery_observed.is_set())
         self.assertEqual(report["status"], "waiting")
         self.assertEqual(report["admission"], "admitted")
         self.assertEqual(report["pendingQuestions"], ["question_1"])

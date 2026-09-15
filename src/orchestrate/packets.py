@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from typing import Any
 
 from .errors import OrchestrateError
@@ -16,6 +17,7 @@ from .sources import SourceIndex, SourceRecord, decode_source_records
 
 PACKET_SCHEMA = "orchestrate-worker-packet/v3"
 PREFLIGHT_SCHEMA = "orchestrate-worker-preflight/v1"
+MAX_PACKET_BYTES = 1024 * 1024
 PACKET_FIELDS = frozenset(
     {
         "schema",
@@ -88,16 +90,34 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON number: {value}")
 
 
+def _require_finite_numbers(value: object) -> None:
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("non-finite JSON number")
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+
+
 def decode_packet(packet_json: str) -> DecodedPacket:
     """Strictly decode canonical v3 and every source record without I/O."""
 
+    if len(packet_json.encode("utf-8")) > MAX_PACKET_BYTES:
+        raise OrchestrateError(
+            "Stored worker packet exceeds the bounded decode limit",
+            code="packet_identity_conflict",
+        )
     try:
         packet = json.loads(
             packet_json,
             object_pairs_hook=_strict_object,
             parse_constant=_reject_json_constant,
         )
-    except (json.JSONDecodeError, ValueError) as exc:
+        _require_finite_numbers(packet)
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise OrchestrateError("Stored worker packet is invalid JSON", code="packet_identity_conflict") from exc
     if isinstance(packet, dict) and packet.get("schema") != PACKET_SCHEMA:
         raise OrchestrateError(
