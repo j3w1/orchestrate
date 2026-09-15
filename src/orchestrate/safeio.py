@@ -58,6 +58,16 @@ class ProjectSourceState(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+def project_source_error_state(exc: OSError) -> ProjectSourceState:
+    """Classify path lookup failures without losing structural evidence."""
+
+    if isinstance(exc, NotADirectoryError) or exc.errno == errno.ENOTDIR:
+        return ProjectSourceState.CHANGED
+    if isinstance(exc, FileNotFoundError) or exc.errno == errno.ENOENT:
+        return ProjectSourceState.ABSENT
+    return ProjectSourceState.UNAVAILABLE
+
+
 def _relative_parts(relative: str) -> tuple[str, ...]:
     path = Path(relative)
     if path.is_absolute() or not path.parts or ".." in path.parts or any(not part for part in path.parts):
@@ -99,16 +109,20 @@ def approved_project_path(root: Path, relative: str, *, require_file: bool = Tru
         current = current / part
         try:
             info = current.lstat()
-        except FileNotFoundError:
-            if require_file:
-                raise OrchestrateError(f"Required source is unavailable: {relative}", code="source_unavailable")
-            return current
-        except NotADirectoryError as exc:
-            raise OrchestrateError(
-                f"Required source has a non-directory ancestor: {relative}",
-                code="source_identity_changed",
-            ) from exc
         except OSError as exc:
+            source_state = project_source_error_state(exc)
+            if source_state == ProjectSourceState.ABSENT:
+                if require_file:
+                    raise OrchestrateError(
+                        f"Required source is unavailable: {relative}",
+                        code="source_unavailable",
+                    ) from exc
+                return current
+            if source_state == ProjectSourceState.CHANGED:
+                raise OrchestrateError(
+                    f"Required source has a non-directory ancestor: {relative}",
+                    code="source_identity_changed",
+                ) from exc
             raise OrchestrateError(f"Required source is unavailable: {relative}", code="source_unavailable") from exc
         if _is_reparse(info):
             raise OrchestrateError(
@@ -146,10 +160,8 @@ def project_source_state(root: Path, relative: str) -> ProjectSourceState:
         raise
     try:
         info = candidate.lstat()
-    except FileNotFoundError:
-        return ProjectSourceState.ABSENT
-    except OSError:
-        return ProjectSourceState.UNAVAILABLE
+    except OSError as exc:
+        return project_source_error_state(exc)
     if _is_reparse(info) or not stat.S_ISREG(info.st_mode):
         return ProjectSourceState.CHANGED
     return ProjectSourceState.PRESENT
@@ -195,7 +207,12 @@ def _read_posix_handle(root: Path, parts: tuple[str, ...], relative: str) -> byt
     except OrchestrateError:
         raise
     except OSError as exc:
-        code = "source_boundary_unresolved" if exc.errno == errno.ELOOP else "source_unavailable"
+        if exc.errno == errno.ELOOP:
+            code = "source_boundary_unresolved"
+        elif project_source_error_state(exc) == ProjectSourceState.CHANGED:
+            code = "source_identity_changed"
+        else:
+            code = "source_unavailable"
         raise OrchestrateError(f"Required source cannot be opened safely: {relative}", code=code) from exc
     finally:
         for descriptor in reversed(descriptors):

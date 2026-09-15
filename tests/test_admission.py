@@ -24,6 +24,7 @@ from orchestrate.readers import read_project
 from orchestrate.safeio import read_project_bytes
 from orchestrate.sources import build_source_index
 from orchestrate.state import AdmissionEffectFence, RunRecord, StateStore
+from tests.path_faults import ResolvedPathFault
 
 
 LIVENESS_TIMEOUT = 120.0  # Outer deadlock detector, not a semantic progress budget.
@@ -764,7 +765,7 @@ class AdmissionTests(unittest.TestCase):
     def test_nonzero_git_show_is_retryable_and_recovers_to_a_fresh_grant(self) -> None:
         real_run = subprocess.run
         alternate_root_spelling = os.fspath(self.root) + os.sep + "."
-        intercepted: list[tuple[str, ...]] = []
+        fault = ResolvedPathFault(alternate_root_spelling)
 
         def transient_show(
             arguments: tuple[str, ...],
@@ -774,10 +775,9 @@ class AdmissionTests(unittest.TestCase):
                 len(arguments) >= 4
                 and arguments[0] == "git"
                 and arguments[1] == "-C"
-                and Path(arguments[2]).resolve() == Path(alternate_root_spelling).resolve()
+                and fault.matches(arguments[2])
                 and arguments[3] == "show"
             ):
-                intercepted.append(arguments)
                 return subprocess.CompletedProcess(arguments, 128, b"", b"fatal: transient Git failure")
             return real_run(arguments, **keywords)
 
@@ -785,7 +785,7 @@ class AdmissionTests(unittest.TestCase):
         with patch("orchestrate.sources.subprocess.run", side_effect=transient_show):
             with self.assertRaises(OrchestrateError) as transient:
                 self._run(PreflightClient(self.root, self.packet))
-        self.assertGreaterEqual(len(intercepted), 1)
+        self.assertGreaterEqual(fault.interceptions, 1)
         self.assertEqual(transient.exception.code, "preflight_retryable")
         self.assertEqual(transient.exception.data["cause"], "git_inspection_failed")  # type: ignore[index]
         with StateStore(self.root) as store:
@@ -982,11 +982,130 @@ class AdmissionTests(unittest.TestCase):
                 )
             self.assertEqual(restored.exception.code, "preflight_already_rejected")
 
+    def test_post_walk_non_directory_shard_race_is_definitive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, run, packet, query_result = self._prepare_ce_preflight(root)
+            shard_parent = root / "docs" / "project-log"
+            saved_parent = root / "docs" / "project-log-original"
+            shard = shard_parent / "shard-001.md"
+            fault = ResolvedPathFault(shard)
+            real_lstat = Path.lstat
+            real_run = subprocess.run
+            armed = False
+            replaced = False
+            native = {
+                "terminalResourceId": "terminal-resource-1",
+                "terminalHandle": "term_worker",
+                "worktreeId": f"repo::{root.resolve()}",
+            }
+
+            def arm_after_completed_stage(*_: object, **__: object) -> dict[str, str]:
+                nonlocal armed
+                armed = True
+                return native
+
+            def replace_parent_after_walk(path: Path) -> os.stat_result:
+                nonlocal replaced
+                info = real_lstat(path)
+                if armed and not replaced and fault.matches(path):
+                    shard_parent.rename(saved_parent)
+                    shard_parent.write_bytes(b"not a directory\n")
+                    replaced = True
+                return info
+
+            def synthetic_query(
+                arguments: tuple[str, ...],
+                **keywords: object,
+            ) -> subprocess.CompletedProcess[bytes]:
+                if arguments[0] == "pnpm":
+                    return subprocess.CompletedProcess(
+                        arguments,
+                        0,
+                        json.dumps(query_result).encode("utf-8"),
+                        b"",
+                    )
+                return real_run(arguments, **keywords)
+
+            client = PreflightClient(root, packet)
+            with (
+                patch(
+                    "orchestrate.admission._native_identity",
+                    side_effect=arm_after_completed_stage,
+                ),
+                patch("orchestrate.safeio.Path.lstat", new=replace_parent_after_walk),
+            ):
+                with self.assertRaises(OrchestrateError) as rejected:
+                    worker_preflight(
+                        root,
+                        run_id="run_1",
+                        task_id="task_1",
+                        dispatch_id="dispatch_1",
+                        packet_id=str(packet["packetId"]),
+                        client=client,
+                        environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                        platform="win32",
+                    )
+            with StateStore(root) as store:
+                observed = store.get_preflight(run.local_id, "task_1", "dispatch_1")
+                attempts = store.list_preflight_attempts(run.local_id, "task_1", "dispatch_1")
+
+            shard_parent.unlink()
+            saved_parent.rename(shard_parent)
+            restored_code: str | None = None
+            restored_cause: object = None
+            restored_grant: object = None
+            with (
+                patch("orchestrate.admission._native_identity", return_value=native),
+                patch("orchestrate.readers.subprocess.run", side_effect=synthetic_query),
+            ):
+                try:
+                    restored_report = worker_preflight(
+                        root,
+                        run_id="run_1",
+                        task_id="task_1",
+                        dispatch_id="dispatch_1",
+                        packet_id=str(packet["packetId"]),
+                        client=PreflightClient(root, packet),
+                        environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+                        platform="win32",
+                    )
+                    restored_grant = restored_report.get("editingGrant")
+                except OrchestrateError as restored:
+                    restored_code = restored.code
+                    if isinstance(restored.data, dict):
+                        restored_cause = restored.data.get("cause")
+
+            self.assertGreaterEqual(fault.interceptions, 1)
+            self.assertTrue(replaced)
+            self.assertEqual(client.calls, [])
+            self.assertEqual(
+                (
+                    rejected.exception.code,
+                    rejected.exception.data.get("cause"),  # type: ignore[union-attr]
+                    observed.get("outcome") if observed is not None else None,
+                    attempts[0]["disposition"],
+                    restored_code,
+                    restored_cause,
+                    restored_grant,
+                ),
+                (
+                    "preflight_rejected",
+                    "source_binding_changed",
+                    "rejected",
+                    "definitive",
+                    "preflight_already_rejected",
+                    None,
+                    None,
+                ),
+            )
+
     def test_still_present_query_source_open_failure_is_retryable_after_native_readback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _, run, packet, query_result = self._prepare_ce_preflight(root)
             query_script = "scripts/quality/project-log.mjs"
+            fault = ResolvedPathFault(root / query_script)
             real_run = subprocess.run
             native = {
                 "terminalResourceId": "terminal-resource-1",
@@ -995,7 +1114,7 @@ class AdmissionTests(unittest.TestCase):
             }
 
             def transient_open(current_root: Path, relative: str) -> bytes:
-                if relative == query_script:
+                if fault.matches(relative, relative_to=current_root):
                     self.assertTrue((current_root / relative).is_file())
                     raise OrchestrateError(
                         "simulated sharing failure",
@@ -1035,6 +1154,7 @@ class AdmissionTests(unittest.TestCase):
                     )
             self.assertEqual(transient.exception.code, "preflight_retryable")
             self.assertEqual(transient.exception.data["cause"], "ce_query_source_unavailable")  # type: ignore[index]
+            self.assertGreaterEqual(fault.interceptions, 1)
             self.assertEqual(client.calls, [])
             with StateStore(root) as store:
                 self.assertIsNone(store.get_preflight(run.local_id, "task_1", "dispatch_1"))

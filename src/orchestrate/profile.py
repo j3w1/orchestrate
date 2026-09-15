@@ -15,6 +15,7 @@ from .errors import OrchestrateError
 from .safeio import (
     ProjectSourceState,
     approved_project_path,
+    project_source_error_state,
     project_source_state,
     read_project_bytes,
 )
@@ -164,7 +165,14 @@ def _profile_candidate(
                     code="source_temporarily_unavailable",
                 ) from exc
         raise
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except OSError as exc:
+        if project_source_error_state(exc) in {ProjectSourceState.ABSENT, ProjectSourceState.CHANGED}:
+            raise OrchestrateError(
+                f"{PROFILE_NAME} identity changed while it was being read",
+                code="source_identity_changed",
+            ) from exc
+        raise OrchestrateError(f"Cannot read {path}: {exc}", code="profile_unreadable") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OrchestrateError(f"Cannot read {path}: {exc}", code="profile_unreadable") from exc
     return raw, validate_profile(value, root=root, require_sources=require_sources)
 

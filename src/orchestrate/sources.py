@@ -27,6 +27,7 @@ from .safeio import (
     ProjectSourceState,
     approved_project_path,
     is_sensitive_source,
+    project_source_error_state,
     project_source_state,
     read_project_bytes,
 )
@@ -227,6 +228,13 @@ class PreparedSourceSet:
                 }:
                     return SourceRevalidation(ProjectSourceState.CHANGED, path)
                 raise
+            except OSError as exc:
+                state = project_source_error_state(exc)
+                if state == ProjectSourceState.UNAVAILABLE:
+                    state = project_source_state(root, path)
+                    if state == ProjectSourceState.PRESENT:
+                        state = ProjectSourceState.UNAVAILABLE
+                return SourceRevalidation(state, path)
             if {"sha256": _sha256(raw), "bytes": len(raw)} != expected:
                 return SourceRevalidation(ProjectSourceState.CHANGED, path)
         return SourceRevalidation(ProjectSourceState.PRESENT)
@@ -353,7 +361,30 @@ def _status_map(root: Path) -> dict[str, str]:
 
 
 def _assert_readable_source(root: Path, relative: str) -> tuple[Path, bytes]:
-    return root / relative, read_project_bytes(root, relative)
+    try:
+        raw = read_project_bytes(root, relative)
+    except OrchestrateError as exc:
+        if (
+            exc.code == "source_unavailable"
+            and project_source_state(root, relative) == ProjectSourceState.CHANGED
+        ):
+            raise OrchestrateError(
+                f"Required source identity changed before it could be read: {relative}",
+                code="source_identity_changed",
+            ) from exc
+        raise
+    except OSError as exc:
+        state = project_source_error_state(exc)
+        code = (
+            "source_identity_changed"
+            if state == ProjectSourceState.CHANGED
+            else "source_unavailable"
+        )
+        raise OrchestrateError(
+            f"Required source cannot be read safely: {relative}",
+            code=code,
+        ) from exc
+    return root / relative, raw
 
 
 def _git_source_presence(root: Path, kind: Literal["head", "index"], relative: str) -> bool:

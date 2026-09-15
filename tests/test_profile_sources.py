@@ -24,6 +24,7 @@ from orchestrate.profile import (
 from orchestrate.readers import _run_ce_query, read_project
 from orchestrate.safeio import ProjectSourceState, project_source_state, read_project_bytes
 from orchestrate.sources import build_source_index
+from tests.path_faults import ResolvedPathFault
 
 
 def git(root: Path, *arguments: str) -> bytes:
@@ -200,9 +201,10 @@ class ProfileAndSourceTests(DisposableRepo):
         source = ancestor / "source.txt"
         source.write_text("still present\n", encoding="utf-8")
         real_lstat = Path.lstat
+        fault = ResolvedPathFault(source)
 
         def unavailable_lstat(path: Path) -> os.stat_result:
-            if path == source:
+            if fault.matches(path):
                 raise PermissionError(errno.EACCES, "simulated metadata failure", path)
             return real_lstat(path)
 
@@ -211,6 +213,7 @@ class ProfileAndSourceTests(DisposableRepo):
                 project_source_state(self.root, "nested/source.txt"),
                 ProjectSourceState.UNAVAILABLE,
             )
+        self.assertGreaterEqual(fault.interceptions, 1)
 
     def test_env_variants_are_excluded_before_content_hashing(self) -> None:
         profile = setup_project(self.root)

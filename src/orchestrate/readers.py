@@ -14,7 +14,12 @@ from typing import Any
 
 from .errors import OrchestrateError
 from .profile import MAX_GIT_PATH_BYTES, ProjectProfile
-from .safeio import ProjectSourceState, approved_project_path, project_source_state
+from .safeio import (
+    ProjectSourceState,
+    approved_project_path,
+    project_source_error_state,
+    project_source_state,
+)
 from .sources import PreparedSourceSet, SourceRevalidation, read_project_text, read_source_text
 
 
@@ -80,6 +85,11 @@ def _relative_target(profile: ProjectProfile, source: str, target: str) -> str |
         except OrchestrateError as exc:
             if exc.code == "source_boundary_unresolved":
                 raise
+            if exc.code == "source_identity_changed":
+                raise OrchestrateError(
+                    f"Reader source identity changed: {relative}",
+                    code="source_binding_changed",
+                ) from exc
             if exc.code == "source_unavailable":
                 raise OrchestrateError(
                     f"Reader source cannot currently be observed: {relative}",
@@ -97,6 +107,11 @@ def _relative_target(profile: ProjectProfile, source: str, target: str) -> str |
             raise OrchestrateError(
                 f"Reader source cannot currently be observed: {relative}",
                 code="source_temporarily_unavailable",
+            )
+        if source_state == ProjectSourceState.CHANGED:
+            raise OrchestrateError(
+                f"Reader source identity changed: {relative}",
+                code="source_binding_changed",
             )
         missing = missing or relative
     if missing is not None:
@@ -117,6 +132,11 @@ def _line_targets(profile: ProjectProfile, source: str, line: str) -> list[str]:
                 raise OrchestrateError(
                     f"Reader source cannot currently be observed: {relative}",
                     code="source_temporarily_unavailable",
+                )
+            elif source_state == ProjectSourceState.CHANGED:
+                raise OrchestrateError(
+                    f"Reader source identity changed: {relative}",
+                    code="source_binding_changed",
                 )
     return result
 
@@ -254,6 +274,19 @@ def _query_source_identities(profile: ProjectProfile) -> dict[str, dict[str, Any
             raise OrchestrateError(
                 "A CE query source is absent or changed",
                 code="ce_query_source_changed",
+                data={"sourcePath": path, "sourceState": source_state.value},
+            ) from exc
+        except OSError as exc:
+            source_state = project_source_error_state(exc)
+            if source_state in {ProjectSourceState.ABSENT, ProjectSourceState.CHANGED}:
+                raise OrchestrateError(
+                    "A CE query source is absent or changed",
+                    code="ce_query_source_changed",
+                    data={"sourcePath": path, "sourceState": source_state.value},
+                ) from exc
+            raise OrchestrateError(
+                "A CE query source cannot currently be observed",
+                code="ce_query_source_unavailable",
                 data={"sourcePath": path, "sourceState": source_state.value},
             ) from exc
         result[path] = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
