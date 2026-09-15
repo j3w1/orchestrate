@@ -3069,13 +3069,15 @@ class ControllerTests(MilestoneRepo):
                             self.assertFalse(any("--ack" in call for call in client.calls))
 
     def _start_pending_question(self, objective: str) -> dict[str, object]:
+        delivery_observed = threading.Event()
         responses = completion_responses(self.root, objective)[:4]
         responses.extend([
             _worker_start_with_real_preflight(self.root, current_shape=True),
             _worker_start_readback(self.root, current_shape=True),
         ])
-        responses.append(
-            {
+        def pending_delivery(_: FakeClient, __: tuple[str, ...]) -> dict[str, object]:
+            delivery_observed.set()
+            return {
                 "result": {
                     "deliveryId": "delivery_q",
                     "messages": [
@@ -3088,9 +3090,19 @@ class ControllerTests(MilestoneRepo):
                     ],
                 }
             }
-        )
+        responses.append(pending_delivery)
         client = FakeClient(responses)
-        report = implement(self.root, objective, client=client, wait_timeout_ms=100, require_context=False)  # type: ignore[arg-type]
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                implement,
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=int(LIVENESS_TIMEOUT * 1000),
+                require_context=False,
+            )
+            report = future.result(timeout=LIVENESS_TIMEOUT)
+            self.assertTrue(delivery_observed.is_set())
         self.assertEqual(report["status"], "waiting")
         self.assertEqual(report["admission"], "admitted")
         self.assertEqual(report["pendingQuestions"], ["question_1"])
