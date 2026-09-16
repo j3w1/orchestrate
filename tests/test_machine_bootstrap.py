@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext, redirect_stdout
-import hashlib
 import io
 import json
 import os
@@ -24,9 +23,12 @@ from orchestrate.machine_bootstrap import (
     RegistryUserPathStore,
     UserPathValue,
     _atomic_write_owned,
+    _commit_staged_no_replace,
     _install_receipt_matches,
     _opened_file_identity_matches,
+    _receipt_value,
     _run_bound_step,
+    _SourceBinding,
     _target_identity,
     _VenvBinding,
     _windows_shim_text,
@@ -99,26 +101,13 @@ def write_pyvenv_config(layout: MachineLayout) -> bytes:
 
 def install_ready_files(layout: MachineLayout) -> None:
     layout.scripts_root.mkdir(parents=True, exist_ok=True)
-    config = write_pyvenv_config(layout)
+    write_pyvenv_config(layout)
     (layout.scripts_root / "python.exe").write_bytes(b"fixture")
     layout.command_path.write_bytes(b"fixture")
-    command_info = layout.command_path.stat()
+    with _SourceBinding(layout) as source, _VenvBinding(layout) as binding:
+        receipt = _receipt_value(binding, source)
     layout.install_receipt.write_text(
-        json.dumps(
-            {
-                "schema": "orchestrate-machine-install/v3",
-                "sourceRoot": str(layout.source_root.resolve()),
-                "venvRoot": str(layout.venv_root.resolve()),
-                "pythonPath": str((layout.scripts_root / "python.exe").resolve()),
-                "pyvenvConfigSha256": f"sha256:{hashlib.sha256(config).hexdigest()}",
-                "commandDevice": command_info.st_dev,
-                "commandInode": command_info.st_ino,
-                "commandSize": command_info.st_size,
-                "commandSha256": f"sha256:{hashlib.sha256(b'fixture').hexdigest()}",
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        json.dumps(receipt, sort_keys=True, separators=(",", ":"))
         + "\n",
         encoding="utf-8",
     )
@@ -330,6 +319,20 @@ class MachineBootstrapTests(unittest.TestCase):
 
             self.assertFalse(marker.exists())
 
+    def test_windows_runner_names_the_bound_interpreter_as_the_application(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            layout.scripts_root.mkdir(parents=True)
+            write_pyvenv_config(layout)
+            (layout.scripts_root / "python.exe").write_bytes(b"fixture")
+
+            with _VenvBinding(layout) as binding, patch(
+                "orchestrate.machine_bootstrap.sys.platform", "win32"
+            ):
+                kwargs = binding.runner_kwargs()
+
+            self.assertEqual(kwargs, {"executable": str(layout.scripts_root / "python.exe")})
+
     @unittest.skipUnless(sys.platform == "win32", "requires Windows sharing semantics")
     def test_windows_binding_denies_interpreter_replacement_while_effects_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -379,7 +382,7 @@ class MachineBootstrapTests(unittest.TestCase):
                     version_info=(3, 13),
                 )
 
-            self.assertEqual(held.exception.code, "machine_bootstrap_receipt_identity_unproven")
+            self.assertEqual(held.exception.code, "machine_bootstrap_shim_identity_unproven")
             self.assertEqual(receipt_victim.read_text(encoding="utf-8"), "receipt-safe")
             self.assertEqual(shim_victim.read_text(encoding="utf-8"), "shim-safe")
 
@@ -387,14 +390,25 @@ class MachineBootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "install.json"
             fault = ResolvedPathFault(target)
-            real_link = os.link
+            real_commit = _commit_staged_no_replace
 
-            def interfering_link(source: str, destination: str, *, follow_symlinks: bool = True) -> None:
-                if fault.matches(destination):
+            def interfering_commit(
+                temporary_name: str,
+                target_name: str,
+                *,
+                parent_fd: int | None,
+                parent: Path,
+            ) -> None:
+                if fault.matches(target_name, relative_to=parent):
                     target.write_bytes(b"unrelated-owner-data")
-                real_link(source, destination, follow_symlinks=follow_symlinks)
+                real_commit(
+                    temporary_name,
+                    target_name,
+                    parent_fd=parent_fd,
+                    parent=parent,
+                )
 
-            with patch("orchestrate.machine_bootstrap.os.link", interfering_link):
+            with patch("orchestrate.machine_bootstrap._commit_staged_no_replace", interfering_commit):
                 with self.assertRaises(FileExistsError):
                     _atomic_write_owned(
                         target,
@@ -442,18 +456,130 @@ class MachineBootstrapTests(unittest.TestCase):
             replacement = layout.install_root / "oversized-receipt"
             replacement.write_bytes(layout.install_receipt.read_bytes() + b" " * (8 * 1024 * 1024))
             fault = ResolvedPathFault(layout.install_receipt)
-            real_open = os.open
-
-            def swapping_open(candidate: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            def swapping_open(candidate: Path) -> None:
                 if fault.matches(candidate):
                     os.replace(replacement, layout.install_receipt)
-                return real_open(candidate, flags, mode, dir_fd=dir_fd)
 
-            with patch("orchestrate.machine_bootstrap.os.open", swapping_open):
-                with _VenvBinding(layout) as binding:
-                    self.assertFalse(_install_receipt_matches(layout, binding))
+            with patch("orchestrate.machine_bootstrap._before_bounded_file_open", swapping_open):
+                with _SourceBinding(layout) as source, _VenvBinding(layout) as binding:
+                    self.assertFalse(_install_receipt_matches(layout, binding, source))
 
             self.assertEqual(fault.interceptions, 1)
+
+    @unittest.skipIf(sys.platform == "win32", "uses a POSIX directory replacement analogue")
+    def test_editable_install_is_bound_to_the_reviewed_source_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            layout.scripts_root.mkdir(parents=True)
+            write_pyvenv_config(layout)
+            (layout.scripts_root / "python.exe").write_bytes(b"fixture")
+            replacement = root / "replacement-checkout"
+            (replacement / "src" / "orchestrate").mkdir(parents=True)
+            (replacement / "src" / "orchestrate" / "__init__.py").write_text(
+                "replacement = True\n", encoding="utf-8"
+            )
+            (replacement / "pyproject.toml").write_text(
+                "[project]\nname='replacement'\n", encoding="utf-8"
+            )
+            original = root / "reviewed-checkout"
+            observed: list[str] = []
+
+            def swapping_runner(
+                argv: tuple[str, ...], **_: object
+            ) -> subprocess.CompletedProcess[object]:
+                if "--editable" in argv:
+                    os.replace(layout.source_root, original)
+                    layout.source_root.symlink_to(replacement, target_is_directory=True)
+                    observed.append((Path(argv[-1]) / "pyproject.toml").read_text(encoding="utf-8"))
+                    layout.command_path.write_bytes(b"fixture")
+                return subprocess.CompletedProcess(argv, 0)
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=FakeUserPath(),
+                    resolver=lambda *_: None,
+                    runner=swapping_runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_source_identity_changed")
+            self.assertEqual(observed, ["[project]\nname='fixture'\n"])
+            self.assertFalse(layout.install_receipt.exists())
+
+    def test_source_change_and_receipt_tampering_cannot_skip_install(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            install_ready_files(layout)
+            store = FakeUserPath(str(layout.bin_root))
+            runner = SyntheticInstaller(layout)
+            (layout.source_root / "pyproject.toml").write_text(
+                "[project]\nname='changed'\n", encoding="utf-8"
+            )
+
+            with self.assertRaises(OrchestrateError) as changed:
+                ensure_machine(
+                    layout=layout,
+                    path_store=store,
+                    resolver=resolving(layout, store),
+                    runner=runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+            self.assertEqual(changed.exception.code, "machine_bootstrap_receipt_identity_unproven")
+            self.assertEqual(runner.calls, [])
+
+            install_ready_files(layout)
+            receipt = json.loads(layout.install_receipt.read_text(encoding="utf-8"))
+            receipt["sourceRoot"] = str(layout.source_root.parent / "laundered")
+            layout.install_receipt.write_text(
+                json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(OrchestrateError) as tampered:
+                ensure_machine(
+                    layout=layout,
+                    path_store=store,
+                    resolver=resolving(layout, store),
+                    runner=runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+            self.assertEqual(tampered.exception.code, "machine_bootstrap_receipt_identity_unproven")
+            self.assertEqual(runner.calls, [])
+
+    @unittest.skipIf(sys.platform == "win32", "uses a POSIX directory-symlink analogue")
+    def test_staging_refuses_a_substituted_parent_before_creating_a_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = root / "bin"
+            parent.mkdir()
+            original = root / "original-bin"
+            unrelated = root / "unrelated"
+            unrelated.mkdir()
+            target = parent / "orchestrate.cmd"
+            fault = ResolvedPathFault(parent)
+
+            def substitute(candidate: Path) -> None:
+                if fault.matches(candidate):
+                    os.replace(parent, original)
+                    parent.symlink_to(unrelated, target_is_directory=True)
+
+            with patch("orchestrate.machine_bootstrap._before_staging_parent_open", substitute):
+                with self.assertRaises(OrchestrateError) as held:
+                    _atomic_write_owned(
+                        target,
+                        b"launcher",
+                        executable=False,
+                        expected_target=None,
+                    )
+
+            self.assertEqual(fault.interceptions, 1)
+            self.assertEqual(held.exception.code, "machine_bootstrap_parent_identity_changed")
+            self.assertEqual(list(unrelated.iterdir()), [])
+            self.assertEqual(list(original.iterdir()), [])
 
     def test_machine_bootstrap_serializes_concurrent_first_install(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -534,6 +660,28 @@ class MachineBootstrapTests(unittest.TestCase):
 
             self.assertEqual(result.actions, ("registered_user_path",))
             self.assertEqual(store.value.split(";"), [str(layout.bin_root), foreign_one, foreign_two])
+
+    def test_healthy_fast_path_requires_the_dedicated_path_entry_first(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            install_ready_files(layout)
+            foreign = r"C:\foreign"
+            store = FakeUserPath(f"{foreign};{layout.bin_root}")
+            runner = SyntheticInstaller(layout)
+
+            self.assertFalse(machine_ready(layout, store, resolver=resolving(layout, store)))
+            result = ensure_machine(
+                layout=layout,
+                path_store=store,
+                resolver=resolving(layout, store),
+                runner=runner,
+                platform="win32",
+                version_info=(3, 13),
+            )
+
+            self.assertEqual(result.actions, ("registered_user_path",))
+            self.assertEqual(store.value.split(";"), [str(layout.bin_root), foreign])
+            self.assertEqual(runner.calls, [])
 
     def test_registry_path_repair_preserves_reg_sz_kind_and_unrelated_text(self) -> None:
         winreg = ModuleType("winreg")
@@ -824,14 +972,25 @@ class MachineBootstrapTests(unittest.TestCase):
             layout.wsl_shim.unlink()
             store = FakeUserPath()
             fault = ResolvedPathFault(layout.wsl_shim)
-            real_link = os.link
+            real_commit = _commit_staged_no_replace
 
-            def link(candidate: str, target: str, *, follow_symlinks: bool = True) -> None:
-                if fault.matches(target):
+            def link(
+                temporary_name: str,
+                target_name: str,
+                *,
+                parent_fd: int | None,
+                parent: Path,
+            ) -> None:
+                if fault.matches(target_name, relative_to=parent):
                     raise PermissionError("synthetic launcher denial")
-                real_link(candidate, target, follow_symlinks=follow_symlinks)
+                real_commit(
+                    temporary_name,
+                    target_name,
+                    parent_fd=parent_fd,
+                    parent=parent,
+                )
 
-            with patch("orchestrate.machine_bootstrap.os.link", link):
+            with patch("orchestrate.machine_bootstrap._commit_staged_no_replace", link):
                 with self.assertRaises(OrchestrateError) as held:
                     ensure_machine(
                         layout=layout,

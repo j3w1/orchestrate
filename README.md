@@ -46,7 +46,7 @@ From the reviewed orchestrate checkout, use its small first-entry script and nam
 py -3.13 .\bootstrap.py setup --project C:\path\to\your-project --json
 ```
 
-That one command verifies Python 3.13, creates the dedicated environment under `%LOCALAPPDATA%\orchestrate\venv`, pins the interpreter and its parent chain across every pip step, installs the reviewed checkout in editable mode, installs the Windows and WSL-facing launchers, and puts `%LOCALAPPDATA%\orchestrate\bin` first on the **user** PATH. Windows keeps non-reparse handles open without write/delete sharing; the synthetic POSIX boundary executes through the pinned interpreter descriptor. It then continues the requested project setup. It refuses redirected or unprovable install paths, never edits the system PATH, and never falls through to another Python environment.
+That one command verifies Python 3.13, creates the dedicated environment under `%LOCALAPPDATA%\orchestrate\venv`, binds the interpreter and reviewed checkout across every pip step, installs that checkout in editable mode, installs the Windows and WSL-facing launchers, and puts `%LOCALAPPDATA%\orchestrate\bin` first on the **user** PATH. Windows holds the interpreter for actual read access without write/delete sharing, passes its exact path as the process application name, and checks the same identities before and after every effect; the synthetic POSIX boundary executes through the pinned interpreter descriptor and passes the checkout through its pinned directory descriptor. It then continues the requested project setup. It refuses redirected or unprovable install paths, never edits the system PATH, and never falls through to another Python environment.
 
 Open a new terminal after the first run. The normal command is now available:
 
@@ -55,9 +55,9 @@ orchestrate doctor
 orchestrate setup --project C:\path\to\another-project --json
 ```
 
-Every later `setup` begins with one user-PATH lookup and bounded fixed launcher/receipt checks. The private v3 receipt binds the installed command's file identity, size, and digest, so a replacement command cannot poison that fast path. When the checks are healthy setup performs no environment creation, pip command, install, scan, upgrade, or model call, and prints no bootstrap message. Missing launchers can be created, while a mismatching existing launcher is preserved and refused for inspection. PATH repair preserves the existing `REG_SZ` or `REG_EXPAND_SZ` kind and unrelated entry text through one transactional compare-and-replace plus read-back. Concurrent setup commands share one machine-bootstrap lock, so the editable install is performed once and the follower reuses it.
+Every later `setup` begins with one user-PATH lookup, one command lookup, fixed launcher/receipt reads, and a bounded identity scan of the reviewed checkout. The private v4 receipt binds its own canonical payload digest, the checkout root identity and tree digest, the environment, and the installed command's file identity, size, and digest. A changed or replaced checkout, swapped receipt, or replacement command therefore cannot enter the healthy path. When the checks are healthy setup performs no environment creation, pip command, install, upgrade, write, or model call and prints no bootstrap message. Missing launchers can be created, while a mismatching existing launcher is preserved and refused for inspection. PATH repair preserves the existing `REG_SZ` or `REG_EXPAND_SZ` kind and unrelated entry text through one transactional compare-and-replace plus read-back. The healthy path requires the one dedicated PATH entry to be first. Concurrent setup commands share one machine-bootstrap lock, so the editable install is performed once and the follower reuses it.
 
-If bootstrap stops, its error names the failed phase. Correct the reported Python, filesystem, pip/network, or user-registry problem and run the same checkout command again. Safe completed phases are reused; an unreceipted command left by an interrupted installer is deliberately not guessed to be owned. An incomplete, redirected, or identity-mismatched dedicated venv is never silently overwritten—move that one `%LOCALAPPDATA%\orchestrate\venv` directory aside after inspection, then rerun. Likewise, inspect and move aside an unrecognized receipt, command, or launcher entry rather than asking bootstrap to overwrite it. `doctor` is read-only unless you explicitly select an active probe; the active compatibility probe has additional disposable-project requirements and is not needed for normal work.
+If bootstrap stops, its error names the failed phase. Correct the reported Python, filesystem, pip/network, or user-registry problem and run the same checkout command again. Safe completed phases are reused; an unreceipted command left by an interrupted installer is deliberately not guessed to be owned. An incomplete, redirected, or identity-mismatched dedicated venv is never silently overwritten—move that one `%LOCALAPPDATA%\orchestrate\venv` directory aside after inspection, then rerun. Likewise, inspect and move aside an unrecognized receipt, command, or launcher entry rather than asking bootstrap to overwrite it. A deliberately moved or updated reviewed checkout changes the v4 source identity: after review, move aside both `%LOCALAPPDATA%\orchestrate\install.json` and `%LOCALAPPDATA%\orchestrate\venv\Scripts\orchestrate.exe`, then rerun that checkout's `bootstrap.py` to create a newly bound installation. `doctor` is read-only unless you explicitly select an active probe; the active compatibility probe has additional disposable-project requirements and is not needed for normal work.
 
 ### Agent skill
 
@@ -213,10 +213,12 @@ Live Orca exercises are separate. Use only disposable projects for mutations, ne
 
 ## Updating
 
-Pull a reviewed revision in the same checkout. Because the dedicated installation is editable, the normal setup check converges through that checkout without another manual install:
+Pull a reviewed revision in the same checkout. The source-bound receipt will refuse to bless changed checkout bytes automatically. After review, move aside the prior receipt and installed command, then let the checkout entry perform the new editable install:
 
 ```powershell
 git pull --ff-only
+Move-Item "$env:LOCALAPPDATA\orchestrate\install.json" "$env:LOCALAPPDATA\orchestrate\install.json.reviewed-old"
+Move-Item "$env:LOCALAPPDATA\orchestrate\venv\Scripts\orchestrate.exe" "$env:LOCALAPPDATA\orchestrate\venv\Scripts\orchestrate.exe.reviewed-old"
 py -3.13 .\bootstrap.py setup --project C:\path\to\your-project --json
 orchestrate doctor
 ```
