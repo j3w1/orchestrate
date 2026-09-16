@@ -40,15 +40,18 @@ jobs:
         shell: bash
         run: |
           python -m build
-          python -m venv smoke-env
+          python -m venv .venv-smoke
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            smoke-env/Scripts/python -m pip install dist/*.whl
-            smoke-env/Scripts/orchestrate --help
-            smoke-env/Scripts/orchestrate doctor --help
-            smoke-env/Scripts/orchestrate-wsl --help
+            .venv-smoke/Scripts/python -m pip install dist/*.whl
+            .venv-smoke/Scripts/orchestrate --help
+            .venv-smoke/Scripts/orchestrate doctor --help
+            .venv-smoke/Scripts/orchestrate-wsl --help
           else
-            smoke-env/bin/python -m pip install dist/*.whl
-            smoke-env/bin/orchestrate --help
-            smoke-env/bin/orchestrate doctor --help
-            smoke-env/bin/orchestrate-wsl --help
+            .venv-smoke/bin/python -m pip install dist/*.whl
+            .venv-smoke/bin/orchestrate --help
+            .venv-smoke/bin/orchestrate doctor --help
+            .venv-smoke/bin/orchestrate-wsl --help
+            .venv-smoke/bin/python tests/installed_machine_smoke.py \
+              --source-root "$PWD" \
+              --command "$PWD/.venv-smoke/bin/orchestrate"
           fi

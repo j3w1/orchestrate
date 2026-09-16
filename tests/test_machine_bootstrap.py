@@ -38,6 +38,7 @@ from orchestrate.machine_bootstrap import (
     _NATIVE_WIN32_PROVIDER,
     _SIMULATED_WIN32_PROVIDER,
     _opened_file_identity_matches,
+    _read_bounded_regular,
     _read_bounded_regular_file,
     _receipt_value,
     _run_bound_step,
@@ -47,6 +48,7 @@ from orchestrate.machine_bootstrap import (
     _VenvBinding,
     _windows_shim_text,
     _wsl_shim_text,
+    default_layout,
     ensure_machine,
     machine_ready,
     register_user_path,
@@ -276,6 +278,189 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(len(runner.calls), call_count)
             self.assertEqual(len(store.writes), write_count)
             self.assertEqual(store.value.split(";").count(str(layout.bin_root)), 1)
+
+    def test_installed_default_layout_uses_authenticated_source_and_continues_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            store = FakeUserPath(r"C:\existing")
+            runner = SyntheticInstaller(layout)
+            resolver = resolving(layout, store)
+            first = ensure_machine(
+                layout=layout,
+                path_store=store,
+                resolver=resolver,
+                runner=runner,
+                platform="win32",
+                version_info=(3, 13),
+            )
+            self.assertEqual(first.state, "repaired")
+            call_count = len(runner.calls)
+            write_count = len(store.writes)
+            installed_module = (
+                root
+                / "wheel-env"
+                / "lib"
+                / "python3.13"
+                / "site-packages"
+                / "orchestrate"
+                / "machine_bootstrap.py"
+            )
+            profile = SimpleNamespace(
+                root=root / "project",
+                path=root / "project" / ".orchestrate.json",
+                digest="sha256:fixture",
+                selection_source="initial-setup-selection",
+                selection_history_digest="sha256:history",
+                value={"reader": {"kind": "repository"}, "instructions": [], "taskEntrypoints": []},
+            )
+            calls: list[str] = []
+
+            def installed_machine() -> MachineBootstrapResult:
+                calls.append("machine")
+                return ensure_machine(
+                    path_store=store,
+                    resolver=resolver,
+                    runner=runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            def project(*_: object, **__: object) -> SimpleNamespace:
+                calls.append("project")
+                return profile
+
+            with patch("orchestrate.machine_bootstrap.__file__", os.fspath(installed_module)), patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": os.fspath(root / "local")},
+            ):
+                selected = default_layout()
+                self.assertEqual(selected.source_root, layout.source_root.resolve())
+                self.assertTrue(selected.source_from_install_record)
+                read_count = store.reads
+                ready = installed_machine()
+                self.assertEqual(ready.state, "ready")
+                self.assertEqual(store.reads, read_count + 1)
+                calls.clear()
+                with patch("orchestrate.cli.ensure_machine", installed_machine), patch(
+                    "orchestrate.cli.setup_project", project
+                ), patch("orchestrate.cli.StateStore", return_value=nullcontext()), redirect_stdout(
+                    io.StringIO()
+                ):
+                    self.assertEqual(main(["setup", "--json"]), 0)
+
+            self.assertEqual(calls, ["machine", "project"])
+            self.assertEqual(len(runner.calls), call_count)
+            self.assertEqual(len(store.writes), write_count)
+
+    def test_installed_default_layout_rejects_moved_persisted_source_definitively(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            install_ready_files(layout)
+            layout.source_root.rename(root / "moved-checkout")
+            installed_module = root / "wheel-env" / "site-packages" / "orchestrate" / "machine_bootstrap.py"
+
+            with patch("orchestrate.machine_bootstrap.__file__", os.fspath(installed_module)), patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": os.fspath(root / "local")},
+            ):
+                with self.assertRaises(OrchestrateError) as held:
+                    default_layout()
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_persisted_source_unavailable")
+            self.assertEqual(held.exception.data["disposition"], "definitive")  # type: ignore[index]
+            self.assertIn("bootstrap.py", held.exception.data["recovery"])  # type: ignore[index]
+
+    def test_installed_default_layout_classifies_temporary_source_read_failure_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            install_ready_files(layout)
+            installed_module = root / "wheel-env" / "site-packages" / "orchestrate" / "machine_bootstrap.py"
+
+            def unavailable(path: Path, limit: int) -> bytes:
+                if path == layout.source_root / "pyproject.toml":
+                    raise OrchestrateError(
+                        "synthetic access failure",
+                        code="machine_bootstrap_safe_io_unavailable",
+                        data={
+                            "component": "boundedRead.open",
+                            "expected": "valid-handle",
+                            "observed": "unavailable",
+                            "errno": errno.EACCES,
+                        },
+                    )
+                return _read_bounded_regular(path, limit)
+
+            with patch("orchestrate.machine_bootstrap.__file__", os.fspath(installed_module)), patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": os.fspath(root / "local")},
+            ), patch("orchestrate.machine_bootstrap._read_bounded_regular", unavailable):
+                with self.assertRaises(OrchestrateError) as held:
+                    default_layout()
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_persisted_source_unavailable")
+            self.assertEqual(held.exception.data["disposition"], "retryable")  # type: ignore[index]
+
+    def test_installed_default_layout_rejects_rewritten_receipt_without_anchor_grant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            install_ready_files(layout)
+            receipt = json.loads(layout.install_receipt.read_text(encoding="utf-8"))
+            receipt["sourceRoot"] = os.fspath(root / "attacker-checkout")
+            payload = {key: item for key, item in receipt.items() if key != "receiptSha256"}
+            canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            receipt["receiptSha256"] = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+            layout.install_receipt.write_bytes(
+                (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+            )
+            installed_module = root / "wheel-env" / "site-packages" / "orchestrate" / "machine_bootstrap.py"
+
+            with patch("orchestrate.machine_bootstrap.__file__", os.fspath(installed_module)), patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": os.fspath(root / "local")},
+            ):
+                with self.assertRaises(OrchestrateError) as held:
+                    default_layout()
+
+            self.assertEqual(
+                held.exception.code,
+                "machine_bootstrap_persisted_source_identity_unproven",
+            )
+            self.assertEqual(held.exception.data["disposition"], "definitive")  # type: ignore[index]
+
+    def test_installed_default_layout_rejects_changed_persisted_source_without_reinstall(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            install_ready_files(layout)
+            store = FakeUserPath(str(layout.bin_root))
+            runner = SyntheticInstaller(layout)
+            layout.source_root.joinpath("pyproject.toml").write_text(
+                "[project]\nname='changed'\n",
+                encoding="utf-8",
+            )
+            installed_module = root / "wheel-env" / "site-packages" / "orchestrate" / "machine_bootstrap.py"
+
+            with patch("orchestrate.machine_bootstrap.__file__", os.fspath(installed_module)), patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": os.fspath(root / "local")},
+            ):
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        path_store=store,
+                        resolver=resolving(layout, store),
+                        runner=runner,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_persisted_source_changed")
+            self.assertEqual(held.exception.data["disposition"], "definitive")  # type: ignore[index]
+            self.assertEqual(runner.calls, [])
+            self.assertEqual(store.writes, [])
 
     @unittest.skipIf(
         sys.platform == "win32",

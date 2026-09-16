@@ -46,6 +46,7 @@ MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_ARCHIVE_BYTES = 72 * 1024 * 1024
 MACHINE_LOCK_NAME = ".machine-bootstrap.lock"
 SIMULATED_WIN32_PROVIDER_ENV = "ORCHESTRATE_BOOTSTRAP_PROVIDER"
+SIMULATED_USER_PATH_ENV = "ORCHESTRATE_BOOTSTRAP_SIMULATED_USER_PATH"
 _SIMULATED_EFFECT_GUARD = threading.RLock()
 
 
@@ -194,6 +195,29 @@ class RegistryUserPathStore:
             )
         except (AttributeError, OSError):
             pass
+
+
+class _SimulatedUserPathStore:
+    """Read-only user-PATH input for the host-neutral installed-wheel smoke.
+
+    This adapter is reachable only through the explicitly selected simulated
+    Win32 provider.  It cannot repair PATH, so an incomplete synthetic machine
+    fails instead of mutating either the process environment or a registry.
+    """
+
+    def read(self) -> UserPathValue:
+        return UserPathValue(os.environ[SIMULATED_USER_PATH_ENV], 2)
+
+    def replace(self, expected: UserPathValue, value: str) -> None:
+        raise OrchestrateError(
+            "The simulated user PATH is read-only; complete the disposable machine fixture before invoking the installed command",
+            code="machine_bootstrap_simulated_path_read_only",
+            data={
+                "component": "simulatedUserPath.mutation",
+                "expected": "read-only-completed-fixture",
+                "observed": "repair-requested",
+            },
+        )
 
 
 def _replace_windows_registry_value(expected: UserPathValue, value: str) -> None:
@@ -360,6 +384,7 @@ class MachineLayout:
     bin_root: Path
     windows_shim: Path
     wsl_shim: Path
+    source_from_install_record: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,7 +416,19 @@ def default_layout(
     state_root = Path(local_app_data) / "orchestrate-state"
     venv_root = install_root / "venv"
     scripts_root = venv_root / "Scripts"
-    selected_source = Path(__file__).resolve().parents[2] if source_root is None else source_root.resolve()
+    module_source = Path(__file__).resolve().parents[2]
+    if source_root is not None:
+        selected_source = source_root.resolve()
+        source_from_install_record = False
+    elif _module_matches_checkout(module_source):
+        selected_source = module_source
+        source_from_install_record = False
+    else:
+        selected_source = _persisted_source_root(
+            install_root / "install.json",
+            state_root / "machine-install.json",
+        )
+        source_from_install_record = True
     return MachineLayout(
         source_root=selected_source,
         install_root=install_root,
@@ -404,6 +441,7 @@ def default_layout(
         bin_root=install_root / "bin",
         windows_shim=install_root / "bin" / WINDOWS_COMMAND,
         wsl_shim=install_root / "bin" / WSL_COMMAND,
+        source_from_install_record=source_from_install_record,
     )
 
 
@@ -459,7 +497,24 @@ def register_user_path(store: UserPathStore, entry: Path) -> bool:
 
 
 def _default_resolver(command: str, path: str) -> str | None:
+    if _active_platform_provider().name == _SIMULATED_WIN32_PROVIDER.name:
+        for entry in path.split(";") if path else ():
+            directory = Path(os.path.expandvars(entry.strip().strip('"')))
+            candidate = directory / f"{command}.cmd"
+            try:
+                info = candidate.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                return os.fspath(candidate)
+        return None
     return shutil.which(command, path=os.path.expandvars(path))
+
+
+def _default_user_path_store(provider: _PlatformProvider) -> UserPathStore:
+    if provider.name == _SIMULATED_WIN32_PROVIDER.name and SIMULATED_USER_PATH_ENV in os.environ:
+        return _SimulatedUserPathStore()
+    return RegistryUserPathStore()
 
 
 def _same_path(left: str | Path, right: str | Path) -> bool:
@@ -3109,6 +3164,301 @@ def _read_canonical_json(path: Path, limit: int) -> object | None:
     return _read_canonical_json_diagnostic(path, limit)[0]
 
 
+_INSTALL_RECEIPT_KEYS = {
+    "schema",
+    "installationId",
+    "sourceRoot",
+    "sourceTreeSha256",
+    "sourceArchiveSha256",
+    "sourceArchiveSize",
+    "venvRoot",
+    "pythonPath",
+    "pyvenvConfigSha256",
+    "commandSize",
+    "commandSha256",
+    "receiptSha256",
+}
+_INSTALL_RECEIPT_STRING_KEYS = (
+    "schema",
+    "installationId",
+    "sourceRoot",
+    "sourceTreeSha256",
+    "sourceArchiveSha256",
+    "venvRoot",
+    "pythonPath",
+    "pyvenvConfigSha256",
+    "commandSha256",
+    "receiptSha256",
+)
+_INSTALL_RECEIPT_INTEGER_KEYS = ("commandSize", "sourceArchiveSize")
+
+
+def _receipt_form_mismatch(
+    value: object,
+    receipt_form: str,
+) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return {
+            "component": "receipt.form",
+            "expected": "canonical-object",
+            "observed": receipt_form,
+        }
+    if set(value) != _INSTALL_RECEIPT_KEYS:
+        return {
+            "component": "receipt.fields",
+            "expected": sorted(_INSTALL_RECEIPT_KEYS),
+            "observed": sorted(str(key) for key in value),
+        }
+    for key in _INSTALL_RECEIPT_STRING_KEYS:
+        if not isinstance(value.get(key), str):
+            return {
+                "component": f"receipt.{key}.form",
+                "expected": "string",
+                "observed": type(value.get(key)).__name__,
+            }
+    for key in _INSTALL_RECEIPT_INTEGER_KEYS:
+        if type(value.get(key)) is not int or value[key] < 0:
+            return {
+                "component": f"receipt.{key}.form",
+                "expected": "nonnegative-integer",
+                "observed": type(value.get(key)).__name__,
+            }
+    if value["schema"] != INSTALL_RECEIPT_SCHEMA:
+        return {
+            "component": "receipt.schema",
+            "expected": INSTALL_RECEIPT_SCHEMA,
+            "observed": value["schema"],
+        }
+    if not value["installationId"]:
+        return {
+            "component": "receipt.installationId.form",
+            "expected": "nonempty-string",
+            "observed": "empty-string",
+        }
+    if not _receipt_integrity_matches(value):
+        payload = {key: item for key, item in value.items() if key != "receiptSha256"}
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return {
+            "component": "receipt.receiptSha256",
+            "expected": f"sha256:{hashlib.sha256(canonical).hexdigest()}",
+            "observed": value["receiptSha256"],
+        }
+    return None
+
+
+def _module_matches_checkout(candidate: Path) -> bool:
+    """Recognize only the checkout whose source file is executing this call."""
+
+    def regular_marker(path: Path) -> bool:
+        info = path.lstat()
+        return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and not _is_reparse(info)
+
+    expected_module = candidate / "src" / "orchestrate" / "machine_bootstrap.py"
+    markers = (
+        candidate / "bootstrap.py",
+        candidate / "pyproject.toml",
+        candidate / "src" / "orchestrate" / "__init__.py",
+    )
+    try:
+        return os.path.samefile(expected_module, Path(__file__).resolve()) and all(
+            regular_marker(marker) for marker in markers
+        )
+    except OSError:
+        return False
+
+
+def _source_record_disposition(exc: OrchestrateError) -> str:
+    data = exc.data or {}
+    absent_or_structural_errno = {
+        errno.ENOENT,
+        errno.ENOTDIR,
+        errno.ELOOP,
+        errno.ENAMETOOLONG,
+        errno.EISDIR,
+        errno.ENXIO,
+    }
+    absent_or_structural_winerror = {2, 3, 123, 1920, 267, 4390}
+    return (
+        "definitive"
+        if data.get("errno") in absent_or_structural_errno
+        or data.get("winerror") in absent_or_structural_winerror
+        or data.get("component") in {
+            "boundedRead.nodeType",
+            "boundedRead.handleSize",
+            "boundedRead.fileIdentity",
+            "installNode.nodeType",
+        }
+        else "retryable"
+    )
+
+
+def _persisted_source_failure(
+    message: str,
+    *,
+    code: str,
+    disposition: str,
+    component: str,
+    observed: object,
+    cause: OrchestrateError | None = None,
+) -> OrchestrateError:
+    data: dict[str, object] = {
+        "component": component,
+        "expected": "authenticated-reviewed-source-record",
+        "observed": observed,
+        "disposition": disposition,
+        "recovery": (
+            "Review the checkout move or change, move aside the documented receipt, archive, command, and anchor files, then rerun that checkout's bootstrap.py first-entry path"
+            if disposition == "definitive"
+            else "Correct the temporary filesystem or sharing failure and rerun the installed command"
+        ),
+    }
+    if cause is not None:
+        data["cause"] = cause.code
+        if cause.data:
+            data["causeData"] = cause.data
+    return OrchestrateError(message, code=code, data=data)
+
+
+def _read_required_source_record(path: Path, *, component: str) -> object:
+    try:
+        raw = _read_bounded_regular(path, MAX_INSTALL_RECEIPT_BYTES)
+    except OrchestrateError as exc:
+        raise _persisted_source_failure(
+            "The installed command cannot read its authenticated reviewed-source record",
+            code="machine_bootstrap_persisted_source_unavailable",
+            disposition=_source_record_disposition(exc),
+            component=component,
+            observed=exc.code,
+            cause=exc,
+        ) from exc
+    try:
+        text = raw.decode("utf-8", errors="strict")
+        value = json.loads(
+            text,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise _persisted_source_failure(
+            "The installed command's reviewed-source record is malformed",
+            code="machine_bootstrap_persisted_source_identity_unproven",
+            disposition="definitive",
+            component=component,
+            observed="malformed-json",
+        ) from exc
+    canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if raw != canonical:
+        raise _persisted_source_failure(
+            "The installed command's reviewed-source record is not canonical",
+            code="machine_bootstrap_persisted_source_identity_unproven",
+            disposition="definitive",
+            component=component,
+            observed="noncanonical-json",
+        )
+    return value
+
+
+def _prove_persisted_source_root(root: Path) -> None:
+    provider = _active_platform_provider()
+    pin: object | None = None
+    try:
+        before = _path_identity(root, directory=True)
+        pin = provider.open_path_pin(root, directory=True)
+        after = _path_identity(root, directory=True)
+        if not _same_identity(before, after, directory=True):
+            raise OrchestrateError(
+                "The persisted reviewed checkout changed while its root was opened",
+                code="machine_bootstrap_source_identity_changed",
+                data={
+                    "component": "persistedSourceRoot.fileIdentity",
+                    "expected": repr(before),
+                    "observed": repr(after),
+                },
+            )
+        for marker in (
+            root / "pyproject.toml",
+            root / "src" / "orchestrate" / "__init__.py",
+        ):
+            _read_bounded_regular(marker, MAX_SOURCE_BYTES)
+        final = _path_identity(root, directory=True)
+        if not _same_identity(before, final, directory=True):
+            raise OrchestrateError(
+                "The persisted reviewed checkout changed while its markers were read",
+                code="machine_bootstrap_source_identity_changed",
+                data={
+                    "component": "persistedSourceRoot.fileIdentity",
+                    "expected": repr(before),
+                    "observed": repr(final),
+                },
+            )
+    except OrchestrateError as exc:
+        raise _persisted_source_failure(
+            "The installed command cannot use the recorded reviewed checkout; rerun from that checkout's bootstrap.py first-entry path after the documented recovery",
+            code="machine_bootstrap_persisted_source_unavailable",
+            disposition=_source_record_disposition(exc),
+            component="persistedSourceRoot",
+            observed=exc.code,
+            cause=exc,
+        ) from exc
+    finally:
+        if pin is not None:
+            provider.close_path_pin(pin)
+
+
+def _persisted_source_root(receipt_path: Path, anchor_path: Path) -> Path:
+    receipt = _read_required_source_record(receipt_path, component="receipt.sourceRecord")
+    mismatch = _receipt_form_mismatch(receipt, "canonical")
+    if mismatch is not None:
+        raise _persisted_source_failure(
+            "The installed command cannot authenticate the receipt that records its reviewed checkout",
+            code="machine_bootstrap_persisted_source_identity_unproven",
+            disposition="definitive",
+            component=str(mismatch["component"]),
+            observed=mismatch["observed"],
+        )
+    assert isinstance(receipt, dict)
+    try:
+        with _AnchorAncestryBinding(anchor_path) as anchor_ancestry:
+            anchor = _read_required_source_record(
+                anchor_path,
+                component="anchor.sourceRecord",
+            )
+            anchor_ancestry.verify()
+    except OrchestrateError as exc:
+        if exc.code.startswith("machine_bootstrap_persisted_source_"):
+            raise
+        raise _persisted_source_failure(
+            "The installed command cannot prove the host-local anchor for its reviewed checkout",
+            code="machine_bootstrap_persisted_source_unavailable",
+            disposition=_source_record_disposition(exc),
+            component="anchor.sourceRecord",
+            observed=exc.code,
+            cause=exc,
+        ) from exc
+    expected_anchor = _anchor_value(receipt)
+    if not isinstance(anchor, dict) or anchor != expected_anchor:
+        raise _persisted_source_failure(
+            "The installed command's reviewed-source receipt does not match its host-local anchor",
+            code="machine_bootstrap_persisted_source_identity_unproven",
+            disposition="definitive",
+            component="anchor.sourceRecord",
+            observed="mismatch",
+        )
+    source_value = receipt["sourceRoot"]
+    assert isinstance(source_value, str)
+    source_root = Path(source_value)
+    if "\x00" in source_value or not source_root.is_absolute():
+        raise _persisted_source_failure(
+            "The installed command's reviewed-source receipt contains a non-absolute checkout path",
+            code="machine_bootstrap_persisted_source_identity_unproven",
+            disposition="definitive",
+            component="receipt.sourceRoot",
+            observed="non-absolute",
+        )
+    _prove_persisted_source_root(source_root)
+    return source_root
+
+
 def _receipt_match_diagnostic(
     layout: MachineLayout,
     binding: _VenvBinding,
@@ -3131,89 +3481,10 @@ def _receipt_match_diagnostic(
         layout.install_receipt,
         MAX_INSTALL_RECEIPT_BYTES,
     )
-    expected_keys = {
-        "schema",
-        "installationId",
-        "sourceRoot",
-        "sourceTreeSha256",
-        "sourceArchiveSha256",
-        "sourceArchiveSize",
-        "venvRoot",
-        "pythonPath",
-        "pyvenvConfigSha256",
-        "commandSize",
-        "commandSha256",
-        "receiptSha256",
-    }
-    if not isinstance(value, dict):
-        return mismatch(
-            {
-                "component": "receipt.form",
-                "expected": "canonical-object",
-                "observed": receipt_form,
-            }
-        )
-    if set(value) != expected_keys:
-        return mismatch(
-            {
-                "component": "receipt.fields",
-                "expected": sorted(expected_keys),
-                "observed": sorted(str(key) for key in value),
-            }
-        )
-    string_keys = (
-        "schema",
-        "installationId",
-        "sourceRoot",
-        "sourceTreeSha256",
-        "sourceArchiveSha256",
-        "venvRoot",
-        "pythonPath",
-        "pyvenvConfigSha256",
-        "commandSha256",
-        "receiptSha256",
-    )
-    integer_keys = (
-        "commandSize",
-        "sourceArchiveSize",
-    )
-    for key in string_keys:
-        if not isinstance(value.get(key), str):
-            return mismatch(
-                {
-                    "component": f"receipt.{key}.form",
-                    "expected": "string",
-                    "observed": type(value.get(key)).__name__,
-                }
-            )
-    for key in integer_keys:
-        if type(value.get(key)) is not int or value[key] < 0:
-            return mismatch(
-                {
-                    "component": f"receipt.{key}.form",
-                    "expected": "nonnegative-integer",
-                    "observed": type(value.get(key)).__name__,
-                }
-            )
-    if not value["installationId"]:
-        return mismatch(
-            {
-                "component": "receipt.installationId.form",
-                "expected": "nonempty-string",
-                "observed": "empty-string",
-            }
-        )
-    if not _receipt_integrity_matches(value):
-        payload = {key: item for key, item in value.items() if key != "receiptSha256"}
-        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        expected_digest = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
-        return mismatch(
-            {
-                "component": "receipt.receiptSha256",
-                "expected": expected_digest,
-                "observed": value["receiptSha256"],
-            }
-        )
+    form_mismatch = _receipt_form_mismatch(value, receipt_form)
+    if form_mismatch is not None:
+        return mismatch(form_mismatch)
+    assert isinstance(value, dict)
     expected = _receipt_value(binding, source, archive, installation_id=value["installationId"])
     for key in sorted(expected):
         if key == "receiptSha256":
@@ -5116,7 +5387,7 @@ def ensure_machine(
             code="machine_bootstrap_python_unsupported",
         )
     selected_layout = default_layout() if layout is None else layout
-    selected_store = RegistryUserPathStore() if path_store is None else path_store
+    selected_store = _default_user_path_store(provider) if path_store is None else path_store
     if machine_ready(selected_layout, selected_store, resolver=resolver):
         return MachineBootstrapResult("ready")
 
@@ -5240,6 +5511,18 @@ def ensure_machine(
                 command_target = _target_identity(selected_layout.command_path)
                 if not receipt_matches:
                     if receipt_target is not None:
+                        if selected_layout.source_from_install_record and receipt_diagnostic.get(
+                            "component"
+                        ) in {"receipt.sourceRoot", "receipt.sourceTreeSha256"}:
+                            raise OrchestrateError(
+                                "The recorded reviewed checkout changed after installation; rerun from that checkout's bootstrap.py first-entry path after the documented recovery",
+                                code="machine_bootstrap_persisted_source_changed",
+                                data={
+                                    **receipt_diagnostic,
+                                    "disposition": "definitive",
+                                    "recovery": "Review the checkout move or change, move aside the documented receipt, archive, command, and anchor files, then rerun that checkout's bootstrap.py first-entry path",
+                                },
+                            )
                         raise OrchestrateError(
                             "The existing machine-install receipt does not prove the current command; move it aside after inspection and rerun setup",
                             code="machine_bootstrap_receipt_identity_unproven",

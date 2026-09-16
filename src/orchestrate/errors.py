@@ -247,6 +247,8 @@ def _sanitize_machine_diagnostic(code: str, data: Mapping[str, Any] | None) -> d
         "handleIdentity",
         "linkedIdentity",
         "receiptWriteCause",
+        "recovery",
+        "cause",
     ):
         value = incoming.get(key)
         if isinstance(value, str):
@@ -256,6 +258,9 @@ def _sanitize_machine_diagnostic(code: str, data: Mapping[str, Any] | None) -> d
         if value is None or type(value) in {bool, int}:
             if value is not None:
                 result[key] = value
+    disposition = incoming.get("disposition")
+    if disposition in {"definitive", "retryable"}:
+        result["disposition"] = disposition
     operations = incoming.get("operations")
     if isinstance(operations, (list, tuple)):
         result["operations"] = [_sanitize_operation(item) for item in operations[:8]]
