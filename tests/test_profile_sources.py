@@ -26,6 +26,7 @@ from orchestrate.safeio import (
     PROJECT_SOURCE_ENVIRONMENTAL_ERRNOS,
     PROJECT_SOURCE_STRUCTURAL_ERRNOS,
     ProjectSourceState,
+    project_source_error_codes_state,
     project_source_error_state,
     project_source_state,
     read_project_bytes,
@@ -281,6 +282,22 @@ class ProfileAndSourceTests(DisposableRepo):
                     project_source_error_state(sharing_error),
                     ProjectSourceState.UNAVAILABLE,
                 )
+        for windows_error in (2, 3):
+            with self.subTest(windows_error=windows_error):
+                self.assertEqual(
+                    project_source_error_codes_state(None, windows_error),
+                    ProjectSourceState.ABSENT,
+                )
+        for windows_error in (123, 1920, 267, 4390):
+            with self.subTest(windows_error=windows_error):
+                self.assertEqual(
+                    project_source_error_codes_state(None, windows_error),
+                    ProjectSourceState.CHANGED,
+                )
+        self.assertEqual(
+            project_source_error_codes_state(None, 32),
+            ProjectSourceState.UNAVAILABLE,
+        )
         self.assertEqual(
             project_source_error_state(OSError(987654, "unknown")),
             ProjectSourceState.UNAVAILABLE,

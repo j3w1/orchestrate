@@ -43,6 +43,7 @@ from orchestrate.machine_bootstrap import (
     _receipt_value,
     _run_bound_step,
     _SourceBinding,
+    _source_tree_records,
     _target_identity,
     _verify_committed_stage,
     _VenvBinding,
@@ -404,6 +405,154 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(fault.interceptions, 1)
             self.assertEqual(held.exception.code, "machine_bootstrap_persisted_source_unavailable")
             self.assertEqual(held.exception.data["disposition"], "retryable")  # type: ignore[index]
+
+    def test_installed_public_entry_classifies_nested_source_access_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            nested = layout.source_root / "docs" / "notes.txt"
+            nested.parent.mkdir()
+            nested.write_bytes(b"receipt-bound nested source\n")
+            install_ready_files(layout)
+            store = FakeUserPath(str(layout.bin_root))
+            runner = SyntheticInstaller(layout)
+            installed_module = (
+                root
+                / "wheel-env"
+                / "site-packages"
+                / "orchestrate"
+                / "machine_bootstrap.py"
+            )
+            fault = ResolvedPathFault(nested)
+
+            def deny_nested_source(path: Path) -> None:
+                if fault.matches(path):
+                    raise PermissionError(
+                        errno.EACCES,
+                        "synthetic nested source access failure",
+                        path,
+                    )
+
+            installed_context = (
+                patch(
+                    "orchestrate.machine_bootstrap.__file__",
+                    os.fspath(installed_module),
+                ),
+                patch.dict(
+                    os.environ,
+                    {"LOCALAPPDATA": os.fspath(root / "local")},
+                ),
+            )
+            with installed_context[0], installed_context[1], patch(
+                "orchestrate.machine_bootstrap._before_bounded_file_open",
+                side_effect=deny_nested_source,
+            ):
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        path_store=store,
+                        resolver=resolving(layout, store),
+                        runner=runner,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
+
+            self.assertEqual(
+                held.exception.code,
+                "machine_bootstrap_persisted_source_unavailable",
+            )
+            self.assertEqual(held.exception.data["disposition"], "retryable")  # type: ignore[index]
+            self.assertIn("rerun", held.exception.data["recovery"])  # type: ignore[index]
+            self.assertEqual(fault.interceptions, 1)
+            self.assertEqual(store.reads, 1)
+            self.assertEqual(store.writes, [])
+            self.assertEqual(runner.calls, [])
+            self.assertFalse((layout.install_root / ".machine-bootstrap.lock").exists())
+
+            with patch(
+                "orchestrate.machine_bootstrap.__file__",
+                os.fspath(installed_module),
+            ), patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": os.fspath(root / "local")},
+            ):
+                recovered = ensure_machine(
+                    path_store=store,
+                    resolver=resolving(layout, store),
+                    runner=runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(recovered.state, "ready")
+            self.assertEqual(store.reads, 2)
+            self.assertEqual(store.writes, [])
+            self.assertEqual(runner.calls, [])
+
+    def test_installed_public_entry_preserves_nested_symlink_failure_after_restoration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            nested = layout.source_root / "docs" / "notes.txt"
+            nested.parent.mkdir()
+            original = b"receipt-bound nested source\n"
+            nested.write_bytes(original)
+            install_ready_files(layout)
+            outside = root / "outside-notes.txt"
+            outside.write_bytes(original)
+            nested.unlink()
+            nested.symlink_to(outside)
+            store = FakeUserPath(str(layout.bin_root))
+            runner = SyntheticInstaller(layout)
+            installed_module = (
+                root
+                / "wheel-env"
+                / "site-packages"
+                / "orchestrate"
+                / "machine_bootstrap.py"
+            )
+            fault = ResolvedPathFault(layout.source_root)
+
+            def restore_after_structural_failure(path: Path) -> list[tuple[str, Path]]:
+                try:
+                    return _source_tree_records(path)
+                except OrchestrateError:
+                    if fault.matches(path):
+                        nested.unlink()
+                        nested.write_bytes(original)
+                    raise
+
+            with patch(
+                "orchestrate.machine_bootstrap.__file__",
+                os.fspath(installed_module),
+            ), patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": os.fspath(root / "local")},
+            ), patch(
+                "orchestrate.machine_bootstrap._source_tree_records",
+                side_effect=restore_after_structural_failure,
+            ):
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        path_store=store,
+                        resolver=resolving(layout, store),
+                        runner=runner,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
+
+            self.assertEqual(fault.interceptions, 1)
+            self.assertFalse(nested.is_symlink())
+            self.assertEqual(nested.read_bytes(), original)
+            self.assertEqual(
+                held.exception.code,
+                "machine_bootstrap_persisted_source_unavailable",
+            )
+            self.assertEqual(held.exception.data["disposition"], "definitive")  # type: ignore[index]
+            self.assertIn("bootstrap.py", held.exception.data["recovery"])  # type: ignore[index]
+            self.assertEqual(store.reads, 1)
+            self.assertEqual(store.writes, [])
+            self.assertEqual(runner.calls, [])
+            self.assertFalse((layout.install_root / ".machine-bootstrap.lock").exists())
 
     def test_installed_default_layout_rejects_rewritten_receipt_without_anchor_grant(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

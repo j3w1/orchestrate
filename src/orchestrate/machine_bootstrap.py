@@ -29,6 +29,12 @@ import io
 from typing import Protocol
 
 from .errors import OrchestrateError
+from .safeio import (
+    ProjectSourceState,
+    project_source_error_codes_state,
+    project_source_error_state,
+    project_source_failure_state,
+)
 from .state import RunLock
 
 
@@ -2067,6 +2073,7 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
 
     def __init__(self, layout: MachineLayout) -> None:
         self._provider = _active_platform_provider()
+        self._persisted = layout.source_from_install_record
         self.path = layout.source_root
         self.operation = _operation_diagnostic(
             "source-binding",
@@ -2078,10 +2085,10 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
             self.path,
             path_form="native-path" if self._provider.native_windows else "proc-self-fd",
         )
-        self._identity = _path_identity(self.path, directory=True)
         self._descriptor: int | None = None
         self._windows_handle: object | None = None
         try:
+            self._identity = _path_identity(self.path, directory=True)
             if self._provider.native_windows:
                 self._windows_handle = self._provider.open_path_pin(self.path, directory=True)
                 self.effect_path = self.path
@@ -2131,9 +2138,23 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
         except BaseException as exc:
             _diagnostic_exception_note(exc, {"operations": [self.operation]})
             self.close()
+            if self._persisted and isinstance(exc, (OrchestrateError, OSError)):
+                if isinstance(exc, OrchestrateError) and exc.code.startswith(
+                    "machine_bootstrap_persisted_source_"
+                ):
+                    raise
+                raise _persisted_source_access_failure(exc) from exc
             raise
 
     def verify(self) -> None:
+        try:
+            self._verify()
+        except (OrchestrateError, OSError) as exc:
+            if self._persisted:
+                raise _persisted_source_access_failure(exc) from exc
+            raise
+
+    def _verify(self) -> None:
         try:
             current = _path_identity(self.path, directory=True)
         except OrchestrateError as exc:
@@ -3267,27 +3288,73 @@ def _module_matches_checkout(candidate: Path) -> bool:
         return False
 
 
-def _source_record_disposition(exc: OrchestrateError) -> str:
-    data = exc.data or {}
-    absent_or_structural_errno = {
-        errno.ENOENT,
-        errno.ENOTDIR,
-        errno.ELOOP,
-        errno.ENAMETOOLONG,
-        errno.EISDIR,
-        errno.ENXIO,
+def _source_record_state(exc: BaseException) -> ProjectSourceState:
+    """Recover one source-local state without replacing direct errno evidence."""
+
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    environmental = False
+    semantic_change = False
+    structural_components = {
+        "boundedRead.nodeType",
+        "boundedRead.handleSize",
+        "boundedRead.fileIdentity",
+        "installNode.nodeType",
+        "retainedFile.formAndSize",
+        "retainedFile.bytes",
+        "sourceEntry.nodeType",
+        "sourceTree.byteCount",
+        "sourceTree.fileCount",
+        "sourceTree.sha256",
     }
-    absent_or_structural_winerror = {2, 3, 123, 1920, 267, 4390}
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, OSError):
+            state = project_source_error_state(current)
+            if state in {ProjectSourceState.ABSENT, ProjectSourceState.CHANGED}:
+                return state
+            environmental = True
+        if isinstance(current, OrchestrateError):
+            carried = project_source_failure_state(current)
+            if carried in {ProjectSourceState.ABSENT, ProjectSourceState.CHANGED}:
+                return carried
+            if carried == ProjectSourceState.UNAVAILABLE:
+                environmental = True
+            data = current.data or {}
+            error_number = data.get("errno")
+            winerror = data.get("winerror")
+            if type(error_number) is int or type(winerror) is int:
+                state = project_source_error_codes_state(
+                    error_number if type(error_number) is int else None,
+                    winerror if type(winerror) is int else None,
+                )
+                if state in {ProjectSourceState.ABSENT, ProjectSourceState.CHANGED}:
+                    return state
+                environmental = True
+            component = data.get("component")
+            observed = data.get("observed")
+            if component in structural_components:
+                semantic_change = True
+            elif component == "sourceRoot.fileIdentity" and observed not in {
+                "unavailable",
+                "unavailable-or-redirected",
+            }:
+                semantic_change = True
+            if current.code == "machine_bootstrap_source_identity_changed":
+                semantic_change = True
+        current = current.__cause__ or current.__context__
+    if environmental:
+        return ProjectSourceState.UNAVAILABLE
+    if semantic_change:
+        return ProjectSourceState.CHANGED
+    return ProjectSourceState.UNAVAILABLE
+
+
+def _source_record_disposition(exc: BaseException) -> str:
     return (
         "definitive"
-        if data.get("errno") in absent_or_structural_errno
-        or data.get("winerror") in absent_or_structural_winerror
-        or data.get("component") in {
-            "boundedRead.nodeType",
-            "boundedRead.handleSize",
-            "boundedRead.fileIdentity",
-            "installNode.nodeType",
-        }
+        if _source_record_state(exc)
+        in {ProjectSourceState.ABSENT, ProjectSourceState.CHANGED}
         else "retryable"
     )
 
@@ -3299,7 +3366,7 @@ def _persisted_source_failure(
     disposition: str,
     component: str,
     observed: object,
-    cause: OrchestrateError | None = None,
+    cause: BaseException | None = None,
 ) -> OrchestrateError:
     data: dict[str, object] = {
         "component": component,
@@ -3313,22 +3380,46 @@ def _persisted_source_failure(
         ),
     }
     if cause is not None:
-        data["cause"] = cause.code
-        if cause.data:
+        data["cause"] = (
+            cause.code if isinstance(cause, OrchestrateError) else type(cause).__name__
+        )
+        if isinstance(cause, OrchestrateError) and cause.data:
             data["causeData"] = cause.data
+        elif isinstance(cause, OSError):
+            data["causeData"] = {
+                "errno": cause.errno,
+                "winerror": getattr(cause, "winerror", None),
+            }
     return OrchestrateError(message, code=code, data=data)
+
+
+def _persisted_source_access_failure(exc: BaseException) -> OrchestrateError:
+    if isinstance(exc, OrchestrateError) and exc.code.startswith(
+        "machine_bootstrap_persisted_source_"
+    ):
+        return exc
+    return _persisted_source_failure(
+        "The installed command cannot prove the complete recorded reviewed checkout; rerun from that checkout's bootstrap.py first-entry path after the documented recovery",
+        code="machine_bootstrap_persisted_source_unavailable",
+        disposition=_source_record_disposition(exc),
+        component="persistedSourceTree",
+        observed=(exc.code if isinstance(exc, OrchestrateError) else type(exc).__name__),
+        cause=exc,
+    )
 
 
 def _read_required_source_record(path: Path, *, component: str) -> object:
     try:
         raw = _read_bounded_regular(path, MAX_INSTALL_RECEIPT_BYTES)
-    except OrchestrateError as exc:
+    except (OrchestrateError, OSError) as exc:
         raise _persisted_source_failure(
             "The installed command cannot read its authenticated reviewed-source record",
             code="machine_bootstrap_persisted_source_unavailable",
             disposition=_source_record_disposition(exc),
             component=component,
-            observed=exc.code,
+            observed=(
+                exc.code if isinstance(exc, OrchestrateError) else type(exc).__name__
+            ),
             cause=exc,
         ) from exc
     try:
@@ -3391,13 +3482,15 @@ def _prove_persisted_source_root(root: Path) -> None:
                     "observed": repr(final),
                 },
             )
-    except OrchestrateError as exc:
+    except (OrchestrateError, OSError) as exc:
         raise _persisted_source_failure(
             "The installed command cannot use the recorded reviewed checkout; rerun from that checkout's bootstrap.py first-entry path after the documented recovery",
             code="machine_bootstrap_persisted_source_unavailable",
             disposition=_source_record_disposition(exc),
             component="persistedSourceRoot",
-            observed=exc.code,
+            observed=(
+                exc.code if isinstance(exc, OrchestrateError) else type(exc).__name__
+            ),
             cause=exc,
         ) from exc
     finally:
@@ -4644,7 +4737,11 @@ def machine_ready(
                 and _shim_matches(layout.windows_shim, _windows_shim_text())
                 and _shim_matches(layout.wsl_shim, _wsl_shim_text())
             )
-    except OrchestrateError:
+    except OrchestrateError as exc:
+        if layout.source_from_install_record and exc.code.startswith(
+            "machine_bootstrap_persisted_source_"
+        ):
+            raise
         return False
 
 
@@ -5048,6 +5145,9 @@ def _run_bound_step(
 
 
 def _require_source_checkout(layout: MachineLayout) -> None:
+    if layout.source_from_install_record:
+        _prove_persisted_source_root(layout.source_root)
+        return
     if not (layout.source_root / "pyproject.toml").is_file() or not (
         layout.source_root / "src" / "orchestrate" / "__init__.py"
     ).is_file():

@@ -46,6 +46,11 @@ jobs:
             .venv-smoke/Scripts/orchestrate --help
             .venv-smoke/Scripts/orchestrate doctor --help
             .venv-smoke/Scripts/orchestrate-wsl --help
+            .venv-smoke/Scripts/python tests/installed_machine_smoke.py \
+              --source-root "$PWD" \
+              --command "$PWD/.venv-smoke/Scripts/orchestrate.exe" \
+              --provider posix \
+              --skip-cli
           else
             .venv-smoke/bin/python -m pip install dist/*.whl
             .venv-smoke/bin/orchestrate --help
