@@ -132,7 +132,7 @@ orchestrate implement "Integrate the exact bounded milestone" --plan milestone-p
   --allow-exceptional-capacity --capacity-reason "Five independent platform fixtures" --json
 ```
 
-If that command stops before launch, `resume` accepts the same two flags and binds the grant to the existing Run and exact plan digest. A grant never transfers to a changed plan. Uncertain launches and unresolved releases keep occupying their slots; orchestrate does not launch a replacement merely because local completion was observed.
+If that command stops before launch, `resume` accepts the same two flags and binds the grant to the existing Run and exact plan digest. Surrounding reason whitespace is normalized, so repeating the same command remains idempotent; a different normalized reason conflicts. A grant never transfers to a changed plan. Uncertain launches and unresolved releases keep occupying their slots; orchestrate does not launch a replacement merely because local completion was observed.
 
 The command waits in the foreground. Ctrl-C stops controller waiting; it does not pretend the active worker stopped. Continue with the Run ID:
 

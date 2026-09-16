@@ -29,6 +29,7 @@ from .coordination import (
     milestone_plan_relative_path,
     native_task_create_arguments,
     require_current_review,
+    validate_immutable_worker_start_readback,
     validate_owned_session_readback,
     validate_release_receipt,
     validate_session_readback,
@@ -1632,6 +1633,8 @@ def _validate_native_milestone_settlement(
     run: RunRecord,
     worker: object,
     outcome: Literal["succeeded", "failed"],
+    *,
+    initial_readback: Mapping[str, Any],
 ) -> None:
     readback = client.run_json(
         "orchestration",
@@ -1656,12 +1659,43 @@ def _validate_native_milestone_settlement(
     ).fetchall()
     try:
         if not release_rows:
+            validate_immutable_worker_start_readback(initial_readback, readback)
             validate_owned_session_readback(session, readback)
         elif len(release_rows) == 1 and release_rows[0]["status"] == "applied" and release_rows[0]["response_json"]:
             # A crash may follow an already validated release but precede the
-            # local outcome transaction. Rejoin its exact settled identities;
-            # the stored release receipt is validated before finalization.
+            # local outcome transaction. Rejoin every immutable identity still
+            # present after Orca's required terminal detachment; the stored
+            # release receipt is validated before finalization.
+            try:
+                stored_release = json.loads(release_rows[0]["response_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise OrchestrateError(
+                    "Milestone settlement has a malformed applied release receipt",
+                    code="release_unconfirmed",
+                ) from exc
+            if not isinstance(stored_release, Mapping):
+                raise OrchestrateError(
+                    "Milestone settlement has a malformed applied release receipt",
+                    code="release_unconfirmed",
+                )
+            current_resource = _result(readback).get("terminalResource")
+            released_detachment = (
+                isinstance(current_resource, Mapping)
+                and current_resource.get("ownershipState") == "released"
+                and current_resource.get("releaseState") == "released"
+            )
+            validate_immutable_worker_start_readback(
+                initial_readback,
+                readback,
+                allow_released_terminal_detachment=released_detachment,
+            )
             validate_session_readback(session, readback)
+            decision = validate_release_receipt(session, stored_release, worker_readback=readback)
+            if decision.state == "uncertain":
+                raise OrchestrateError(
+                    "Milestone settlement still has an uncertain applied release",
+                    code="release_unconfirmed",
+                )
         else:
             raise OrchestrateError(
                 "Milestone settlement has an unresolved release transition",
@@ -2401,6 +2435,71 @@ def _validate_milestone_worker_readback(
             worktree_id=actual_worktree,
             terminal_id=terminal,
         )
+    result = _result(readback)
+    readback_dispatch = result.get("dispatch")
+    readback_worker = result.get("worker")
+    readback_resource = result.get("terminalResource")
+    readback_terminal = result.get("terminal")
+    if (
+        not isinstance(readback_dispatch, Mapping)
+        or not isinstance(readback_worker, Mapping)
+        or not isinstance(readback_resource, Mapping)
+    ):
+        raise OrchestrateError("worker-show omitted immutable start identity", code="native_worker_binding_mismatch")
+    optional_expected_fields = (
+        (readback_dispatch, "agent", choice.agent),
+        (readback_dispatch, "agentIdentity", choice.agent),
+        (readback_worker, "dispatchId", dispatch_id),
+        (readback_worker, "dispatch_id", dispatch_id),
+        (readback_worker, "runId", run.native_run_id),
+        (readback_worker, "run_id", run.native_run_id),
+        (readback_worker, "taskId", binding.task_id),
+        (readback_worker, "task_id", binding.task_id),
+        (readback_worker, "worktreeId", actual_worktree),
+        (readback_worker, "worktree_id", actual_worktree),
+        (readback_worker, "agentTerminalHandle", terminal),
+        (readback_worker, "agent_terminal_handle", terminal),
+        (readback_worker, "agent", choice.agent),
+        (readback_worker, "agentIdentity", choice.agent),
+    )
+    changed_optional = [
+        field
+        for component, field, expected in optional_expected_fields
+        if field in component and component.get(field) != expected
+    ]
+    if changed_optional:
+        raise OrchestrateError(
+            "worker-show changed an observed worker or Dispatch start identity",
+            code="native_worker_binding_mismatch",
+            data={"fields": changed_optional},
+        )
+    if readback_terminal is not None:
+        if not isinstance(readback_terminal, Mapping):
+            raise OrchestrateError("worker-show returned a malformed terminal identity", code="native_worker_binding_mismatch")
+        if (
+            readback_terminal.get("handle") != terminal
+            or ("worktreeId" in readback_terminal and readback_terminal.get("worktreeId") != actual_worktree)
+            or ("agentIdentity" in readback_terminal and readback_terminal.get("agentIdentity") != choice.agent)
+        ):
+            raise OrchestrateError("worker-show terminal does not match the accepted start", code="native_worker_binding_mismatch")
+        for field in ("ptyId", "incarnationId", "executionHostId"):
+            if field in readback_terminal and (
+                not isinstance(readback_terminal[field], str) or not readback_terminal[field]
+            ):
+                raise OrchestrateError(
+                    "worker-show terminal has a malformed immutable identity",
+                    code="native_worker_binding_mismatch",
+                    data={"field": f"terminal.{field}"},
+                )
+    for field in ("endpointId", "endpointIncarnation"):
+        if field in readback_resource and readback_resource[field] is not None and (
+            not isinstance(readback_resource[field], str) or not readback_resource[field]
+        ):
+            raise OrchestrateError(
+                "worker-show terminal resource has a malformed endpoint identity",
+                code="native_worker_binding_mismatch",
+                data={"field": f"terminalResource.{field}"},
+            )
     return resource
 
 
@@ -2998,6 +3097,7 @@ def _process_milestone_delivery(
     client: OrcaClient,
     store: StateStore,
     run: RunRecord,
+    profile: ProjectProfile,
     plan: MilestonePlan,
     delivery_id: str,
     messages: list[dict[str, Any]],
@@ -3072,6 +3172,41 @@ def _process_milestone_delivery(
             plan,
             integration_owner=NativeTaskBinding(owner.key, run.task_id, (), "first-increment-owner"),
         )
+        binding = bindings[task.key]
+        choice = load_role_roster().choice(task.role)
+        try:
+            initial_readback = json.loads(worker["readback_json"])
+        except (TypeError, json.JSONDecodeError) as exc:  # type: ignore[index]
+            raise OrchestrateError(
+                "Milestone worker lost its validated start readback",
+                code="settlement_mismatch",
+            ) from exc
+        if not isinstance(initial_readback, Mapping):
+            raise OrchestrateError(
+                "Milestone worker start readback is malformed",
+                code="settlement_mismatch",
+            )
+        try:
+            initial_resource = _validate_milestone_worker_readback(
+                initial_readback,
+                run,
+                profile,
+                binding,
+                choice,
+                dispatch_id=worker["dispatch_id"],  # type: ignore[index]
+                actual_worktree=worker["worktree_id"],  # type: ignore[index]
+                terminal=worker["terminal_handle"],  # type: ignore[index]
+            )
+        except OrchestrateError as exc:
+            raise OrchestrateError(
+                "Milestone worker start readback no longer proves its immutable binding",
+                code="settlement_mismatch",
+            ) from exc
+        if initial_resource.resource_id != worker["resource_id"]:  # type: ignore[index]
+            raise OrchestrateError(
+                "Milestone worker start readback changed its resource identity",
+                code="settlement_mismatch",
+            )
         scheduler.validate_settlement_readback(
             str(run.native_run_id),
             plan,
@@ -3086,6 +3221,7 @@ def _process_milestone_delivery(
             replace(run, task_id=worker["task_id"], dispatch_id=worker["dispatch_id"]),
             worker,
             outcome,  # type: ignore[arg-type]
+            initial_readback=initial_readback,
         )
         result_outcome, result_digest = _read_milestone_result(store, run, plan, task, worker, payload)
         release_state = _release_milestone_worker(
@@ -3959,7 +4095,7 @@ def _supervise_milestone(
                 "The bound milestone Delivery is missing its immutable journal",
                 code="delivery_journal_missing",
             )
-        run = _process_milestone_delivery(client, store, run, plan, run.delivery_id, messages)
+        run = _process_milestone_delivery(client, store, run, profile, plan, run.delivery_id, messages)
         if not store.pending_questions(run.local_id):
             _ack_if_resolved(client, store, run)
             run = store.get_run(run.local_id)
@@ -3991,7 +4127,7 @@ def _supervise_milestone(
                 continue
             store.journal_delivery(current.local_id, delivery_id, payload, messages)
             current = store.update_run(current.local_id, delivery_id=delivery_id)
-            current = _process_milestone_delivery(client, store, current, plan, delivery_id, messages)
+            current = _process_milestone_delivery(client, store, current, profile, plan, delivery_id, messages)
             if store.pending_questions(current.local_id):
                 break
             _ack_if_resolved(client, store, current)

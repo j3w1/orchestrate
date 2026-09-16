@@ -1360,6 +1360,201 @@ class ReleaseDecision:
     recovery_metadata: Mapping[str, Any] | None = None
 
 
+_DISPATCH_START_IDENTITY_FIELDS = (
+    "id",
+    "runId",
+    "run_id",
+    "taskId",
+    "task_id",
+    "agent",
+    "agentIdentity",
+)
+_WORKER_START_IDENTITY_FIELDS = (
+    "id",
+    "dispatchId",
+    "dispatch_id",
+    "runId",
+    "run_id",
+    "taskId",
+    "task_id",
+    "worktreeId",
+    "worktree_id",
+    "agentTerminalHandle",
+    "agent_terminal_handle",
+    "agent",
+    "agentIdentity",
+)
+_TERMINAL_START_IDENTITY_FIELDS = (
+    "handle",
+    "ptyId",
+    "incarnationId",
+    "worktreeId",
+    "executionHostId",
+    "agentIdentity",
+)
+_TERMINAL_RESOURCE_START_IDENTITY_FIELDS = (
+    "id",
+    "originDispatchId",
+    "ownerDispatchId",
+    "terminalHandle",
+    "worktreeId",
+    "endpointId",
+    "endpointIncarnation",
+)
+_START_OPTION_IDENTITY_FIELDS = (
+    "worktree",
+    "resolvedWorktreeId",
+    "terminal",
+    "agent",
+    "setup",
+    "setupSource",
+)
+
+
+def _same_json_identity(expected: object, actual: object) -> bool:
+    if type(expected) is not type(actual):
+        return False
+    if isinstance(expected, Mapping):
+        return set(expected) == set(actual) and all(  # type: ignore[arg-type]
+            _same_json_identity(expected[key], actual[key])  # type: ignore[index]
+            for key in expected
+        )
+    if isinstance(expected, list):
+        return len(expected) == len(actual) and all(  # type: ignore[arg-type]
+            _same_json_identity(left, right)
+            for left, right in zip(expected, actual, strict=True)  # type: ignore[arg-type]
+        )
+    return expected == actual
+
+
+def _require_observed_start_fields(
+    initial: Mapping[str, Any],
+    current: Mapping[str, Any],
+    fields: Sequence[str],
+    *,
+    component: str,
+) -> None:
+    changed = [
+        f"{component}.{field}"
+        for field in fields
+        if field in initial
+        and (field not in current or not _same_json_identity(initial[field], current[field]))
+    ]
+    if changed:
+        raise OrchestrateError(
+            "worker-show changed immutable worker-start identity",
+            code="release_unconfirmed",
+            data={"fields": changed},
+        )
+
+
+def validate_immutable_worker_start_readback(
+    initial_payload: Mapping[str, Any],
+    current_payload: Mapping[str, Any],
+    *,
+    allow_released_terminal_detachment: bool = False,
+) -> None:
+    """Rejoin every supported immutable field observed in the validated start readback.
+
+    Runtime status, execution stage, ownership/release state, timestamps, archive,
+    and liveness are deliberately excluded.  A supported optional field becomes
+    mandatory once the initial worker-show reported it.
+    """
+
+    initial = _result(initial_payload)
+    current = _result(current_payload)
+    initial_dispatch = initial.get("dispatch")
+    current_dispatch = current.get("dispatch")
+    initial_worker = initial.get("worker")
+    current_worker = current.get("worker")
+    initial_resource = initial.get("terminalResource")
+    current_resource = current.get("terminalResource")
+    if not all(
+        isinstance(item, Mapping)
+        for item in (
+            initial_dispatch,
+            current_dispatch,
+            initial_worker,
+            current_worker,
+            initial_resource,
+            current_resource,
+        )
+    ):
+        raise OrchestrateError(
+            "worker-show omitted immutable worker-start identity",
+            code="release_unconfirmed",
+        )
+    assert isinstance(initial_dispatch, Mapping)
+    assert isinstance(current_dispatch, Mapping)
+    assert isinstance(initial_worker, Mapping)
+    assert isinstance(current_worker, Mapping)
+    assert isinstance(initial_resource, Mapping)
+    assert isinstance(current_resource, Mapping)
+    _require_observed_start_fields(
+        initial_dispatch,
+        current_dispatch,
+        _DISPATCH_START_IDENTITY_FIELDS,
+        component="dispatch",
+    )
+    _require_observed_start_fields(
+        initial_worker,
+        current_worker,
+        _WORKER_START_IDENTITY_FIELDS,
+        component="worker",
+    )
+    _require_observed_start_fields(
+        initial_resource,
+        current_resource,
+        _TERMINAL_RESOURCE_START_IDENTITY_FIELDS,
+        component="terminalResource",
+    )
+
+    initial_options = initial_worker.get("startOptions")
+    current_options = current_worker.get("startOptions")
+    if not isinstance(initial_options, Mapping) or not isinstance(current_options, Mapping):
+        raise OrchestrateError(
+            "worker-show omitted immutable worker startOptions",
+            code="release_unconfirmed",
+        )
+    _require_observed_start_fields(
+        initial_options,
+        current_options,
+        _START_OPTION_IDENTITY_FIELDS,
+        component="worker.startOptions",
+    )
+    initial_launch = initial_options.get("launch")
+    current_launch = current_options.get("launch")
+    if not isinstance(initial_launch, Mapping) or not isinstance(current_launch, Mapping):
+        raise OrchestrateError(
+            "worker-show omitted immutable requested/effective launch identity",
+            code="release_unconfirmed",
+        )
+    _require_observed_start_fields(
+        initial_launch,
+        current_launch,
+        ("requested", "effective"),
+        component="worker.startOptions.launch",
+    )
+
+    initial_terminal = initial.get("terminal")
+    current_terminal = current.get("terminal")
+    if isinstance(initial_terminal, Mapping):
+        if current_terminal is None and allow_released_terminal_detachment:
+            pass
+        elif not isinstance(current_terminal, Mapping):
+            raise OrchestrateError(
+                "worker-show lost the immutable worker terminal identity",
+                code="release_unconfirmed",
+            )
+        else:
+            _require_observed_start_fields(
+                initial_terminal,
+                current_terminal,
+                _TERMINAL_START_IDENTITY_FIELDS,
+                component="terminal",
+            )
+
+
 def validate_session_readback(session: WorkerSession, payload: Mapping[str, Any]) -> None:
     result = _result(payload)
     dispatch = result.get("dispatch")

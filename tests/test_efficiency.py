@@ -73,10 +73,22 @@ class EfficiencyTests(unittest.TestCase):
                     plan_digest="plan_a",
                     requested_limit=5,
                     allow_exceptional_capacity=True,
-                    capacity_reason="Five independent verification fixtures",
+                    capacity_reason="  Five independent verification fixtures  ",
                 )
                 self.assertEqual(grant["limit"], 5)  # type: ignore[index]
+                self.assertEqual(grant["reason"], "Five independent verification fixtures")  # type: ignore[index]
                 self.assertEqual(capacity_grant(store, run.local_id), grant)
+                self.assertEqual(
+                    ensure_capacity_grant(
+                        store,
+                        run,
+                        plan_digest="plan_a",
+                        requested_limit=5,
+                        allow_exceptional_capacity=True,
+                        capacity_reason="  Five independent verification fixtures  ",
+                    ),
+                    grant,
+                )
                 self.assertEqual(
                     ensure_capacity_grant(
                         store,
@@ -88,6 +100,16 @@ class EfficiencyTests(unittest.TestCase):
                     ),
                     grant,
                 )
+                with self.assertRaises(OrchestrateError) as changed_reason:
+                    ensure_capacity_grant(
+                        store,
+                        run,
+                        plan_digest="plan_a",
+                        requested_limit=5,
+                        allow_exceptional_capacity=True,
+                        capacity_reason="Five genuinely different verification fixtures",
+                    )
+                self.assertEqual(changed_reason.exception.code, "capacity_grant_conflict")
                 with self.assertRaises(OrchestrateError) as inherited:
                     ensure_capacity_grant(
                         store,

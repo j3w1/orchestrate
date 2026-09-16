@@ -906,6 +906,7 @@ class MilestoneClient:
                     "dispatchId": dispatch_id,
                     "worktreeId": worktree,
                     "agentTerminalHandle": terminal,
+                    "agent": record["launch"]["requested"]["agent"],  # type: ignore[index]
                     "lastError": "worker_failed" if failed else None,
                     "state": outcome if settled else "ready",
                     "stage": "settled" if settled else "input_accepted",
@@ -922,7 +923,14 @@ class MilestoneClient:
                         "setupSource": "existing_worktree",
                     },
                 },
-                "terminal": None if released else {"handle": terminal},
+                "terminal": None if released else {
+                    "handle": terminal,
+                    "ptyId": f"pty_{dispatch_id}",
+                    "incarnationId": f"incarnation_{dispatch_id}",
+                    "worktreeId": worktree,
+                    "executionHostId": "local",
+                    "agentIdentity": record["launch"]["requested"]["agent"],  # type: ignore[index]
+                },
                 "terminalResource": {
                     "id": resource,
                     "ownershipState": "released" if released else "owned",
@@ -932,6 +940,8 @@ class MilestoneClient:
                     "ownerDispatchId": dispatch_id,
                     "terminalHandle": terminal,
                     "worktreeId": worktree,
+                    "endpointId": f"endpoint_{dispatch_id}",
+                    "endpointIncarnation": f"endpoint_incarnation_{dispatch_id}",
                     "releaseRequestedAt": "2026-01-01T00:00:00Z" if released else None,
                     "releaseCompletedAt": "2026-01-01T00:00:01Z" if released else None,
                     "releaseError": None,
@@ -3116,6 +3126,140 @@ class ControllerTests(MilestoneRepo):
         self.assertEqual(recovered["verification"], "not_run")
         self.assertTrue(client.workers["dispatch_2"]["released"])
 
+    def _assert_post_check_worker_identity_hold(
+        self,
+        *,
+        outcome: str,
+        fault_path: tuple[str, ...],
+        remove: bool,
+    ) -> None:
+        objective = f"Revalidate immutable worker identity after {outcome} Delivery"
+        plan = self._write_milestone_plan(objective)
+
+        class PostCheckWorkerDriftClient(MilestoneClient):
+            inject_fault = False
+
+            def _worker_show(self, dispatch_id: str) -> dict[str, object]:
+                response = super()._worker_show(dispatch_id)
+                if self.inject_fault and dispatch_id == "dispatch_2" and not self.workers[dispatch_id]["released"]:
+                    target = response["result"]
+                    for key in fault_path[:-1]:
+                        target = target[key]  # type: ignore[index,assignment]
+                    if remove:
+                        del target[fault_path[-1]]  # type: ignore[index]
+                    else:
+                        target[fault_path[-1]] = "replacement"  # type: ignore[index]
+                return response
+
+            def run_json(self, *arguments: str, **keywords: object) -> dict[str, object]:
+                response = super().run_json(*arguments, **keywords)
+                if (
+                    arguments[:2] == ("orchestration", "check")
+                    and "--ack" not in arguments
+                    and response["result"].get("deliveryId") == "delivery_2"  # type: ignore[index,union-attr]
+                ):
+                    self.inject_fault = True
+                return response
+
+        client = PostCheckWorkerDriftClient(self.root, pause_after_owner=True)
+        implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        client.settle_without_delivery("dispatch_2", outcome=outcome)
+        starts_before = len(
+            [
+                call
+                for call in client.calls
+                if call[:2] == ("orchestration", "worker-start")
+                and call[call.index("--task") + 1] == "task_2"
+            ]
+        )
+        client.deliveries_paused = False
+        with self.assertRaises(OrchestrateError) as caught:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(caught.exception.code, "settlement_mismatch")
+        self.assertFalse(client.workers["dispatch_2"]["released"])
+        self.assertFalse(
+            any(
+                call[:2] == ("orchestration", "worker-release")
+                and call[call.index("--dispatch") + 1] == "dispatch_2"
+                for call in client.calls
+            )
+        )
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            worker = store.connection.execute(
+                "SELECT outcome, result_outcome, release_state FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            ).fetchone()
+            delivery = store.connection.execute(
+                "SELECT acked FROM deliveries WHERE run_local_id = ? AND delivery_id = 'delivery_2'",
+                (run.local_id,),
+            ).fetchone()
+            message = store.connection.execute(
+                "SELECT effect_status FROM delivery_messages WHERE run_local_id = ? AND delivery_id = 'delivery_2'",
+                (run.local_id,),
+            ).fetchone()
+            self.assertEqual((worker["outcome"], worker["result_outcome"], worker["release_state"]), (None, None, "owned"))
+            self.assertEqual(delivery["acked"], 0)
+            self.assertEqual(message["effect_status"], "observed")
+
+        client.inject_fault = False
+        recovered = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        self.assertEqual(
+            recovered["status"],
+            "worker_succeeded" if outcome == "succeeded" else "milestone_blocked",
+        )
+        releases = [
+            call
+            for call in client.calls
+            if call[:2] == ("orchestration", "worker-release")
+            and call[call.index("--dispatch") + 1] == "dispatch_2"
+        ]
+        task_starts = [
+            call
+            for call in client.calls
+            if call[:2] == ("orchestration", "worker-start")
+            and call[call.index("--task") + 1] == "task_2"
+        ]
+        self.assertEqual(len(releases), 1)
+        self.assertEqual(len(task_starts), starts_before)
+
+    @requires_native_windows_admission
+    def test_success_delivery_holds_changed_terminal_incarnation_until_exact_restoration(self) -> None:
+        self._assert_post_check_worker_identity_hold(
+            outcome="succeeded",
+            fault_path=("terminal", "incarnationId"),
+            remove=False,
+        )
+
+    @requires_native_windows_admission
+    def test_failed_delivery_holds_missing_endpoint_incarnation_until_exact_restoration(self) -> None:
+        self._assert_post_check_worker_identity_hold(
+            outcome="failed",
+            fault_path=("terminalResource", "endpointIncarnation"),
+            remove=True,
+        )
+
     @requires_native_windows_admission
     def test_grantless_historical_wide_run_reconciles_before_holding_new_launches(self) -> None:
         objective = "Reconcile a historical capacity-four worker before any replacement launch"
@@ -3198,13 +3342,28 @@ class ControllerTests(MilestoneRepo):
         self.assertFalse(any(call[:2] == ("orchestration", "worker-release") for call in new_calls))
         self.assertFalse(any(call[:2] == ("orchestration", "check") for call in new_calls))
 
+        client.deliveries_paused = True
+        granted = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            allow_exceptional_capacity=True,
+            capacity_reason="  authorize the remaining bounded review launch  ",
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        self.assertEqual(granted["status"], "milestone_waiting")
+        starts_after_grant = [call for call in client.calls if call[:2] == ("orchestration", "worker-start")]
+        self.assertEqual(len(starts_after_grant), starts_before + 1)
+        client.deliveries_paused = False
         completed = resume(
             self.root,
             None,
             client=client,  # type: ignore[arg-type]
             milestone_plan=plan,
             allow_exceptional_capacity=True,
-            capacity_reason="authorize the remaining bounded review launch",
+            capacity_reason="  authorize the remaining bounded review launch  ",
             wait_timeout_ms=60_000,
             require_context=False,
         )
@@ -3270,6 +3429,18 @@ class ControllerTests(MilestoneRepo):
             self.assertEqual((worker["outcome"], worker["result_outcome"], worker["release_state"]), (None, None, "owned"))
             self.assertEqual(release["status"], "applied")
 
+        client.workers["dispatch_2"]["launch"]["effective"]["effort"] = "replacement"  # type: ignore[index]
+        with self.assertRaises(OrchestrateError) as drifted:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(drifted.exception.code, "settlement_mismatch")
+        client.workers["dispatch_2"]["launch"]["effective"]["effort"] = "high"  # type: ignore[index]
         recovered = resume(
             self.root,
             None,
@@ -3287,6 +3458,13 @@ class ControllerTests(MilestoneRepo):
             and call[call.index("--dispatch") + 1] == "dispatch_2"
         ]
         self.assertEqual(len(releases), 1)
+        starts = [
+            call
+            for call in client.calls
+            if call[:2] == ("orchestration", "worker-start")
+            and call[call.index("--task") + 1] == "task_2"
+        ]
+        self.assertEqual(len(starts), 1)
 
     @requires_native_windows_admission
     def test_resume_repairs_missing_session_projection_idempotently(self) -> None:

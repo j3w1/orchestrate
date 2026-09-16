@@ -180,7 +180,8 @@ def ensure_capacity_grant(
 ) -> dict[str, object] | None:
     """Validate ordinary capacity or persist one exact exceptional per-Run grant."""
 
-    has_reason = isinstance(capacity_reason, str) and bool(capacity_reason.strip())
+    normalized_reason = capacity_reason.strip() if isinstance(capacity_reason, str) else None
+    has_reason = bool(normalized_reason)
     if allow_exceptional_capacity != has_reason:
         raise OrchestrateError(
             "Exceptional capacity requires both --allow-exceptional-capacity and --capacity-reason",
@@ -208,7 +209,7 @@ def ensure_capacity_grant(
                 "Exceptional capacity grant does not bind the selected plan and limit",
                 code="capacity_grant_conflict",
             )
-        if allow_exceptional_capacity and existing["reason"] != capacity_reason:
+        if allow_exceptional_capacity and existing["reason"] != normalized_reason:
             raise OrchestrateError("Exceptional capacity was already granted for a different reason", code="capacity_grant_conflict")
         return existing
     if not allow_exceptional_capacity or not has_reason:
@@ -217,9 +218,8 @@ def ensure_capacity_grant(
             code="exceptional_capacity_required",
             data={"planDigest": plan_digest, "requestedLimit": requested_limit},
         )
-    assert capacity_reason is not None
-    reason = capacity_reason.strip()
-    if len(reason) > 1000:
+    assert normalized_reason is not None
+    if len(normalized_reason) > 1000:
         raise OrchestrateError("Capacity reason exceeds the bounded 1000-character limit", code="capacity_reason_too_large")
     granted_at = utc_now()
     value: dict[str, object] = {
@@ -228,7 +228,7 @@ def ensure_capacity_grant(
         "runId": run.native_run_id,
         "planDigest": plan_digest,
         "limit": requested_limit,
-        "reason": reason,
+        "reason": normalized_reason,
         "grantedAt": granted_at,
     }
     store.record_stable_evidence(
