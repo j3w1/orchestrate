@@ -730,7 +730,11 @@ class NativeDagScheduler:
             if worker is None:
                 allowed_statuses = {"ready", "pending"}
             elif worker["outcome"] is None:
-                allowed_statuses = {"dispatched"}
+                # Native settlement can precede receipt of the lifecycle
+                # Delivery that authoritatively records the local outcome.
+                # The exact bound worker continues to occupy capacity until
+                # that Delivery is validated, released, and journaled.
+                allowed_statuses = {"dispatched", "completed", "failed"}
             else:
                 allowed_statuses = {"completed" if worker["outcome"] == "succeeded" else "failed"}
             if (

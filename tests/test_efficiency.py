@@ -267,14 +267,23 @@ class EfficiencyTests(unittest.TestCase):
                 original = project / "original.json"
                 productive = project / "productive.json"
                 fresh = project / "fresh.json"
+                newer = project / "newer.json"
                 diagnosis = project / "diagnosis.json"
+                diagnosis_two = project / "diagnosis-two.json"
                 write_record(original, "fixture 4 failed")
                 write_record(productive, "diagnosis isolated shape selection")
                 write_record(fresh, "new fixture 7 failed")
+                write_record(newer, "new fixture 9 failed")
                 diagnosis.write_text(
                     json.dumps({"diagnosis_evidence": "diagnosis isolated shape selection"}),
                     encoding="utf-8",
                 )
+                diagnosis_two.write_text(
+                    json.dumps({"diagnosis_evidence": "diagnosis isolated parser boundary"}),
+                    encoding="utf-8",
+                )
+                productive_two = project / "productive-two.json"
+                write_record(productive_two, "diagnosis isolated parser boundary")
 
                 decisions = [
                     run_intervention(project, run_id=run.local_id, task="task_1", record_path=original, diagnosis_path=None)["status"],
@@ -283,6 +292,14 @@ class EfficiencyTests(unittest.TestCase):
                     run_intervention(project, run_id=run.local_id, task="task_1", record_path=original, diagnosis_path=None)["status"],
                     run_intervention(project, run_id=run.local_id, task="task_1", record_path=productive, diagnosis_path=None)["status"],
                     run_intervention(project, run_id=run.local_id, task="task_1", record_path=fresh, diagnosis_path=None)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=original, diagnosis_path=None)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=productive, diagnosis_path=None)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=fresh, diagnosis_path=None)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=None, diagnosis_path=diagnosis_two)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=productive_two, diagnosis_path=None)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=newer, diagnosis_path=None)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=original, diagnosis_path=None)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=productive, diagnosis_path=None)["status"],
                 ]
             self.assertEqual(
                 decisions,
@@ -293,6 +310,14 @@ class EfficiencyTests(unittest.TestCase):
                     "unresolved",
                     "unresolved",
                     "correction_allowed",
+                    "unresolved",
+                    "unresolved",
+                    "diagnosis_required",
+                    "correction_allowed",
+                    "unresolved",
+                    "correction_allowed",
+                    "unresolved",
+                    "unresolved",
                 ],
             )
 

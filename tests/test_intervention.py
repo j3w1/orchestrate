@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 import json
 import sqlite3
@@ -97,9 +98,44 @@ class InterventionTests(unittest.TestCase):
                     ledger.consider_correction(task_key="task", correction_key="same", record=genuinely_new),
                     "correction_allowed",
                 )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=original),
+                    "unresolved",
+                )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=productive),
+                    "unresolved",
+                )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=genuinely_new),
+                    "diagnosis_required",
+                )
+                self.assertEqual(
+                    ledger.finish_diagnosis(task_key="task", diagnosis_evidence="evidence four"),
+                    "correction_allowed",
+                )
+                second_diagnosis = InterventionRecord(
+                    "obligation", "failure", "hypothesis", "evidence four", "check"
+                )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=second_diagnosis),
+                    "unresolved",
+                )
                 state = ledger.read("task")
                 self.assertEqual(state["correctionCount"], 2)  # type: ignore[index]
-                self.assertEqual(state["diagnosisStatus"], "not_needed")  # type: ignore[index]
+                self.assertEqual(state["diagnosisStatus"], "productive")  # type: ignore[index]
+
+            with StateStore(Path(project_dir), home=Path(home_dir)) as restarted_store:
+                restarted = InterventionLedger(restarted_store, run.local_id)
+                for stale in (original, productive, genuinely_new, second_diagnosis):
+                    self.assertEqual(
+                        restarted.consider_correction(
+                            task_key="task",
+                            correction_key="same",
+                            record=stale,
+                        ),
+                        "unresolved",
+                    )
 
     def test_old_productive_row_migrates_with_both_evidence_identities(self) -> None:
         with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
@@ -161,6 +197,94 @@ class InterventionTests(unittest.TestCase):
                     ledger.consider_correction(task_key="task", correction_key="same", record=diagnosis),
                     "unresolved",
                 )
+                fresh = InterventionRecord("obligation", "failure", "hypothesis", "fresh evidence", "check")
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=fresh),
+                    "correction_allowed",
+                )
+                history = store.connection.execute(
+                    """SELECT evidence_digest FROM intervention_evidence_history
+                       WHERE run_local_id = 'run_old' AND task_key = 'task' AND correction_key = 'same'
+                       ORDER BY evidence_digest"""
+                ).fetchall()
+                self.assertEqual(
+                    {row["evidence_digest"] for row in history},
+                    {original.evidence_digest, diagnosis.evidence_digest, fresh.evidence_digest},
+                )
+
+            with StateStore(project, home=home) as restarted_store:
+                restarted = InterventionLedger(restarted_store, "run_old")
+                self.assertEqual(
+                    restarted.consider_correction(task_key="task", correction_key="same", record=original),
+                    "unresolved",
+                )
+                self.assertEqual(
+                    restarted.consider_correction(task_key="task", correction_key="same", record=diagnosis),
+                    "unresolved",
+                )
+
+    def test_two_digest_schema_migrates_only_recoverable_consumed_history(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            project = Path(project_dir)
+            home = Path(home_dir)
+            from orchestrate.state import project_key
+
+            state_dir = home / "projects" / project_key(project.resolve())
+            state_dir.mkdir(parents=True)
+            connection = sqlite3.connect(state_dir / "state.sqlite3")
+            correction = InterventionRecord("obligation", "failure", "hypothesis", "current evidence", "check")
+            diagnosis = InterventionRecord("obligation", "failure", "hypothesis", "diagnosis evidence", "check")
+            encoded = json.dumps(asdict(correction), sort_keys=True, separators=(",", ":"))
+            connection.executescript(
+                """
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta VALUES ('schema', 'orchestrate-state/v1');
+                CREATE TABLE interventions (
+                    run_local_id TEXT NOT NULL,
+                    task_key TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    correction_key TEXT NOT NULL,
+                    evidence_digest TEXT NOT NULL,
+                    correction_evidence_digest TEXT NOT NULL,
+                    diagnosis_evidence_digest TEXT,
+                    correction_count INTEGER NOT NULL,
+                    diagnosis_status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (run_local_id, task_key)
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO interventions VALUES (?, ?, ?, ?, ?, ?, ?, 4, 'productive', ?, ?)",
+                (
+                    "run_current",
+                    "task",
+                    encoded,
+                    "same",
+                    diagnosis.evidence_digest,
+                    correction.evidence_digest,
+                    diagnosis.evidence_digest,
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-02T00:00:00+00:00",
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            with StateStore(project, home=home) as store:
+                history = store.connection.execute(
+                    """SELECT evidence_digest, evidence_kind FROM intervention_evidence_history
+                       WHERE run_local_id = 'run_current' AND task_key = 'task'
+                       ORDER BY evidence_kind"""
+                ).fetchall()
+                self.assertEqual(
+                    {(row["evidence_digest"], row["evidence_kind"]) for row in history},
+                    {
+                        (correction.evidence_digest, "correction"),
+                        (diagnosis.evidence_digest, "diagnosis"),
+                    },
+                )
 
     def test_incomplete_intervention_record_fails_closed(self) -> None:
         with self.assertRaises(OrchestrateError) as caught:
@@ -209,6 +333,60 @@ class InterventionTests(unittest.TestCase):
                 thread.join(timeout=10)
                 self.assertFalse(thread.is_alive())
             self.assertCountEqual(outcomes, ["correction_allowed", "diagnosis_not_authorized"])
+
+    def test_concurrent_stale_history_replay_cannot_enable_diagnosis_or_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            project = Path(project_dir)
+            home = Path(home_dir)
+            original = InterventionRecord("obligation", "failure", "hypothesis", "evidence one", "check")
+            fresh = InterventionRecord("obligation", "failure", "hypothesis", "evidence three", "check")
+            with StateStore(project, home=home) as store:
+                run = store.create_run(objective="fix", profile_digest="p", source_digest="s")
+                ledger = InterventionLedger(store, run.local_id)
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=original),
+                    "correction_allowed",
+                )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=original),
+                    "diagnosis_required",
+                )
+                self.assertEqual(
+                    ledger.finish_diagnosis(task_key="task", diagnosis_evidence="evidence two"),
+                    "correction_allowed",
+                )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=fresh),
+                    "correction_allowed",
+                )
+
+            barrier = threading.Barrier(3)
+            outcomes: list[str] = []
+            outcome_lock = threading.Lock()
+
+            def replay() -> None:
+                with StateStore(project, home=home) as concurrent_store:
+                    concurrent = InterventionLedger(concurrent_store, run.local_id)
+                    barrier.wait()
+                    outcome = concurrent.consider_correction(
+                        task_key="task",
+                        correction_key="same",
+                        record=original,
+                    )
+                with outcome_lock:
+                    outcomes.append(outcome)
+
+            threads = [threading.Thread(target=replay) for _ in range(3)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(outcomes, ["unresolved"] * 3)
+            with StateStore(project, home=home) as store:
+                state = InterventionLedger(store, run.local_id).read("task")
+                self.assertEqual(state["correctionCount"], 2)  # type: ignore[index]
+                self.assertEqual(state["diagnosisStatus"], "not_needed")  # type: ignore[index]
 
 
 if __name__ == "__main__":

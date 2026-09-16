@@ -839,6 +839,7 @@ class MilestoneClient:
             "launch": launch,
             "state": "ready",
             "released": False,
+            "delivery_sent": False,
         }
         self.peak_active_workers = max(
             self.peak_active_workers,
@@ -884,7 +885,9 @@ class MilestoneClient:
     def _worker_show(self, dispatch_id: str) -> dict[str, object]:
         record = self.workers[dispatch_id]
         task_id = record["task_id"]
-        settled = record["state"] == "succeeded"
+        outcome = record["state"]
+        settled = outcome in {"succeeded", "failed"}
+        failed = outcome == "failed"
         released = bool(record["released"])
         terminal = record["terminal"]
         worktree = record["worktree"]
@@ -896,15 +899,15 @@ class MilestoneClient:
                     "runId": "run_1",
                     "taskId": task_id,
                     "task_id": task_id,
-                    "status": "completed" if settled else "dispatched",
-                    "lastFailure": None,
+                    "status": "failed" if failed else "completed" if settled else "dispatched",
+                    "lastFailure": "worker_failed" if failed else None,
                 },
                 "worker": {
                     "dispatchId": dispatch_id,
                     "worktreeId": worktree,
                     "agentTerminalHandle": terminal,
-                    "lastError": None,
-                    "state": "succeeded" if settled else "ready",
+                    "lastError": "worker_failed" if failed else None,
+                    "state": outcome if settled else "ready",
                     "stage": "settled" if settled else "input_accepted",
                     "residualResources": [
                         {"kind": "terminal", "role": "agent", "action": "created", "id": terminal}
@@ -939,13 +942,20 @@ class MilestoneClient:
         }
 
     def _delivery(self) -> dict[str, object]:
-        active = next(record for record in self.workers.values() if record["state"] == "ready")
+        active = next(
+            record
+            for record in self.workers.values()
+            if record["state"] in {"ready", "succeeded", "failed"} and not record["delivery_sent"]
+        )
         task_id = active["task_id"]
         dispatch_id = next(key for key, value in self.workers.items() if value is active)
-        active["state"] = "succeeded"
-        self.tasks[task_id]["status"] = "completed"
-        payload: dict[str, object] = {"taskId": task_id, "dispatchId": dispatch_id, "outcome": "succeeded"}
-        if task_id != "task_1":
+        if active["state"] == "ready":
+            active["state"] = "succeeded"
+        outcome = str(active["state"])
+        active["delivery_sent"] = True
+        self.tasks[task_id]["status"] = "completed" if outcome == "succeeded" else "failed"
+        payload: dict[str, object] = {"taskId": task_id, "dispatchId": dispatch_id, "outcome": outcome}
+        if task_id != "task_1" and outcome == "succeeded":
             with StateStore(self.root) as store:
                 run = store.select_run(None)
                 packet = store.get_packet(run.local_id, task_id)
@@ -985,6 +995,15 @@ class MilestoneClient:
                 ],
             }
         }
+
+    def settle_without_delivery(self, dispatch_id: str, *, outcome: str) -> None:
+        if outcome not in {"succeeded", "failed"}:
+            raise AssertionError(f"unsupported synthetic outcome: {outcome}")
+        record = self.workers[dispatch_id]
+        if record["delivery_sent"]:
+            raise AssertionError("synthetic worker Delivery was already consumed")
+        record["state"] = outcome
+        self.tasks[str(record["task_id"])]["status"] = "completed" if outcome == "succeeded" else "failed"
 
     def run_json(self, *arguments: str, **_: object) -> dict[str, object]:
         self.calls.append(arguments)
@@ -2708,6 +2727,196 @@ class ControllerTests(MilestoneRepo):
         self.assertEqual(sum(call[call.index("--task") + 1] == "task_2" for call in starts_after), 1)
         releases = [call for call in client.calls if call[:2] == ("orchestration", "worker-release")]
         self.assertEqual(sum(call[call.index("--dispatch") + 1] == "dispatch_2" for call in releases), 1)
+
+    def _resume_settled_milestone_before_delivery(
+        self,
+        *,
+        outcome: str,
+        remove_binding: bool,
+    ) -> tuple[dict[str, object], MilestoneClient]:
+        objective = f"Integrate then receive {outcome} after native settlement"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+        first = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        self.assertEqual(first["status"], "milestone_waiting")
+        client.settle_without_delivery("dispatch_2", outcome=outcome)
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            run_local_id = run.local_id
+            self.assertIsNone(run.delivery_id)
+            self.assertIsNone(
+                store.connection.execute(
+                    "SELECT 1 FROM deliveries WHERE run_local_id = ? AND delivery_id = 'delivery_2'",
+                    (run.local_id,),
+                ).fetchone()
+            )
+            if remove_binding:
+                store.connection.execute(
+                    "DELETE FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                    (run.local_id,),
+                )
+        starts_before = len(
+            [
+                call
+                for call in client.calls
+                if call[:2] == ("orchestration", "worker-start")
+                and call[call.index("--task") + 1] == "task_2"
+            ]
+        )
+        client.deliveries_paused = False
+        report = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        starts_after = len(
+            [
+                call
+                for call in client.calls
+                if call[:2] == ("orchestration", "worker-start")
+                and call[call.index("--task") + 1] == "task_2"
+            ]
+        )
+        self.assertEqual(starts_before, 1)
+        self.assertEqual(starts_after, starts_before)
+        releases = [
+            call
+            for call in client.calls
+            if call[:2] == ("orchestration", "worker-release")
+            and call[call.index("--dispatch") + 1] == "dispatch_2"
+        ]
+        self.assertEqual(len(releases), 1)
+        with StateStore(self.root) as store:
+            run = store.get_run(run_local_id)
+            worker = store.connection.execute(
+                "SELECT outcome, release_state FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            ).fetchone()
+            self.assertEqual(worker["outcome"], outcome)
+            self.assertEqual(worker["release_state"], "released")
+        return report, client
+
+    @requires_native_windows_admission
+    def test_resume_receives_success_settled_before_delivery_with_original_binding(self) -> None:
+        report, _ = self._resume_settled_milestone_before_delivery(
+            outcome="succeeded",
+            remove_binding=False,
+        )
+        self.assertEqual(report["status"], "worker_succeeded")
+        self.assertEqual(report["verification"], "review_accepted")
+
+    @requires_native_windows_admission
+    def test_resume_receives_success_settled_before_delivery_with_reconstructed_binding(self) -> None:
+        report, _ = self._resume_settled_milestone_before_delivery(
+            outcome="succeeded",
+            remove_binding=True,
+        )
+        self.assertEqual(report["status"], "worker_succeeded")
+        self.assertEqual(report["verification"], "review_accepted")
+
+    @requires_native_windows_admission
+    def test_resume_receives_failure_settled_before_delivery_with_original_binding(self) -> None:
+        report, client = self._resume_settled_milestone_before_delivery(
+            outcome="failed",
+            remove_binding=False,
+        )
+        self.assertEqual(report["status"], "milestone_blocked")
+        self.assertEqual(report["verification"], "not_run")
+        self.assertNotIn("dispatch_3", client.workers)
+
+    @requires_native_windows_admission
+    def test_resume_receives_failure_settled_before_delivery_with_reconstructed_binding(self) -> None:
+        report, client = self._resume_settled_milestone_before_delivery(
+            outcome="failed",
+            remove_binding=True,
+        )
+        self.assertEqual(report["status"], "milestone_blocked")
+        self.assertEqual(report["verification"], "not_run")
+        self.assertNotIn("dispatch_3", client.workers)
+
+    @requires_native_windows_admission
+    def test_settled_before_delivery_still_requires_exact_native_task_identity(self) -> None:
+        objective = "Integrate then reject changed settled Task identity"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+        implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        client.settle_without_delivery("dispatch_2", outcome="succeeded")
+        client.tasks["task_2"]["run_id"] = "run_replacement"
+        client.deliveries_paused = False
+        with self.assertRaises(OrchestrateError) as caught:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(caught.exception.code, "native_task_binding_mismatch")
+        self.assertFalse(
+            any(
+                call[:2] == ("orchestration", "worker-release")
+                and call[call.index("--dispatch") + 1] == "dispatch_2"
+                for call in client.calls
+            )
+        )
+
+    @requires_native_windows_admission
+    def test_settled_reconstruction_rejects_replacement_worker_identity(self) -> None:
+        objective = "Integrate then reject replaced settled worker identity"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+        implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        client.settle_without_delivery("dispatch_2", outcome="failed")
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            store.connection.execute(
+                "DELETE FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            )
+        client.workers["dispatch_2"]["worktree"] = "repo::replacement"
+        client.deliveries_paused = False
+        with self.assertRaises(OrchestrateError) as caught:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(caught.exception.code, "native_worker_binding_mismatch")
+        self.assertFalse(
+            any(
+                call[:2] == ("orchestration", "worker-release")
+                and call[call.index("--dispatch") + 1] == "dispatch_2"
+                for call in client.calls
+            )
+        )
 
     @requires_native_windows_admission
     def test_resume_repairs_missing_session_projection_idempotently(self) -> None:

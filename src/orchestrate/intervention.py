@@ -91,13 +91,25 @@ class InterventionLedger:
                         now,
                     ),
                 )
+                self.store.connection.execute(
+                    """INSERT INTO intervention_evidence_history(
+                           run_local_id, task_key, correction_key, evidence_digest,
+                           evidence_kind, consumed_at
+                       ) VALUES (?, ?, ?, ?, 'correction', ?)""",
+                    (self.run_local_id, task_key, correction_key, record.evidence_digest, now),
+                )
                 return "correction_allowed"
-            same_attempt = (
+            consumed = self.store.connection.execute(
+                """SELECT evidence_kind FROM intervention_evidence_history
+                   WHERE run_local_id = ? AND task_key = ? AND correction_key = ?
+                     AND evidence_digest = ?""",
+                (self.run_local_id, task_key, correction_key, record.evidence_digest),
+            ).fetchone()
+            current_attempt = (
                 row["correction_key"] == correction_key
-                and record.evidence_digest
-                in {row["correction_evidence_digest"], row["diagnosis_evidence_digest"]}
+                and row["correction_evidence_digest"] == record.evidence_digest
             )
-            if not same_attempt:
+            if consumed is None:
                 self.store.connection.execute(
                     """UPDATE interventions
                        SET record_json = ?, correction_key = ?, evidence_digest = ?,
@@ -115,8 +127,15 @@ class InterventionLedger:
                         task_key,
                     ),
                 )
+                self.store.connection.execute(
+                    """INSERT INTO intervention_evidence_history(
+                           run_local_id, task_key, correction_key, evidence_digest,
+                           evidence_kind, consumed_at
+                       ) VALUES (?, ?, ?, ?, 'correction', ?)""",
+                    (self.run_local_id, task_key, correction_key, record.evidence_digest, now),
+                )
                 return "correction_allowed"
-            if row["diagnosis_status"] in {"not_needed", "required"}:
+            if current_attempt and row["diagnosis_status"] in {"not_needed", "required"}:
                 if row["diagnosis_status"] == "not_needed":
                     self.store.connection.execute(
                         """UPDATE interventions SET record_json = ?, diagnosis_status = 'required', updated_at = ?
@@ -149,7 +168,17 @@ class InterventionLedger:
                 if isinstance(diagnosis_evidence, str) and diagnosis_evidence.strip()
                 else None
             )
-            productive = new_digest is not None and new_digest != row["correction_evidence_digest"]
+            consumed = (
+                self.store.connection.execute(
+                    """SELECT 1 FROM intervention_evidence_history
+                       WHERE run_local_id = ? AND task_key = ? AND correction_key = ?
+                         AND evidence_digest = ?""",
+                    (self.run_local_id, task_key, row["correction_key"], new_digest),
+                ).fetchone()
+                if new_digest is not None
+                else None
+            )
+            productive = new_digest is not None and consumed is None
             changed = self.store.connection.execute(
                 """UPDATE interventions
                    SET evidence_digest = COALESCE(?, evidence_digest),
@@ -169,6 +198,20 @@ class InterventionLedger:
                 raise OrchestrateError(
                     "The bounded diagnosis was already consumed concurrently",
                     code="diagnosis_not_authorized",
+                )
+            if productive:
+                self.store.connection.execute(
+                    """INSERT INTO intervention_evidence_history(
+                           run_local_id, task_key, correction_key, evidence_digest,
+                           evidence_kind, consumed_at
+                       ) VALUES (?, ?, ?, ?, 'diagnosis', ?)""",
+                    (
+                        self.run_local_id,
+                        task_key,
+                        row["correction_key"],
+                        new_digest,
+                        utc_now(),
+                    ),
                 )
         return "correction_allowed" if productive else "unresolved"
 
