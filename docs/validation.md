@@ -26,6 +26,9 @@ Do not record credentials, private source text, raw environments, personal files
 | Frozen build | Build from a clean `git archive HEAD` export, not the mutable working tree | No matching correction-candidate record yet | `NOT_RUN` |
 | Fresh wheel install | Install the frozen wheel into a new virtual environment | No matching correction-candidate record yet | `NOT_RUN` |
 | CLI help smoke | Installed `orchestrate --help`, `orchestrate doctor --help`, and `orchestrate-wsl --help` | No matching correction-candidate record yet | `NOT_RUN` |
+| Synthetic machine-bootstrap regressions | Fake user-PATH store and resolver, disposable venv/install roots, synthetic subprocesses, spelling-robust path faults; no live registry, PATH, or Python mutation | No matching correction-candidate record yet | `NOT_RUN` |
+| Live Windows first-machine bootstrap | Reviewed checkout entry through project setup; dedicated Python 3.13 venv, editable install, HKCU user-PATH registration, command resolution, rerun fast path, and recovery exercised on a disposable Windows user profile | No matching correction-candidate record yet | `NOT_RUN` |
+| Live WSL bootstrap launcher | A new WSL shell resolves the generated user-PATH shim and forwards cwd/Unicode argv/exit to the canonical Windows installation without Linux state | No matching correction-candidate record yet | `NOT_RUN` |
 | Read-only discovery trial, CE-governed repository | Discovery functions only; never run `setup`, project hooks, checks, or mutations | No matching correction-candidate record yet | `NOT_RUN` |
 | Read-only discovery trial, `j3w1.github.io` | Discovery functions only; never run `setup`, project hooks, checks, or mutations | No matching correction-candidate record yet | `NOT_RUN` |
 | Disposable Windows multi-worker frontier | More ready work than `maxWorkers`, native dependencies/gates, deterministic waves, and restart reconciliation in a disposable repository | No matching correction-candidate record yet | `NOT_RUN` |
@@ -42,6 +45,10 @@ Candidate `9ec68be` locally ran 230 tests with 49 expected win32-only skips and 
 ### Native-Windows managed admission limits Linux test coverage
 
 Managed worker preflight is win32-only by design in this milestone. Tests whose intended assertion requires a successful native-Windows admission path therefore use an explicit non-Windows skip, while Linux continues to run every host-neutral test and every pre-admission rejection test. The Windows and Linux CI jobs do not exercise equivalent unit/incident coverage: Windows runs the complete suite, and Linux runs that host-neutral subset; both jobs still run explicit incident discovery, wheel build, isolated install, and CLI help smokes. A passing Linux subset is not evidence of managed Linux or WSL worker admission, and the Windows-coordinated WSL lifecycle remains a separate `NOT_RUN` gate above.
+
+### First-machine bootstrap evidence boundary
+
+Unit coverage injects a memory-only user-PATH store, synthetic command resolver and subprocess runner, and disposable installation roots. It can prove deterministic fast-path decisions, exact phase selection, launcher bytes, idempotency, duplicate-entry repair, and explicit failures without touching a real user profile. It cannot prove Windows registry permissions or propagation, `py.exe` discovery, pip/network behavior, Windows command resolution, WSL Windows-PATH import, mounted-file execution, or a real cross-boundary launch. Those facts remain the two live `NOT_RUN` rows above until exact-candidate evidence is recorded; no Linux run or synthetic win32 argument fills them.
 
 ### Managed admission source observation boundary
 

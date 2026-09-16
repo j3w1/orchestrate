@@ -20,7 +20,7 @@ orca repo add --path $fixture --json
 
 ## Configure and run
 
-Use the exact Python installation containing this reviewed wheel or editable checkout:
+Use the canonical command installed by the reviewed checkout's documented `bootstrap.py setup` entry. If this is the machine's first use, complete that entry before this live controller exercise; do not substitute a hand-built venv or PATH edit.
 
 ```powershell
 orchestrate setup --project $fixture --json

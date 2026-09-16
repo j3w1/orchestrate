@@ -36,19 +36,28 @@ Read [Execution contracts and recovery](docs/contracts-and-recovery.md) for the 
 
 ## Installation
 
-orchestrate requires Python 3.13 or newer. It is not published to PyPI.
+orchestrate requires Python 3.13 or newer and a reviewed checkout. It is not published to PyPI. You do not need to create a virtual environment, run pip, or edit PATH yourself.
 
 ### Windows
 
-Install a reviewed checkout into a virtual environment:
+From the reviewed orchestrate checkout, use its small first-entry script and name the project you want to configure:
 
 ```powershell
-py -3.13 -m venv .venv
-.\.venv\Scripts\python -m pip install --editable .
-.\.venv\Scripts\orchestrate doctor
+py -3.13 .\bootstrap.py setup --project C:\path\to\your-project --json
 ```
 
-`doctor` is read-only unless you explicitly select an active probe. The active compatibility probe has additional disposable-project requirements and is not needed for normal work.
+That one command verifies Python 3.13, creates the dedicated environment under `%LOCALAPPDATA%\orchestrate\venv`, prepares pip, installs the reviewed checkout in editable mode, installs the Windows and WSL-facing launchers, and puts `%LOCALAPPDATA%\orchestrate\bin` first on the **user** PATH. It then continues the requested project setup. It never edits the system PATH or another Python environment.
+
+Open a new terminal after the first run. The normal command is now available:
+
+```powershell
+orchestrate doctor
+orchestrate setup --project C:\path\to\another-project --json
+```
+
+Every later `setup` begins with one user-PATH lookup and fixed launcher checks. When those are healthy it performs no environment creation, pip command, install, scan, upgrade, or model call, and prints no bootstrap message. If a launcher or PATH entry needs repair, setup repairs only the dedicated installation and reports the actions. Repeating either path is idempotent: the PATH contains one canonical entry and an existing editable install is not repeated.
+
+If bootstrap stops, its error names the failed phase. Correct the reported Python, filesystem, pip/network, or user-registry problem and run the same checkout command again; completed steps are reused. An incomplete dedicated venv is never silently overwritten—move that one `%LOCALAPPDATA%\orchestrate\venv` directory aside after inspection, then rerun. `doctor` is read-only unless you explicitly select an active probe; the active compatibility probe has additional disposable-project requirements and is not needed for normal work.
 
 ### Agent skill
 
@@ -74,18 +83,19 @@ The package never edits `AGENTS.md`, user prompts, or another agent's configurat
 
 The CI workflow runs the complete unit and incident suite on Windows, including the managed-admission and controller-lifecycle fixtures that require native Windows. Linux runs every host-neutral test and explicitly skips only tests whose intended assertion requires the win32-only managed worker admission path. Both jobs run explicit incident discovery, wheel build, isolated install, and CLI help smokes. A workflow definition is not proof that a particular candidate passed; [Validation evidence](docs/validation.md) keeps that distinction explicit. The Orca CLI resolver uses `ORCA_CLI_COMMAND` in a managed forwarded session, `orca-dev` in a dev checkout, `orca-ide` on Linux outside Orca, and `orca` on packaged Windows.
 
-`orchestrate-wsl` is a transport-only launcher. Configure its one machine-local pointer as a JSON argument array naming the reviewed Windows entry point, then pass ordinary CLI arguments:
+Machine bootstrap places an extensionless `orchestrate` shell launcher beside the Windows shim. With WSL's normal Windows-PATH import enabled, it is available in a new WSL shell without a Linux installation:
 
 ```bash
-export ORCHESTRATE_WINDOWS_COMMAND_JSON='["/mnt/c/path/to/windows/.venv/Scripts/orchestrate.exe"]'
-orchestrate-wsl status --json
+orchestrate status --json
 ```
 
-It forwards the exact `WSL_DISTRO_NAME`, absolute Linux working directory, Unicode-safe argument array, inherited streams, and exit code to the Windows receiver. It creates no Linux state directory; the Windows process remains the only state owner. The payload does not choose a worker host, translate an Orca recovery command, or replace Orca placement and lifecycle. A real Windows-coordinated WSL worker lifecycle is still `NOT_RUN` for this candidate, so Linux unit or CI success is not a WSL/provider claim.
+The launcher uses WSL's `python3` only to encode the bounded transport payload. It forwards the exact `WSL_DISTRO_NAME`, absolute Linux working directory, Unicode-safe argument array, inherited streams, and exit code to the Windows executable. It installs no Linux package and creates no Linux state directory; Windows remains the only installation and state owner. Environments that deliberately disable Windows-PATH import must expose the mounted `%LOCALAPPDATA%\orchestrate\bin` directory through their own WSL policy; bootstrap does not edit shell startup files.
+
+The packaged `orchestrate-wsl` entry point remains the same transport implementation for already configured environments using `ORCHESTRATE_WINDOWS_COMMAND_JSON`. Neither launcher chooses a worker host, translates an Orca recovery command, or replaces Orca placement and lifecycle. A real Windows PATH bootstrap and Windows-coordinated WSL lifecycle are still `NOT_RUN` for this candidate, so synthetic or Linux test success is not a live Windows/WSL claim.
 
 ## The Basic Workflow
 
-Start in the project you want to configure:
+After the one-time checkout entry above, start in any project you want to configure:
 
 ```powershell
 orchestrate setup --json
@@ -203,11 +213,11 @@ Live Orca exercises are separate. Use only disposable projects for mutations, ne
 
 ## Updating
 
-Pull the reviewed revision and reinstall it in the same environment:
+Pull a reviewed revision in the same checkout. Because the dedicated installation is editable, the normal setup check converges through that checkout without another manual install:
 
 ```powershell
 git pull --ff-only
-.\.venv\Scripts\python -m pip install --editable .
+py -3.13 .\bootstrap.py setup --project C:\path\to\your-project --json
 orchestrate doctor
 ```
 
