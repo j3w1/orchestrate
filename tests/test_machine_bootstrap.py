@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from orchestrate.errors import OrchestrateError
-from orchestrate.cli import main
+from orchestrate.cli import _print_human, main
 from orchestrate.machine_bootstrap import (
     MachineLayout,
     MachineBootstrapResult,
@@ -418,6 +418,25 @@ class MachineBootstrapTests(unittest.TestCase):
         self.assertEqual(calls, ["machine", "project"])
         self.assertIn('"machineBootstrap"', output.getvalue())
         self.assertIn('"state": "ready"', output.getvalue())
+
+    def test_human_setup_output_reports_repairs_without_treating_not_run_as_check_rows(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _print_human(
+                {
+                    "status": "configured",
+                    "checks": "NOT_RUN",
+                    "machineBootstrap": {
+                        "state": "repaired",
+                        "actions": ["installed_windows_shim", "registered_user_path"],
+                    },
+                }
+            )
+        self.assertEqual(
+            output.getvalue(),
+            "orchestrate: configured\n"
+            "  Machine bootstrap: repaired (installed_windows_shim, registered_user_path)\n",
+        )
 
     def test_register_user_path_preserves_unrelated_empty_and_spelled_entries(self) -> None:
         store = FakeUserPath(r";C:\one;C:\two")

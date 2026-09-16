@@ -110,8 +110,9 @@ def _print_human(report: dict[str, Any]) -> None:
         actions = machine.get("actions")
         if isinstance(actions, list):
             print(f"  Machine bootstrap: repaired ({', '.join(str(item) for item in actions)})")
-    if "checks" in report:
-        for check in report["checks"]:
+    checks = report.get("checks")
+    if isinstance(checks, list):
+        for check in checks:
             print(f"  {check['status'].upper():11} {check['name']}: {check['detail']}")
     for label, key in (("Run", "runId"), ("Task", "taskId"), ("Dispatch", "dispatchId")):
         if report.get(key):
