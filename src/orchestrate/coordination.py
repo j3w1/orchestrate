@@ -554,6 +554,14 @@ class NativeDagScheduler:
             if stored_arguments != arguments or not isinstance(native, Mapping) or not isinstance(native.get("id"), str):
                 raise OrchestrateError("Applied milestone Task receipt changed identity", code="native_task_binding_mismatch")
             return self._record_binding(task, native["id"], dependency_ids)
+        return self._validated_binding(task, dependency_ids, row)
+
+    @staticmethod
+    def _validated_binding(
+        task: MilestoneTask,
+        dependency_ids: list[str],
+        row: Mapping[str, Any],
+    ) -> NativeTaskBinding:
         expected = (
             task.candidate_digest,
             task.contract_digest,
@@ -571,7 +579,48 @@ class NativeDagScheduler:
                 "Stored milestone Task binding conflicts with the selected plan",
                 code="native_task_binding_mismatch",
             )
+        if not isinstance(row["task_id"], str) or not row["task_id"]:
+            raise OrchestrateError(
+                "Stored milestone Task binding lost its native identity",
+                code="native_task_binding_mismatch",
+            )
         return NativeTaskBinding(task.key, row["task_id"], tuple(dependency_ids), task.spec)
+
+    def existing_bindings(
+        self,
+        plan: MilestonePlan,
+        *,
+        integration_owner: NativeTaskBinding,
+    ) -> dict[str, NativeTaskBinding]:
+        """Load exact existing Task bindings without creating or reconstructing any."""
+
+        plan.validated()
+        owner = next(task for task in plan.tasks if task.integration_owner)
+        if (
+            integration_owner.key != owner.key
+            or integration_owner.dependencies
+            or integration_owner.task_id == ""
+        ):
+            raise OrchestrateError(
+                "The existing implementation Task is not the exact integration owner",
+                code="integration_owner_invalid",
+            )
+        bindings = {owner.key: integration_owner}
+        for task in plan.topological():
+            if task.integration_owner:
+                continue
+            dependency_ids = [bindings[key].task_id for key in task.dependencies]
+            row = self.store.connection.execute(
+                "SELECT * FROM milestone_task_bindings WHERE run_local_id = ? AND task_key = ?",
+                (self.run_local_id, task.key),
+            ).fetchone()
+            if row is None:
+                raise OrchestrateError(
+                    "Milestone settlement lost an exact planned Task binding",
+                    code="native_task_binding_mismatch",
+                )
+            bindings[task.key] = self._validated_binding(task, dependency_ids, row)
+        return bindings
 
     def _record_binding(
         self,
@@ -712,6 +761,8 @@ class NativeDagScheduler:
         run_id: str,
         plan: MilestonePlan,
         bindings: Mapping[str, NativeTaskBinding],
+        *,
+        required_statuses: Mapping[str, str] | None = None,
     ) -> None:
         response = self.client.run_json("orchestration", "task-list", "--run", run_id, "--json")
         rows = _result(response).get("tasks")
@@ -737,6 +788,9 @@ class NativeDagScheduler:
                 allowed_statuses = {"dispatched", "completed", "failed"}
             else:
                 allowed_statuses = {"completed" if worker["outcome"] == "succeeded" else "failed"}
+            required_status = required_statuses.get(key) if required_statuses is not None else None
+            if required_status is not None:
+                allowed_statuses = {required_status}
             if (
                 not isinstance(row, Mapping)
                 or row.get("run_id") != run_id
@@ -749,6 +803,47 @@ class NativeDagScheduler:
                     f"Native Task readback changed {task.key}'s identity, title, spec, dependencies, or gate state",
                     code="native_task_binding_mismatch",
                 )
+
+    def validate_settlement_readback(
+        self,
+        run_id: str,
+        plan: MilestonePlan,
+        bindings: Mapping[str, NativeTaskBinding],
+        gates: Mapping[str, NativeGateBinding],
+        *,
+        task_key: str,
+        outcome: Literal["succeeded", "failed"],
+    ) -> None:
+        """Revalidate a Delivery's exact current Task and gate before settlement effects."""
+
+        task_map = {task.key: task for task in plan.tasks}
+        task = task_map.get(task_key)
+        binding = bindings.get(task_key)
+        if task is None or binding is None or task.integration_owner:
+            raise OrchestrateError(
+                "Milestone settlement has no exact planned follow-up Task",
+                code="native_task_binding_mismatch",
+            )
+        required_status = "completed" if outcome == "succeeded" else "failed"
+        self._validate_readback(
+            run_id,
+            plan,
+            {task_key: binding},
+            required_statuses={task_key: required_status},
+        )
+        if task.gate not in {"verification", "review"}:
+            raise OrchestrateError(
+                "Milestone settlement Task has no exact lifecycle gate",
+                code="native_gate_mismatch",
+            )
+        gate = gates.get(task_key)
+        if gate is None:
+            raise OrchestrateError(
+                "Milestone settlement lost its exact planned gate",
+                code="native_gate_mismatch",
+            )
+        self._validate_stored_gate(task, binding.task_id, self._gate_question(task, plan), gate)
+        self._gate_readback(gate)
 
     def ready_wave(
         self,
@@ -873,19 +968,16 @@ class NativeDagScheduler:
         ).fetchone()
         if row is None:
             return None
-        expected = (task_id, task.gate, question)
-        actual = (row["task_id"], row["gate_kind"], row["question"])
-        if actual != expected:
-            raise OrchestrateError("Stored gate conflicts with the selected plan", code="native_gate_mismatch")
         binding = NativeGateBinding(
-            task.key,
-            task_id,
+            row["task_key"],
+            row["task_id"],
             row["gate_id"],
-            task.gate,  # type: ignore[arg-type]
-            question,
+            row["gate_kind"],
+            row["question"],
             row["status"],
             row["resolution"],
         )
+        self._validate_stored_gate(task, task_id, question, binding)
         try:
             self._gate_readback(binding)
             return binding
@@ -937,6 +1029,27 @@ class NativeDagScheduler:
             (recovered.resolution, utc_now(), self.run_local_id, task.key),
         )
         return recovered
+
+    @staticmethod
+    def _validate_stored_gate(
+        task: MilestoneTask,
+        task_id: str,
+        question: str,
+        binding: NativeGateBinding,
+    ) -> None:
+        if (
+            binding.task_key != task.key
+            or binding.task_id != task_id
+            or binding.gate_kind != task.gate
+            or binding.question != question
+            or binding.status not in {"pending", "resolved"}
+            or (binding.status == "pending" and binding.resolution is not None)
+            or (binding.status == "resolved" and binding.resolution not in {"accepted", "rejected"})
+        ):
+            raise OrchestrateError(
+                "Stored gate conflicts with the selected plan",
+                code="native_gate_mismatch",
+            )
 
     def create_gates(
         self,
@@ -1276,6 +1389,31 @@ def validate_session_readback(session: WorkerSession, payload: Mapping[str, Any]
         or resource_identity.worktree_id != session.worktree_id
     ):
         raise OrchestrateError("worker-show changed the exact session resource identity", code="release_unconfirmed")
+
+
+def validate_owned_session_readback(session: WorkerSession, payload: Mapping[str, Any]) -> None:
+    """Require an exact settled session whose resource is still owned and unreleased."""
+
+    validate_session_readback(session, payload)
+    result = _result(payload)
+    resource = result.get("terminalResource")
+    terminal = result.get("terminal")
+    if (
+        not isinstance(resource, Mapping)
+        or not isinstance(terminal, Mapping)
+        or terminal.get("handle") != session.terminal_handle
+        or resource.get("ownershipState") != "owned"
+        or resource.get("releaseState") != "not_requested"
+        or resource.get("retainedReason") is not None
+        or resource.get("releaseRequestedAt") is not None
+        or resource.get("releaseCompletedAt") is not None
+        or resource.get("releaseError") is not None
+        or resource.get("archive") is not None
+    ):
+        raise OrchestrateError(
+            "worker-show no longer has the exact owned settlement resource",
+            code="release_unconfirmed",
+        )
 
 
 def validate_release_receipt(

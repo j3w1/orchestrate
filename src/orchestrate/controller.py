@@ -29,7 +29,9 @@ from .coordination import (
     milestone_plan_relative_path,
     native_task_create_arguments,
     require_current_review,
+    validate_owned_session_readback,
     validate_release_receipt,
+    validate_session_readback,
 )
 from .admission import joined_preflight_status, other_dispatch_observations, validate_packet_sources
 from .errors import OrchestrateError
@@ -1594,7 +1596,11 @@ def _record_input_submission_diagnostic(
     )
 
 
-def _validate_native_settlement(client: OrcaClient, run: RunRecord, outcome: str) -> None:
+def _validate_native_settlement(
+    client: OrcaClient,
+    run: RunRecord,
+    outcome: str,
+) -> None:
     worker = client.run_json("orchestration", "worker-show", "--dispatch", str(run.dispatch_id), "--json")
     tasks = client.run_json("orchestration", "task-list", "--run", str(run.native_run_id), "--json")
     dispatch = _result(worker).get("dispatch")
@@ -1618,6 +1624,54 @@ def _validate_native_settlement(client: OrcaClient, run: RunRecord, outcome: str
     matching = [item for item in task_rows or [] if isinstance(item, Mapping) and item.get("id") == run.task_id]
     if len(matching) != 1 or matching[0].get("status") != expected or matching[0].get("run_id") != run.native_run_id:
         raise OrchestrateError("worker_done does not match native Task settlement", code="settlement_mismatch")
+
+
+def _validate_native_milestone_settlement(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    worker: object,
+    outcome: Literal["succeeded", "failed"],
+) -> None:
+    readback = client.run_json(
+        "orchestration",
+        "worker-show",
+        "--dispatch",
+        worker["dispatch_id"],  # type: ignore[index]
+        "--json",
+    )
+    session = WorkerSession(
+        worker["dispatch_id"],  # type: ignore[index]
+        worker["task_id"],  # type: ignore[index]
+        worker["terminal_handle"],  # type: ignore[index]
+        worker["resource_id"],  # type: ignore[index]
+        worker["worktree_id"],  # type: ignore[index]
+        worker["agent"],  # type: ignore[index]
+        str(run.native_run_id),
+        outcome,
+    )
+    release_rows = store.connection.execute(
+        "SELECT status, response_json FROM intentions WHERE run_local_id = ? AND operation = ? ORDER BY created_at",
+        (run.local_id, f"milestone-worker-release:{worker['task_key']}"),  # type: ignore[index]
+    ).fetchall()
+    try:
+        if not release_rows:
+            validate_owned_session_readback(session, readback)
+        elif len(release_rows) == 1 and release_rows[0]["status"] == "applied" and release_rows[0]["response_json"]:
+            # A crash may follow an already validated release but precede the
+            # local outcome transaction. Rejoin its exact settled identities;
+            # the stored release receipt is validated before finalization.
+            validate_session_readback(session, readback)
+        else:
+            raise OrchestrateError(
+                "Milestone settlement has an unresolved release transition",
+                code="release_unconfirmed",
+            )
+    except OrchestrateError as exc:
+        raise OrchestrateError(
+            "worker_done does not match the exact native Dispatch settlement and owned resource",
+            code="settlement_mismatch",
+        ) from exc
 
 
 def _recover_prompt_stall_resource_binding(
@@ -3007,10 +3061,31 @@ def _process_milestone_delivery(
             raise OrchestrateError("Milestone Delivery contains unsupported mail", code="delivery_unsupported")
         outcome = str(payload["outcome"])
         task = task_map[worker["task_key"]]
-        _validate_native_settlement(
+        if not isinstance(run.task_id, str) or not run.task_id:
+            raise OrchestrateError(
+                "Milestone settlement lost the integration owner's native Task identity",
+                code="integration_owner_invalid",
+            )
+        scheduler = NativeDagScheduler(client, store, run.local_id)
+        owner = next(item for item in plan.tasks if item.integration_owner)
+        bindings = scheduler.existing_bindings(
+            plan,
+            integration_owner=NativeTaskBinding(owner.key, run.task_id, (), "first-increment-owner"),
+        )
+        scheduler.validate_settlement_readback(
+            str(run.native_run_id),
+            plan,
+            bindings,
+            _milestone_gate_rows(store, run),
+            task_key=task.key,
+            outcome=outcome,  # type: ignore[arg-type]
+        )
+        _validate_native_milestone_settlement(
             client,
+            store,
             replace(run, task_id=worker["task_id"], dispatch_id=worker["dispatch_id"]),
-            outcome,
+            worker,
+            outcome,  # type: ignore[arg-type]
         )
         result_outcome, result_digest = _read_milestone_result(store, run, plan, task, worker, payload)
         release_state = _release_milestone_worker(
@@ -3815,36 +3890,45 @@ def _advance_milestone(
     finished = {owner.key, *(row["task_key"] for row in workers if row["outcome"] is not None)}
     gate_rows = _milestone_gate_rows(store, run)
     roster = load_role_roster()
-    _ensure_run_capacity(store, run)
-    remaining_capacity = runtime_plan.max_workers - len(active)
-    for binding in scheduler.ready_wave(
-        str(run.native_run_id),
-        runtime_plan,
-        bindings,
-        active=active,
-        finished=finished,
-        remaining_capacity=remaining_capacity,
-    ):
-        task = next(item for item in runtime_plan.tasks if item.key == binding.key)
-        gate = gate_rows.get(task.key)
-        if task.gate in {"verification", "review"} and (
-            gate is None or gate.status != "resolved" or gate.resolution != "accepted"
+    launch_authorized = True
+    try:
+        _ensure_run_capacity(store, run)
+    except OrchestrateError as exc:
+        if exc.code != "exceptional_capacity_required" or not active:
+            raise
+        # Historical wider Runs may reconcile their exact existing workers,
+        # but this missing launch grant cannot authorize even one new start.
+        launch_authorized = False
+    if launch_authorized:
+        remaining_capacity = runtime_plan.max_workers - len(active)
+        for binding in scheduler.ready_wave(
+            str(run.native_run_id),
+            runtime_plan,
+            bindings,
+            active=active,
+            finished=finished,
+            remaining_capacity=remaining_capacity,
         ):
-            raise OrchestrateError("Native ready view bypassed an unresolved planned gate", code="native_ready_gate_mismatch")
-        if len(active) >= runtime_plan.max_workers:
-            break
-        _start_milestone_worker(
-            client,
-            store,
-            run,
-            profile,
-            task,
-            binding,
-            packets[task.key],
-            roster.choice(task.role),
-            worktree_id=worktree_id,
-        )
-        active.add(task.key)
+            task = next(item for item in runtime_plan.tasks if item.key == binding.key)
+            gate = gate_rows.get(task.key)
+            if task.gate in {"verification", "review"} and (
+                gate is None or gate.status != "resolved" or gate.resolution != "accepted"
+            ):
+                raise OrchestrateError("Native ready view bypassed an unresolved planned gate", code="native_ready_gate_mismatch")
+            if len(active) >= runtime_plan.max_workers:
+                break
+            _start_milestone_worker(
+                client,
+                store,
+                run,
+                profile,
+                task,
+                binding,
+                packets[task.key],
+                roster.choice(task.role),
+                worktree_id=worktree_id,
+            )
+            active.add(task.key)
     run = store.update_run(run.local_id, phase="milestone_waiting", verification_status="pending")
     return run, runtime_plan
 
