@@ -106,7 +106,11 @@ def _bounded_text(value: object) -> str:
     if len(text) <= _DIAGNOSTIC_FIELD_LIMIT:
         return text
     digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
-    return f"{text[:160]}...<sha256:{digest}>"
+    return f"{text[:160]}...<truncated-text-id:sha256:{digest}>"
+
+
+def _redacted_string_identity(value: object) -> str:
+    return f"redacted-string-id:{_diagnostic_hash(value)}"
 
 
 def _sanitize_identity_value(component: str, value: object) -> object:
@@ -117,26 +121,37 @@ def _sanitize_identity_value(component: str, value: object) -> object:
             return [
                 item
                 if isinstance(item, str) and item in _RECEIPT_FIELDS
-                else f"unknown-field:{_diagnostic_hash(item)}"
+                else f"unknown-field-string-id:{_diagnostic_hash(item)}"
                 for item in value[:16]
             ]
         return [_sanitize_identity_value(component, item) for item in value[:16]]
     if not isinstance(value, str):
-        return {"type": type(value).__name__, "sha256": _diagnostic_hash(value)}
+        return {
+            "type": type(value).__name__,
+            "redactedValueIdentity": _diagnostic_hash(value),
+        }
 
     if value in _SAFE_IDENTITY_VALUES or value.startswith("machine_bootstrap_"):
         return value
-    if value.startswith(("redacted:sha256:", "invalid:sha256:")):
+    if value.startswith(("redacted-string-id:sha256:", "invalid-digest-string-id:sha256:")):
         return value
+    if value.startswith("redacted:sha256:"):
+        return value.replace("redacted:sha256:", "redacted-string-id:sha256:", 1)
+    if value.startswith("invalid:sha256:"):
+        return value.replace("invalid:sha256:", "invalid-digest-string-id:sha256:", 1)
     lowered = component.casefold()
     if any(marker in lowered for marker in ("path", "root", "resolution")):
         if value == "absent" or os.path.isabs(value) or ntpath.isabs(value):
             return _bounded_text(value)
-        return f"redacted:{_diagnostic_hash(value)}"
+        return _redacted_string_identity(value)
     if "sha256" in lowered or "digest" in lowered:
-        return value if _SHA256.fullmatch(value) else f"invalid:{_diagnostic_hash(value)}"
+        return (
+            value
+            if _SHA256.fullmatch(value)
+            else f"invalid-digest-string-id:{_diagnostic_hash(value)}"
+        )
     if "installationid" in lowered:
-        return _diagnostic_hash(value)
+        return _redacted_string_identity(value)
     if "fileidentity" in lowered:
         return _bounded_text(value)
     if re.fullmatch(r"(?:0\.\.[0-9]+|mode:0x[0-9a-f]+(?:;links:[0-9]+)?)", value):
@@ -150,7 +165,7 @@ def _sanitize_identity_value(component: str, value: object) -> object:
         return value
     if value.startswith(("orchestrate-machine-install/", "orchestrate-machine-install-anchor/")):
         return _bounded_text(value)
-    return f"redacted:{_diagnostic_hash(value)}"
+    return _redacted_string_identity(value)
 
 
 def _sanitize_operation(value: object) -> dict[str, object]:
@@ -188,7 +203,11 @@ def _sanitize_archive_stage(value: object) -> dict[str, object]:
         result["size"] = size
     digest = value.get("sha256")
     if isinstance(digest, str):
-        result["sha256"] = digest if _SHA256.fullmatch(digest) else f"invalid:{_diagnostic_hash(digest)}"
+        result["sha256"] = (
+            digest
+            if _SHA256.fullmatch(digest)
+            else f"invalid-digest-string-id:{_diagnostic_hash(digest)}"
+        )
     return result
 
 

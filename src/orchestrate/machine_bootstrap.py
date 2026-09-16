@@ -81,7 +81,14 @@ class _PlatformProvider(Protocol):
 
     def close_path_pin(self, handle: object) -> None: ...
 
-    def open_staging_file(self, path: Path, flags: int, mode: int) -> int: ...
+    def open_staging_file(
+        self,
+        path: Path,
+        flags: int,
+        mode: int,
+        *,
+        delete_on_close: bool = False,
+    ) -> int: ...
 
     def close_staging_file(self, descriptor: int) -> None: ...
 
@@ -1201,14 +1208,21 @@ def _close_windows_path_pin(handle: object) -> None:
     close_handle(handle)
 
 
-def _open_windows_staging_file(path: Path, flags: int, mode: int) -> int:
+def _open_windows_staging_file(
+    path: Path,
+    flags: int,
+    mode: int,
+    *,
+    delete_on_close: bool = False,
+) -> int:
     """Create one binary stage whose writer admits the read-handoff handle.
 
     ``os.open`` does not let the caller select Windows sharing.  The bootstrap
     must retain write access across the no-replace link, while a later
     read-only bridge is opened before that writer is released.  CreateFileW is
-    therefore used explicitly with FILE_SHARE_READ and without write/delete
-    sharing; ownership of the resulting handle is transferred to the CRT fd.
+    therefore used explicitly with FILE_SHARE_READ and without write sharing;
+    normal stages also omit delete sharing and every delete disposition.
+    Ownership of the resulting handle is transferred to the CRT fd.
     """
 
     import ctypes
@@ -1218,9 +1232,11 @@ def _open_windows_staging_file(path: Path, flags: int, mode: int) -> int:
     generic_read = 0x80000000
     generic_write = 0x40000000
     share_read = 0x00000001
+    share_delete = 0x00000004
     create_new = 1
     file_attribute_normal = 0x00000080
     open_reparse_point = 0x00200000
+    file_flag_delete_on_close = 0x04000000
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
@@ -1237,10 +1253,12 @@ def _open_windows_staging_file(path: Path, flags: int, mode: int) -> int:
     handle = create_file(
         os.fspath(path),
         generic_read | generic_write,
-        share_read,
+        share_read | (share_delete if delete_on_close else 0),
         None,
         create_new,
-        file_attribute_normal | open_reparse_point,
+        file_attribute_normal
+        | open_reparse_point
+        | (file_flag_delete_on_close if delete_on_close else 0),
         None,
     )
     if handle == ctypes.c_void_p(-1).value:
@@ -1248,13 +1266,25 @@ def _open_windows_staging_file(path: Path, flags: int, mode: int) -> int:
         if winerror in {80, 183}:  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
             raise FileExistsError(winerror, "exclusive staging file exists", path)
         raise OSError(winerror, "CreateFileW staging failed", path)
+    descriptor: int | None = None
     try:
-        return msvcrt.open_osfhandle(
+        # Preserve the caller's access/append mode, but admit no CRT
+        # disposition flag: in particular this must never gain
+        # _O_TEMPORARY/delete-on-close merely because the caller used a named
+        # staging path.  Binary mode is set independently after ownership of
+        # the handle transfers to the descriptor.
+        descriptor = msvcrt.open_osfhandle(
             int(handle),
-            (flags & (os.O_RDWR | os.O_WRONLY | os.O_APPEND)) | _binary_open_flag(),
+            flags & (os.O_RDWR | os.O_WRONLY | os.O_APPEND),
         )
+        handle = None
+        msvcrt.setmode(descriptor, _binary_open_flag())
+        return descriptor
     except BaseException:
-        _close_windows_path_pin(handle)
+        if descriptor is not None:
+            os.close(descriptor)
+        elif handle is not None:
+            _close_windows_path_pin(handle)
         raise
 
 
@@ -1289,8 +1319,18 @@ class _PosixPlatformProvider:
     def close_path_pin(self, handle: object) -> None:
         os.close(int(handle))
 
-    def open_staging_file(self, path: Path, flags: int, mode: int) -> int:
-        return os.open(os.fspath(path), flags, mode)
+    def open_staging_file(
+        self,
+        path: Path,
+        flags: int,
+        mode: int,
+        *,
+        delete_on_close: bool = False,
+    ) -> int:
+        descriptor = os.open(os.fspath(path), flags, mode)
+        if delete_on_close:
+            path.unlink()
+        return descriptor
 
     def close_staging_file(self, descriptor: int) -> None:
         os.close(descriptor)
@@ -1325,8 +1365,20 @@ class _NativeWin32PlatformProvider:
     def close_path_pin(self, handle: object) -> None:
         _close_windows_path_pin(handle)
 
-    def open_staging_file(self, path: Path, flags: int, mode: int) -> int:
-        return _open_windows_staging_file(path, flags, mode)
+    def open_staging_file(
+        self,
+        path: Path,
+        flags: int,
+        mode: int,
+        *,
+        delete_on_close: bool = False,
+    ) -> int:
+        return _open_windows_staging_file(
+            path,
+            flags,
+            mode,
+            delete_on_close=delete_on_close,
+        )
 
     def close_staging_file(self, descriptor: int) -> None:
         os.close(descriptor)
@@ -1422,13 +1474,31 @@ class _SimulatedWin32PlatformProvider(_PosixPlatformProvider):
         self._shares.pop(descriptor, None)
         super().close_path_pin(handle)
 
-    def open_staging_file(self, path: Path, flags: int, mode: int) -> int:
-        descriptor = super().open_staging_file(path, flags, mode)
+    def open_staging_file(
+        self,
+        path: Path,
+        flags: int,
+        mode: int,
+        *,
+        delete_on_close: bool = False,
+    ) -> int:
+        descriptor = super().open_staging_file(
+            path,
+            flags,
+            mode,
+            delete_on_close=False,
+        )
         try:
             identity = _PathIdentity.from_stat(os.fstat(descriptor))
             self._admit(identity, wants_write=True, shares_write=False)
             # The retained writer admits readers, but neither writers nor delete.
             self._shares[descriptor] = (identity, True, False, False)
+            if delete_on_close:
+                # A Windows delete-on-close disposition makes the public name
+                # unavailable while the descriptor remains live.  Model that
+                # name reachability exactly instead of postponing the unlink
+                # until close as the old simulation did.
+                super().unlink_staging_file(path)
             return descriptor
         except BaseException:
             super().close_staging_file(descriptor)
@@ -3448,6 +3518,92 @@ def _open_parent_from_retained_root(
         raise
 
 
+def _ensure_directory_from_retained_root(
+    root_binding: _InstallAncestryBinding | _AnchorAncestryBinding,
+    path: Path,
+    *,
+    code: str,
+) -> None:
+    """Create ``path`` without re-resolving a retained descriptor root."""
+
+    root_binding.verify()
+    try:
+        relative = Path(os.path.abspath(path)).relative_to(
+            Path(os.path.abspath(root_binding.public_root))
+        )
+    except ValueError as exc:
+        raise OrchestrateError(
+            "Machine bootstrap directory creation is outside its retained repair root",
+            code=code,
+            data={
+                "component": "directoryCreate.retainedRoot",
+                "expected": os.fspath(root_binding.public_root),
+                "observed": os.fspath(path),
+            },
+        ) from exc
+
+    if root_binding.leaf_fd is None:
+        # Native Windows keeps every public ancestry component open without
+        # delete sharing, so its spelling cannot be replaced while this
+        # descent creates and pins the child components.
+        with _DirectoryDescent(path, create=True, code=code) as descent:
+            descent.verify()
+        root_binding.verify()
+        return
+
+    descriptor = os.dup(root_binding.leaf_fd)
+    public_parent = root_binding.public_root
+    try:
+        for component in relative.parts:
+            public_child = public_parent / component
+            try:
+                info = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                _before_directory_component_create(public_parent, public_child)
+                try:
+                    os.mkdir(component, dir_fd=descriptor)
+                except OSError as exc:
+                    raise OrchestrateError(
+                        "Machine bootstrap could not create a retained-root directory",
+                        code=code,
+                        data={
+                            "component": "directoryCreate.component",
+                            "expected": "new-directory-under-retained-parent",
+                            "observed": type(exc).__name__,
+                            "path": os.fspath(public_child),
+                        },
+                    ) from exc
+                info = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if _is_reparse(info) or stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise OrchestrateError(
+                    "Machine bootstrap refuses a redirected retained-root directory",
+                    code=code,
+                    data={
+                        "component": "directoryCreate.nodeType",
+                        "expected": "directory",
+                        "observed": (
+                            "redirected"
+                            if _is_reparse(info) or stat.S_ISLNK(info.st_mode)
+                            else "unexpected-node"
+                        ),
+                        "path": os.fspath(public_child),
+                    },
+                )
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+            )
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            public_parent = public_child
+    finally:
+        os.close(descriptor)
+    root_binding.verify()
+
+
 def _atomic_write_owned(
     path: Path,
     raw: bytes,
@@ -3625,11 +3781,12 @@ def _atomic_write_owned(
                         | getattr(os, "O_NOFOLLOW", 0)
                         | _binary_open_flag()
                     )
-                    if provider.windows_semantics and retain_descriptor:
+                    if provider.windows_semantics:
                         descriptor = provider.open_staging_file(
                             staging_parent_path / temporary_name,
                             stage_flags,
                             0o600,
+                            delete_on_close=False,
                         )
                     else:
                         descriptor = os.open(
@@ -3976,6 +4133,14 @@ def _atomic_write_owned(
                         Path(f"/proc/self/fd/{retained_temporary_parent_descriptor}")
                         / temporary_name
                     )
+            elif provider.windows_semantics:
+                # The committed target now names the verified staged node.  A
+                # normal Windows named stage must be closed before its
+                # abandoned/post-commit temporary name is explicitly removed;
+                # no delete disposition is armed during staging.
+                provider.close_staging_file(descriptor)
+                descriptor = None
+                provider.unlink_staging_file(staging_parent_path / temporary_name)
             else:
                 os.unlink(
                     temporary_name
@@ -3997,7 +4162,7 @@ def _atomic_write_owned(
             if retain_descriptor
             else None
         )
-        if not retain_descriptor:
+        if not retain_descriptor and descriptor is not None:
             provider.close_staging_file(descriptor)
         descriptor = None
         if root_binding is not None:
@@ -4020,10 +4185,15 @@ def _atomic_write_owned(
                 pass
         if temporary_name is not None and not anonymous:
             try:
-                os.unlink(
-                    temporary_name if parent_fd is not None else os.fspath(path.parent / temporary_name),
-                    **({} if parent_fd is None else {"dir_fd": parent_fd}),
-                )
+                if provider.windows_semantics:
+                    provider.unlink_staging_file(staging_parent_path / temporary_name)
+                else:
+                    os.unlink(
+                        temporary_name
+                        if parent_fd is not None
+                        else os.fspath(path.parent / temporary_name),
+                        **({} if parent_fd is None else {"dir_fd": parent_fd}),
+                    )
             except OSError:
                 pass
         if parent_fd is not None:
@@ -4382,7 +4552,15 @@ def _write_shim(
     return True
 
 
-def _ensure_directory(path: Path, *, code: str) -> None:
+def _ensure_directory(
+    path: Path,
+    *,
+    code: str,
+    root_binding: _InstallAncestryBinding | _AnchorAncestryBinding | None = None,
+) -> None:
+    if root_binding is not None:
+        _ensure_directory_from_retained_root(root_binding, path, code=code)
+        return
     with _DirectoryDescent(path, create=True, code=code) as descent:
         descent.verify()
 
@@ -5065,7 +5243,11 @@ def ensure_machine(
                     archive_stages_evidence = list(archive.stage_diagnostics)
                     archive.close()
 
-            _ensure_directory(selected_layout.bin_root, code="machine_bootstrap_shim_write_failed")
+            _ensure_directory(
+                selected_layout.bin_root,
+                code="machine_bootstrap_shim_write_failed",
+                root_binding=install_ancestry,
+            )
             source.verify()
             if _write_shim(
                 selected_layout.windows_shim,

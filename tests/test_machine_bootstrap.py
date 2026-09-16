@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import random
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,7 @@ from orchestrate.machine_bootstrap import (
     _atomic_write_owned,
     _build_source_archive,
     _commit_staged_no_replace,
+    _ensure_directory,
     _ensure_install_parent,
     _install_receipt_matches,
     _NATIVE_WIN32_PROVIDER,
@@ -127,15 +129,17 @@ def install_ready_files(layout: MachineLayout) -> None:
                 archive,
                 installation_id="fixture-installation",
             )
-    layout.install_receipt.write_text(
-        json.dumps(receipt, sort_keys=True, separators=(",", ":"))
-        + "\n",
-        encoding="utf-8",
+    layout.install_receipt.write_bytes(
+        (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
     )
     layout.install_anchor.parent.mkdir(parents=True, exist_ok=True)
-    layout.install_anchor.write_text(
-        json.dumps(_anchor_value(receipt), sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
+    layout.install_anchor.write_bytes(
+        (
+            json.dumps(_anchor_value(receipt), sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
     )
     layout.bin_root.mkdir(parents=True, exist_ok=True)
     layout.windows_shim.write_text(_windows_shim_text(), encoding="utf-8", newline="")
@@ -174,6 +178,12 @@ def resolving(layout: MachineLayout, store: FakeUserPath):
 
 
 class MachineBootstrapTests(unittest.TestCase):
+    def test_canonical_machine_record_fixtures_never_use_text_writes(self) -> None:
+        source = Path(__file__).read_text(encoding="utf-8")
+        forbidden_call = "." + "write" + "_text("
+        for fixture_name in ("install_receipt", "install_anchor", "source_archive"):
+            self.assertNotIn(fixture_name + forbidden_call, source)
+
     def test_windows_alias_identity_is_handle_based_not_spelling_based(self) -> None:
         opened = SimpleNamespace(st_dev=7, st_ino=99, st_mode=0o100600)
         same_file_through_alias = SimpleNamespace(st_dev=7, st_ino=99, st_mode=0o100444)
@@ -414,9 +424,8 @@ class MachineBootstrapTests(unittest.TestCase):
             root = Path(directory)
             layout = fixture_layout(root)
             install_ready_files(layout)
-            layout.install_receipt.write_text(
-                '{"schema":"orchestrate-machine-install/v1","sourceRoot":"stale"}\n',
-                encoding="utf-8",
+            layout.install_receipt.write_bytes(
+                b'{"schema":"orchestrate-machine-install/v1","sourceRoot":"stale"}\n'
             )
             layout.windows_shim.write_text("wrong\n", encoding="utf-8")
             receipt_victim = root / "receipt-victim"
@@ -529,6 +538,30 @@ class MachineBootstrapTests(unittest.TestCase):
                     expected_target=None,
                 )
             self.assertEqual(target.read_bytes(), b"forced-named\n")
+
+    @unittest.skipIf(sys.platform == "win32", "simulated provider uses descriptor-host APIs")
+    def test_forced_named_staging_uses_provider_lifetime_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "orchestrate.machine_bootstrap._active_platform_provider",
+            return_value=_SIMULATED_WIN32_PROVIDER,
+        ), patch(
+            "orchestrate.machine_bootstrap._staging_strategy",
+            return_value="named",
+        ), patch.object(
+            _SIMULATED_WIN32_PROVIDER,
+            "open_staging_file",
+            wraps=_SIMULATED_WIN32_PROVIDER.open_staging_file,
+        ) as opened:
+            target = Path(directory) / "provider-named-stage"
+            _atomic_write_owned(
+                target,
+                b"provider-owned-lifetime\n",
+                executable=False,
+                expected_target=None,
+            )
+            self.assertEqual(target.read_bytes(), b"provider-owned-lifetime\n")
+            opened.assert_called_once()
+            self.assertIs(opened.call_args.kwargs["delete_on_close"], False)
 
     @unittest.skipIf(sys.platform == "win32", "O_TMPFILE is a Linux test-provider branch")
     def test_forced_anonymous_staging_branch_commits_exact_bytes(self) -> None:
@@ -716,9 +749,10 @@ class MachineBootstrapTests(unittest.TestCase):
             install_ready_files(layout)
             receipt = json.loads(layout.install_receipt.read_text(encoding="utf-8"))
             receipt["sourceRoot"] = str(layout.source_root.parent / "laundered")
-            layout.install_receipt.write_text(
-                json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
-                encoding="utf-8",
+            layout.install_receipt.write_bytes(
+                (
+                    json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8")
             )
             with self.assertRaises(OrchestrateError) as tampered:
                 ensure_machine(
@@ -753,9 +787,10 @@ class MachineBootstrapTests(unittest.TestCase):
                     archive,
                     installation_id=recorded["installationId"],
                 )
-            layout.install_receipt.write_text(
-                json.dumps(forged, sort_keys=True, separators=(",", ":")) + "\n",
-                encoding="utf-8",
+            layout.install_receipt.write_bytes(
+                (
+                    json.dumps(forged, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8")
             )
 
             with self.assertRaises(OrchestrateError) as held:
@@ -876,6 +911,35 @@ class MachineBootstrapTests(unittest.TestCase):
                     allow_write_share=True,
                 )
                 _SIMULATED_WIN32_PROVIDER.close_path_pin(bridge)
+            finally:
+                _SIMULATED_WIN32_PROVIDER.close_staging_file(descriptor)
+
+    def test_simulated_named_stage_is_public_until_explicit_abandonment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / "normal-stage"
+            descriptor = _SIMULATED_WIN32_PROVIDER.open_staging_file(
+                stage,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+                delete_on_close=False,
+            )
+            try:
+                self.assertTrue(stat.S_ISREG(stage.lstat().st_mode))
+            finally:
+                _SIMULATED_WIN32_PROVIDER.close_staging_file(descriptor)
+            _SIMULATED_WIN32_PROVIDER.unlink_staging_file(stage)
+            self.assertFalse(stage.exists())
+
+            delete_pending = root / "delete-pending-stage"
+            descriptor = _SIMULATED_WIN32_PROVIDER.open_staging_file(
+                delete_pending,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+                delete_on_close=True,
+            )
+            try:
+                self.assertFalse(delete_pending.exists())
             finally:
                 _SIMULATED_WIN32_PROVIDER.close_staging_file(descriptor)
 
@@ -1384,6 +1448,55 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(held.exception.code, "machine_bootstrap_install_identity_changed")
             self.assertFalse((substitute / layout.source_archive.name).exists())
 
+    @unittest.skipIf(sys.platform == "win32", "native no-delete handles deny root rename")
+    def test_bin_creation_refuses_a_replaced_retained_root_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            runner = SyntheticInstaller(layout)
+            retained = root / "retained-install"
+            substitute = layout.install_root
+            intercepted = False
+
+            def replace_before_bin(
+                path: Path,
+                *,
+                code: str,
+                root_binding: object | None = None,
+            ) -> None:
+                nonlocal intercepted
+                if path == layout.bin_root and not intercepted:
+                    intercepted = True
+                    os.replace(layout.install_root, retained)
+                    substitute.mkdir()
+                if root_binding is None:
+                    _ensure_directory(path, code=code)
+                else:
+                    _ensure_directory(
+                        path,
+                        code=code,
+                        root_binding=root_binding,  # type: ignore[arg-type]
+                    )
+
+            with patch(
+                "orchestrate.machine_bootstrap._ensure_directory",
+                side_effect=replace_before_bin,
+            ):
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        layout=layout,
+                        path_store=FakeUserPath(),
+                        resolver=lambda *_: None,
+                        runner=runner,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
+
+            self.assertTrue(intercepted)
+            self.assertEqual(list(substitute.iterdir()), [])
+            self.assertFalse((retained / "bin").exists())
+            self.assertEqual(held.exception.code, "machine_bootstrap_install_identity_changed")
+
     def test_redirected_install_ancestry_is_refused_before_any_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1444,6 +1557,38 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(held.exception.data["expected"], "directory")
             self.assertEqual(held.exception.data["observed"], "redirected")
             self.assertIn('"component":"installNode.nodeType"', str(held.exception))
+
+    def test_redacted_string_identities_are_not_content_digests(self) -> None:
+        error = OrchestrateError(
+            "synthetic receipt failure",
+            code="machine_bootstrap_receipt_write_failed",
+            data={
+                "component": "receipt-and-anchor.write",
+                "expected": "both-canonical-records",
+                "observed": "FileNotFoundError",
+            },
+        )
+        self.assertRegex(
+            error.data["expected"],
+            r"\Aredacted-string-id:sha256:[0-9a-f]{64}\Z",
+        )
+        self.assertRegex(
+            error.data["observed"],
+            r"\Aredacted-string-id:sha256:[0-9a-f]{64}\Z",
+        )
+
+        digest = "sha256:" + "a" * 64
+        content_error = OrchestrateError(
+            "synthetic content mismatch",
+            code="machine_bootstrap_commit_identity_changed",
+            data={
+                "component": "commit.stagedSha256",
+                "expected": digest,
+                "observed": digest,
+            },
+        )
+        self.assertEqual(content_error.data["expected"], digest)
+        self.assertEqual(content_error.data["observed"], digest)
 
     @unittest.skipIf(sys.platform == "win32", "native Windows uses an ancestor junction probe")
     def test_redirected_anchor_ancestor_cannot_authorize_a_receipt(self) -> None:
@@ -1860,10 +2005,9 @@ class MachineBootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             layout = fixture_layout(Path(directory))
             install_ready_files(layout)
-            layout.install_receipt.write_text(
-                '{"schema":"orchestrate-machine-install/v2",'
-                '"sourceRoot":"wrong","sourceRoot":"also-wrong"}\n',
-                encoding="utf-8",
+            layout.install_receipt.write_bytes(
+                b'{"schema":"orchestrate-machine-install/v2",'
+                b'"sourceRoot":"wrong","sourceRoot":"also-wrong"}\n'
             )
             store = FakeUserPath(str(layout.bin_root))
             runner = SyntheticInstaller(layout)
