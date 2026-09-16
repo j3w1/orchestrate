@@ -1315,10 +1315,11 @@ class MachineBootstrapTests(unittest.TestCase):
                 return original_call(argv, **kwargs)
 
             if sys.platform == "win32":
+                store = FakeUserPath()
                 result = ensure_machine(
                     layout=layout,
-                    path_store=FakeUserPath(),
-                    resolver=lambda *_: None,
+                    path_store=store,
+                    resolver=resolving(layout, store),
                     runner=transient_archive,
                     platform="win32",
                     version_info=(3, 13),
