@@ -416,16 +416,13 @@ class CoordinationTests(unittest.TestCase):
             SharedContract(digest, "settled", {"nested": {"version": 9}})
         self.assertEqual(mismatch.exception.code, "shared_contract_digest_mismatch")
 
-    def test_exact_session_is_reused_only_for_immediate_same_agent_work(self) -> None:
+    def test_new_task_always_releases_the_prior_session_even_for_the_same_agent(self) -> None:
         session = WorkerSession(
             "dispatch_1", "task_1", "term_exact", "resource_1", "worktree_1", "codex", "run_1"
         )
         reused = next_session_action(session, next_task_id="task_2", next_agent="codex")
-        self.assertEqual(reused.kind, "reuse")
-        self.assertEqual(
-            reused.argv[-4:],
-            ("--terminal", "term_exact", "--worktree", "id:worktree_1"),
-        )
+        self.assertEqual(reused.kind, "release")
+        self.assertNotIn("--terminal", reused.argv)
         released = next_session_action(session, next_task_id="task_2", next_agent="claude")
         self.assertEqual(released.kind, "release")
         self.assertEqual(released.argv[-1], "dispatch_1")

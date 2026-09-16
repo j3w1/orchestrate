@@ -30,6 +30,7 @@ from orchestrate.controller import (
     answer,
     explain,
     implement,
+    packet,
     reconcile_intentions,
     resume,
     status,
@@ -1325,6 +1326,7 @@ class MilestoneRepo(unittest.TestCase):
         objective: str,
         *,
         specialist_keys: tuple[str, ...] = ("verify",),
+        max_workers: int = 2,
     ) -> str:
         relative = "milestone-plan.json"
         specialist_tasks = [
@@ -1343,7 +1345,7 @@ class MilestoneRepo(unittest.TestCase):
                 {
                     "schema": "orchestrate-milestone-plan/v1",
                     "contract": {"interface": "frozen-v1", "checks": ["focused"]},
-                    "maxWorkers": 2,
+                    "maxWorkers": max_workers,
                     "tasks": [
                         {
                             "key": "owner",
@@ -1374,6 +1376,24 @@ class MilestoneRepo(unittest.TestCase):
 
 
 class ControllerTests(MilestoneRepo):
+    def test_packet_uses_the_existing_read_only_state_store(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective="read one packet", profile_digest="p", source_digest="s")
+            run = store.update_run(run.local_id, task_id="task_packet")
+            store.save_packet(run.local_id, "task_packet", '{"schema":"fixture-packet/v1"}')
+
+        observed_modes: list[bool] = []
+        original_init = StateStore.__init__
+
+        def observe_init(instance: StateStore, *arguments: object, **keywords: object) -> None:
+            observed_modes.append(keywords.get("read_only") is True)
+            original_init(instance, *arguments, **keywords)  # type: ignore[arg-type]
+
+        with patch.object(StateStore, "__init__", new=observe_init):
+            observed = packet(self.root, run.local_id, "task_packet")
+        self.assertEqual(observed, {"schema": "fixture-packet/v1"})
+        self.assertEqual(observed_modes, [True])
+
     def test_public_implement_prelaunch_accepts_bound_milestone_plan_source(self) -> None:
         objective = "Validate the bound milestone plan before native launch"
         plan = self._write_milestone_plan(objective)
@@ -1396,6 +1416,93 @@ class ControllerTests(MilestoneRepo):
                 require_context=False,
             )
         self.assertTrue(any(call[:2] == ("orchestration", "worker-start") for call in client.calls))
+
+    def test_public_implement_records_exceptional_grant_before_native_launch(self) -> None:
+        objective = "Grant four bounded workers before the first launch"
+        plan = self._write_milestone_plan(
+            objective,
+            specialist_keys=("verify_a", "verify_b", "verify_c"),
+            max_workers=4,
+        )
+
+        class PrelaunchReached(RuntimeError):
+            pass
+
+        class PrelaunchProbe(MilestoneClient):
+            def _launch(self, task_id: str, arguments: tuple[str, ...]) -> OrcaJsonResponse:
+                with StateStore(self.root, home=Path(self.state_home)) as store:
+                    run = store.select_run(None)
+                    grants = [item for item in store.evidence(run.local_id) if item["kind"] == "capacity-grant"]
+                self.asserted_grants = grants
+                raise PrelaunchReached(f"validated {task_id}")
+
+        client = PrelaunchProbe(self.root)
+        client.state_home = self.state_temp.name
+        with self.assertRaisesRegex(PrelaunchReached, "validated task_1"):
+            implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                allow_exceptional_capacity=True,
+                capacity_reason="four independent bounded checks",
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(len(client.asserted_grants), 1)
+        payload = client.asserted_grants[0]["payload"]
+        self.assertEqual(payload["runId"], "run_1")
+        self.assertEqual(payload["limit"], 4)
+        self.assertEqual(payload["reason"], "four independent bounded checks")
+
+    def test_public_resume_can_record_exceptional_grant_before_first_launch(self) -> None:
+        objective = "Resume a held four-worker Run with an exact grant"
+        plan = self._write_milestone_plan(
+            objective,
+            specialist_keys=("verify_a", "verify_b", "verify_c"),
+            max_workers=4,
+        )
+        client = MilestoneClient(self.root)
+        with self.assertRaises(OrchestrateError) as held:
+            implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(held.exception.code, "exceptional_capacity_required")
+        self.assertFalse(any(call[:2] == ("orchestration", "worker-start") for call in client.calls))
+
+        class PrelaunchReached(RuntimeError):
+            pass
+
+        original_launch = client._launch
+
+        def stop_at_launch(task_id: str, arguments: tuple[str, ...]) -> OrcaJsonResponse:
+            with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+                run = store.select_run(None)
+                grants = [item for item in store.evidence(run.local_id) if item["kind"] == "capacity-grant"]
+            self.assertEqual(len(grants), 1)
+            self.assertEqual(grants[0]["payload"]["limit"], 4)
+            raise PrelaunchReached(f"validated {task_id}")
+
+        client._launch = stop_at_launch  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(PrelaunchReached, "validated task_1"):
+                resume(
+                    self.root,
+                    None,
+                    client=client,  # type: ignore[arg-type]
+                    milestone_plan=plan,
+                    allow_exceptional_capacity=True,
+                    capacity_reason="resume four independent bounded checks",
+                    wait_timeout_ms=60_000,
+                    require_context=False,
+                )
+        finally:
+            client._launch = original_launch  # type: ignore[method-assign]
 
     @requires_native_windows_admission
     def test_production_controller_executes_tracked_native_milestone_plan(self) -> None:
@@ -1491,7 +1598,7 @@ class ControllerTests(MilestoneRepo):
     @requires_native_windows_admission
     def test_resume_executes_valid_mixed_later_waves_under_remaining_capacity(self) -> None:
         objective = "Resume every valid later specialist wave"
-        specialists = ("verify_a", "verify_b", "verify_c")
+        specialists = ("verify_a", "verify_b", "verify_c", "verify_d", "verify_e")
         plan = self._write_milestone_plan(objective, specialist_keys=specialists)
         client = MilestoneClient(self.root, pause_after_owner=True)
 
@@ -1549,7 +1656,14 @@ class ControllerTests(MilestoneRepo):
                 for call in client.calls
                 if call[:2] == ("orchestration", "worker-start")
             ],
-            ["task_1", "task_2", "task_3", "task_4", "task_5"],
+            ["task_1", "task_2", "task_3", "task_4", "task_5", "task_6", "task_7"],
+        )
+        self.assertTrue(
+            all(
+                "--terminal" not in call
+                for call in client.calls
+                if call[:2] == ("orchestration", "worker-start")
+            )
         )
 
     @requires_native_windows_admission
@@ -3890,6 +4004,7 @@ class ControllerTests(MilestoneRepo):
         ]
         self.assertEqual(len(diagnostics), 1)
         self.assertEqual(diagnostics[0]["status"], "unresolved")
+
         self.assertFalse(diagnostics[0]["payload"]["taskInputResent"])
         self.assertEqual(sum("worker-start" in call for call in client.calls), 1)
         self.assertEqual(sum(call[:2] == ("orchestration", "worker-show") for call in client.calls), 2)
@@ -3905,6 +4020,38 @@ class ControllerTests(MilestoneRepo):
                 sum(item["subject"] == "worker input submission unproven" for item in store.evidence(run.local_id)),
                 1,
             )
+
+    def test_thirty_minute_healthy_wait_uses_native_checks_without_coordination_model_launches(self) -> None:
+        objective = "Wait efficiently for the already-running implementation owner"
+        responses = completion_responses(self.root, objective)[:6]
+        responses.extend(
+            {"result": {"deliveryId": None, "messages": [], "timedOut": True}}
+            for _ in range(30)
+        )
+        client = FakeClient(responses)
+        clock = (0.0, *(float(index * 60) for index in range(30)), 1800.0)
+
+        with patch("orchestrate.controller._monotonic", side_effect=clock) as controlled_clock:
+            report = implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=1_800_000,
+                require_context=False,
+            )
+
+        checks = [call for call in client.calls if call[:2] == ("orchestration", "check")]
+        starts = [call for call in client.calls if call[:2] == ("orchestration", "worker-start")]
+        self.assertEqual(report["status"], "waiting")
+        self.assertEqual(controlled_clock.call_count, 32)
+        self.assertEqual(len(checks), 30)
+        self.assertTrue(all(call[call.index("--timeout-ms") + 1] == "60000" for call in checks))
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(
+            report["efficiency"]["usage"]["controllerModelCalls"],
+            {"value": 0, "scope": "instrumented deterministic controller only"},
+        )
+        self.assertEqual(client.responses, [])
 
     def test_controller_rejects_both_versioned_input_accepted_failure_fields(self) -> None:
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
@@ -4486,7 +4633,7 @@ class ControllerTests(MilestoneRepo):
 
             self.assertEqual(recovered.phase, "worker_unadmitted")
             self.assertFalse(any("worker-release" in call for call in recovery_client.calls))
-            self.assertEqual(len(store.evidence(run.local_id)), 2)
+            self.assertEqual(len(store.evidence(run.local_id)), 3)
 
     def test_resume_reprocesses_terminal_phase_observed_delivery_and_acks(self) -> None:
         profile = setup_project(self.root)

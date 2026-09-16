@@ -32,6 +32,7 @@ Do not record credentials, private source text, raw environments, personal files
 | Read-only discovery trial, CE-governed repository | Discovery functions only; never run `setup`, project hooks, checks, or mutations | No matching correction-candidate record yet | `NOT_RUN` |
 | Read-only discovery trial, `j3w1.github.io` | Discovery functions only; never run `setup`, project hooks, checks, or mutations | No matching correction-candidate record yet | `NOT_RUN` |
 | Disposable Windows multi-worker frontier | More ready work than `maxWorkers`, native dependencies/gates, deterministic waves, and restart reconciliation in a disposable repository | No matching correction-candidate record yet | `NOT_RUN` |
+| Per-Run efficiency controls | Omitted/default and explicit ordinary limits; exceptional grant binding; five-ready capacity-two waves; uncertain launch/release occupancy; restart replay; fresh Task sessions; 2h/8h boundaries; strict intervention concurrency; read-only telemetry and historical unknowns | No matching correction-candidate record yet | `NOT_RUN` |
 | Windows-coordinated WSL lifecycle | This candidate admits managed workers only on Windows; prove launcher transport and direct Orca WSL lifecycle separately without claiming WSL worker admission | No matching correction-candidate record yet | `NOT_RUN` |
 | Matched direct-versus-orchestrate cost trial | Same disposable starting inputs, roster, objective, and required checks; no provider billing inference | Coordinator cost record | `NOT_RUN` |
 | Hosted Windows/Linux CI | Exact-candidate matrix jobs run their unit and incident suites, explicit incident discovery, an in-checkout wheel build, an isolated install, and the CLI help smokes | No matching correction-candidate record yet | `NOT_RUN` |
@@ -59,6 +60,10 @@ The earlier missing-source and incomplete-source-record limitations are correcte
 The bounded source reads still do not make a multi-file snapshot atomic and do not constrain hostile or unrelated external writers. The CE query therefore rechecks the exact completed query-source identities immediately before and after its subprocess, while the immutable observation and admission/effect fence continue to order only managed preflight and controller paths.
 
 The tracked milestone plan has explicit controller-bound source membership. A host-neutral public `implement --plan` prelaunch regression reaches `worker-start` only after that non-reader source validates, while Windows-only tests retain responsibility for the subsequent managed-admission lifecycle. Repo-reader routing cannot make an otherwise ineligible packet path readable, and a reference-only source that appears between checks is rejected without a byte read.
+
+### Efficiency evidence boundary
+
+Capacity and intervention coverage uses disposable host-local databases and synthetic public Orca receipts. Stable efficiency events record controller-observed Run/session boundaries; they do not inspect transcripts or request provider usage. Session durations are observed wall time and are not compute time. A historical database with the current table contract remains readable, but session counts that predate the efficiency start event remain `unknown` rather than being reconstructed from incomplete evidence. Worker tokens, model turns, external coordinator usage, provider billing, and live model behavior remain unavailable unless separately observed by an explicit future contract. The deterministic controller's scoped model-call count does not describe the enclosing agent that invoked it.
 
 ### Hosted CI history and unstarted worker attempt
 

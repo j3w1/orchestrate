@@ -1333,13 +1333,54 @@ class StateStore(AbstractContextManager["StateStore"]):
             (f"evidence_{uuid.uuid4().hex}", run_local_id, kind, status, subject, json.dumps(payload, sort_keys=True), utc_now()),
         )
 
+    def record_stable_evidence(
+        self,
+        run_local_id: str,
+        *,
+        evidence_id: str,
+        kind: str,
+        status: str,
+        subject: str,
+        payload: object,
+        created_at: str | None = None,
+    ) -> None:
+        """Insert one replay-safe evidence event with an externally stable identity."""
+
+        if not evidence_id or not evidence_id.startswith("evidence_"):
+            raise ValueError("Stable evidence IDs must use the evidence_ prefix")
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        existing = self.connection.execute(
+            "SELECT run_local_id, kind, status, subject, payload_json FROM evidence WHERE id = ?",
+            (evidence_id,),
+        ).fetchone()
+        if existing is not None:
+            observed = (
+                existing["run_local_id"],
+                existing["kind"],
+                existing["status"],
+                existing["subject"],
+                existing["payload_json"],
+            )
+            expected = (run_local_id, kind, status, subject, encoded)
+            if observed != expected:
+                raise OrchestrateError(
+                    "Stable evidence identity conflicts with its recorded event",
+                    code="evidence_identity_conflict",
+                )
+            return
+        self.connection.execute(
+            "INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (evidence_id, run_local_id, kind, status, subject, encoded, created_at or utc_now()),
+        )
+
     def evidence(self, run_local_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute(
-            "SELECT kind, status, subject, payload_json, created_at FROM evidence WHERE run_local_id = ? ORDER BY created_at",
+            "SELECT id, kind, status, subject, payload_json, created_at FROM evidence WHERE run_local_id = ? ORDER BY created_at, id",
             (run_local_id,),
         ).fetchall()
         return [
             {
+                "eventId": row["id"],
                 "kind": row["kind"],
                 "status": row["status"],
                 "subject": row["subject"],

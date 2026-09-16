@@ -177,7 +177,7 @@ class MilestonePlan:
     contract: SharedContract
     candidate_digest: str
     tasks: tuple[MilestoneTask, ...]
-    max_workers: int = 3
+    max_workers: int = 2
 
     def validated(self) -> "MilestonePlan":
         if not self.candidate_digest:
@@ -336,7 +336,8 @@ def load_milestone_plan(
         )
     raw = read_project_bytes(root, relative)
     try:
-        decoded = json.loads(raw.decode("utf-8"))
+        original_json = raw.decode("utf-8")
+        decoded = json.loads(original_json)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OrchestrateError("Milestone plan is not strict UTF-8 JSON", code="milestone_plan_invalid") from exc
     plan = _validated_milestone_plan_value(
@@ -344,9 +345,8 @@ def load_milestone_plan(
         objective=objective,
         candidate_digest=candidate_digest,
     )
-    canonical = _canonical_json(decoded)
-    digest = _canonical_digest_from_json(canonical, "plan")
-    return LoadedMilestonePlan(relative, digest, canonical, plan)
+    digest = _canonical_digest_from_json(original_json, "plan")
+    return LoadedMilestonePlan(relative, digest, original_json, plan)
 
 
 def load_stored_milestone_plan(
@@ -362,12 +362,6 @@ def load_stored_milestone_plan(
         decoded = json.loads(plan_json)
     except (TypeError, json.JSONDecodeError) as exc:
         raise OrchestrateError("Stored milestone plan is not strict JSON", code="milestone_plan_invalid") from exc
-    canonical = _canonical_json(decoded)
-    if canonical != plan_json:
-        raise OrchestrateError(
-            "Stored milestone plan bytes are not canonical",
-            code="milestone_plan_invalid",
-        )
     plan = _validated_milestone_plan_value(
         decoded,
         objective=objective,
@@ -375,8 +369,8 @@ def load_stored_milestone_plan(
     )
     return LoadedMilestonePlan(
         relative_path,
-        _canonical_digest_from_json(canonical, "plan"),
-        canonical,
+        _canonical_digest_from_json(plan_json, "plan"),
+        plan_json,
         plan,
     )
 
@@ -389,11 +383,14 @@ def _validated_milestone_plan_value(
 ) -> MilestonePlan:
     """Validate the complete v1 schema, contract, Tasks, roles, dependencies, and gates."""
 
-    if not isinstance(decoded, Mapping) or set(decoded) != {"schema", "contract", "maxWorkers", "tasks"}:
+    if not isinstance(decoded, Mapping) or set(decoded) not in (
+        {"schema", "contract", "tasks"},
+        {"schema", "contract", "maxWorkers", "tasks"},
+    ):
         raise OrchestrateError("Milestone plan has unsupported or missing fields", code="milestone_plan_invalid")
     if decoded.get("schema") != MILESTONE_PLAN_SCHEMA:
         raise OrchestrateError("Milestone plan schema is unsupported", code="milestone_plan_invalid")
-    max_workers = decoded.get("maxWorkers")
+    max_workers = decoded.get("maxWorkers", 2)
     raw_tasks = decoded.get("tasks")
     raw_contract = decoded.get("contract")
     if type(max_workers) is not int or not isinstance(raw_tasks, list) or not isinstance(raw_contract, Mapping):
@@ -1229,20 +1226,9 @@ def next_session_action(
 ) -> SessionAction:
     """Choose exactly one post-settlement owner for the bound terminal."""
 
-    if next_task_id is not None and next_agent == session.agent:
-        return SessionAction(
-            "reuse",
-            (
-                "orchestration",
-                "worker-start",
-                "--task",
-                next_task_id,
-                "--terminal",
-                session.terminal_handle,
-                "--worktree",
-                f"id:{session.worktree_id}",
-            ),
-        )
+    # A Task boundary is a session boundary. Existing Dispatch recovery and
+    # answers retain their session, but a newly created Task always starts a
+    # fresh agent session even when its role selects the same agent.
     return SessionAction(
         "release",
         ("orchestration", "worker-release", "--dispatch", session.dispatch_id),

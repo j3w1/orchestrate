@@ -33,6 +33,13 @@ from .coordination import (
 )
 from .admission import joined_preflight_status, other_dispatch_observations, validate_packet_sources
 from .errors import OrchestrateError
+from .efficiency import (
+    efficiency_report,
+    ensure_capacity_grant,
+    initialize_efficiency_observation,
+    occupied_milestone_tasks,
+    record_efficiency_event,
+)
 from .identity import ControllerIdentity, require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError, orca_task_title
 from .orca_compat import (
@@ -441,6 +448,18 @@ def _reconcile_confirmed_worker_start(
         worktree_id=resource_identity.worktree_id,
         readback=readback,
     )
+    binding_row = store.connection.execute(
+        "SELECT created_at FROM worker_resource_bindings WHERE run_local_id = ?",
+        (run.local_id,),
+    ).fetchone()
+    record_efficiency_event(
+        store,
+        run.local_id,
+        event="session_created",
+        identity=str(dispatch_id),
+        details={"taskId": str(run.task_id), "kind": "implementation-owner"},
+        observed_at=binding_row["created_at"] if binding_row is not None else None,
+    )
     store.mark_intention(
         intention_id,
         "applied",
@@ -807,6 +826,7 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
         "nextObligation": next_obligation,
         "live": live,
         "evidence": store.evidence(run.local_id),
+        "efficiency": efficiency_report(store, run),
     }
 
 
@@ -856,6 +876,42 @@ def _milestone_plan_path(store: StateStore, run: RunRecord) -> str | None:
         (run.local_id,),
     ).fetchone()
     return str(row["relative_path"]) if row is not None else None
+
+
+def _run_capacity_binding(store: StateStore, run: RunRecord) -> tuple[str | None, int]:
+    row = store.connection.execute(
+        "SELECT relative_path, plan_digest, plan_json FROM milestone_plan_bindings WHERE run_local_id = ?",
+        (run.local_id,),
+    ).fetchone()
+    if row is None:
+        return None, 1
+    loaded = load_stored_milestone_plan(
+        row["relative_path"],
+        row["plan_json"],
+        objective=run.objective,
+        candidate_digest=run.source_digest,
+    )
+    if loaded.digest != row["plan_digest"]:
+        raise OrchestrateError("Stored milestone plan digest changed", code="milestone_plan_changed")
+    return loaded.digest, loaded.plan.max_workers
+
+
+def _ensure_run_capacity(
+    store: StateStore,
+    run: RunRecord,
+    *,
+    allow_exceptional_capacity: bool = False,
+    capacity_reason: str | None = None,
+) -> None:
+    plan_digest, requested = _run_capacity_binding(store, run)
+    ensure_capacity_grant(
+        store,
+        run,
+        plan_digest=plan_digest,
+        requested_limit=requested,
+        allow_exceptional_capacity=allow_exceptional_capacity,
+        capacity_reason=capacity_reason,
+    )
 
 
 def _has_milestone_history(store: StateStore, run: RunRecord) -> bool:
@@ -1784,6 +1840,13 @@ def _release_disposition(
                 "worker-show release readback still exposes an attached terminal",
                 code="release_unconfirmed",
             )
+        record_efficiency_event(
+            store,
+            run.local_id,
+            event="session_released",
+            identity=str(run.dispatch_id),
+            details={"disposition": "released" if released_resource else "retained"},
+        )
         return
     if release_state == "release_pending":
         raise OrchestrateError(
@@ -2201,6 +2264,14 @@ def _start_milestone_worker(
     if existing is not None:
         if existing["task_id"] != binding.task_id or existing["role"] != task.role or existing["agent"] != choice.agent:
             raise OrchestrateError("Stored milestone worker conflicts with its planned Task", code="native_worker_binding_mismatch")
+        record_efficiency_event(
+            store,
+            run.local_id,
+            event="session_created",
+            identity=existing["dispatch_id"],
+            details={"taskId": binding.task_id, "taskKey": task.key, "kind": "milestone"},
+            observed_at=existing["created_at"],
+        )
         return
     operation = f"milestone-worker-start:{task.key}"
     unresolved = store.connection.execute(
@@ -2310,24 +2381,33 @@ def _start_milestone_worker(
         response=response,
     )
     now = utc_now()
-    store.connection.execute(
-        """INSERT INTO milestone_worker_bindings
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'owned', ?, ?, ?)""",
-        (
+    with store.transaction():
+        store.connection.execute(
+            """INSERT INTO milestone_worker_bindings
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'owned', ?, ?, ?)""",
+            (
+                run.local_id,
+                task.key,
+                binding.task_id,
+                dispatch_id,
+                task.role,
+                choice.agent,
+                resource.resource_id,
+                resource.terminal_handle,
+                resource.worktree_id,
+                json.dumps(readback, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        record_efficiency_event(
+            store,
             run.local_id,
-            task.key,
-            binding.task_id,
-            dispatch_id,
-            task.role,
-            choice.agent,
-            resource.resource_id,
-            resource.terminal_handle,
-            resource.worktree_id,
-            json.dumps(readback, sort_keys=True),
-            now,
-            now,
-        ),
-    )
+            event="session_created",
+            identity=dispatch_id,
+            details={"taskId": binding.task_id, "taskKey": task.key, "kind": "milestone"},
+            observed_at=now,
+        )
 
 
 def _read_milestone_result(
@@ -2437,6 +2517,13 @@ def _release_milestone_worker(
             code="release_pending",
             data={"taskKey": worker["task_key"], "recovery": dict(decision.recovery_metadata or {})},  # type: ignore[index]
         )
+    record_efficiency_event(
+        store,
+        run.local_id,
+        event="session_released",
+        identity=worker["dispatch_id"],  # type: ignore[index]
+        details={"disposition": decision.state, "taskKey": worker["task_key"]},  # type: ignore[index]
+    )
     return decision.state
 
 
@@ -3354,10 +3441,11 @@ def _advance_milestone(
         )
         return run, runtime_plan
 
-    active = {row["task_key"] for row in workers if row["outcome"] is None}
+    active = occupied_milestone_tasks(store, run.local_id)
     finished = {owner.key, *(row["task_key"] for row in workers if row["outcome"] is not None)}
     gate_rows = _milestone_gate_rows(store, run)
     roster = load_role_roster()
+    _ensure_run_capacity(store, run)
     remaining_capacity = runtime_plan.max_workers - len(active)
     for binding in scheduler.ready_wave(
         str(run.native_run_id),
@@ -3458,6 +3546,8 @@ def implement(
     *,
     client: OrcaClient,
     milestone_plan: str | None = None,
+    allow_exceptional_capacity: bool = False,
+    capacity_reason: str | None = None,
     wait_timeout_ms: int = 300_000,
     require_context: bool = True,
 ) -> JsonObject:
@@ -3468,6 +3558,8 @@ def implement(
             None,
             client=client,
             milestone_plan=milestone_plan,
+            allow_exceptional_capacity=allow_exceptional_capacity,
+            capacity_reason=capacity_reason,
             wait_timeout_ms=wait_timeout_ms,
             require_context=require_context,
         )
@@ -3510,10 +3602,17 @@ def implement(
                 else None
             )
             run = store.create_run(objective=normalized, profile_digest=profile.digest, source_digest=sources.digest)
+            initialize_efficiency_observation(store, run)
             if loaded_plan is not None:
                 _record_milestone_plan(store, run, loaded_plan)
             with store.lock(run.local_id):
                 run = _create_native_run(client, store, run)
+                _ensure_run_capacity(
+                    store,
+                    run,
+                    allow_exceptional_capacity=allow_exceptional_capacity,
+                    capacity_reason=capacity_reason,
+                )
                 run = _create_task_and_packet(client, store, run, profile)
                 packet_json = _ensure_packet(store, run, profile)
                 run = _start_worker(
@@ -3544,6 +3643,8 @@ def resume(
     *,
     client: OrcaClient,
     milestone_plan: str | None = None,
+    allow_exceptional_capacity: bool = False,
+    capacity_reason: str | None = None,
     wait_timeout_ms: int = 300_000,
     require_context: bool = True,
 ) -> JsonObject:
@@ -3559,6 +3660,13 @@ def resume(
                         "Resume plan does not match the Run's immutable selected plan",
                         code="milestone_plan_changed",
                     )
+            if (allow_exceptional_capacity or capacity_reason is not None) and run.native_run_id:
+                _ensure_run_capacity(
+                    store,
+                    run,
+                    allow_exceptional_capacity=allow_exceptional_capacity,
+                    capacity_reason=capacity_reason,
+                )
             if bound_plan_path is not None and (
                 run.phase.startswith("milestone_")
                 or (run.phase == "worker_succeeded" and run.delivery_id is None)
@@ -3680,9 +3788,17 @@ def resume(
                 run = _finish_prompt_stall_cleanup(client, store, run)
             if run.phase == "preparing":
                 run = _create_native_run(client, store, run)
+            if run.phase in {"run_created", "task_created"}:
+                _ensure_run_capacity(
+                    store,
+                    run,
+                    allow_exceptional_capacity=allow_exceptional_capacity,
+                    capacity_reason=capacity_reason,
+                )
             if run.phase == "run_created":
                 run = _create_task_and_packet(client, store, run, profile)
             if run.phase == "task_created":
+                _ensure_run_capacity(store, run)
                 packet_json = _ensure_packet(store, run, profile)
                 _validate_task_binding(
                     client,
@@ -3816,8 +3932,8 @@ def explain(root: Path, run_id: str | None) -> JsonObject:
 
 
 def packet(root: Path, run_id: str, task_id: str) -> JsonObject:
-    profile = ProjectProfile.load(root)
-    with StateStore(profile.root) as store:
+    project_root = find_project_root(root)
+    with StateStore.open_read_only(project_root) as store:
         run = store.get_run(run_id)
         return store.get_packet(run.local_id, task_id)
 

@@ -273,14 +273,33 @@ class BooleanInventoryCloseClient(ReconciledCloseClient):
 class BootstrapTests(unittest.TestCase):
     def test_cli_routes_the_explicit_versioned_milestone_plan(self) -> None:
         parsed = build_parser().parse_args(
-            ["implement", "authorized objective", "--plan", "plans/milestone.json", "--json"]
+            [
+                "implement",
+                "authorized objective",
+                "--plan",
+                "plans/milestone.json",
+                "--allow-exceptional-capacity",
+                "--capacity-reason",
+                "four independent checks",
+                "--json",
+            ]
         )
         self.assertEqual(parsed.command, "implement")
         self.assertEqual(parsed.objective, "authorized objective")
         self.assertEqual(parsed.plan, "plans/milestone.json")
+        self.assertTrue(parsed.allow_exceptional_capacity)
+        self.assertEqual(parsed.capacity_reason, "four independent checks")
 
     def test_payload_round_trip_preserves_spaces_unicode_and_argument_boundaries(self) -> None:
-        arguments = ["implement", "fix spaced path 雪", "--project", "C:/a b/雪"]
+        arguments = [
+            "implement",
+            "fix spaced path 雪",
+            "--project",
+            "C:/a b/雪",
+            "--allow-exceptional-capacity",
+            "--capacity-reason",
+            "four bounded workers 雪",
+        ]
         self.assertEqual(decode_payload(encode_payload(arguments)), arguments)
 
     def test_bootstrap_rejects_project_contained_state_before_terminal_creation(self) -> None:

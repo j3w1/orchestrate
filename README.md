@@ -30,7 +30,7 @@ Next, `orchestrate implement` reads the selected sources, binds the exact candid
 
 From there, Orca stays in charge of Runs, Tasks, Dispatches, workers, gates, and messages. orchestrate journals mutation intentions and whole Deliveries, checks exact public readbacks, and stops on uncertain effects instead of guessing or retrying blindly. `status`, `explain`, and `resume` use that record after an interruption.
 
-The default workflow has one implementation owner. An explicitly selected milestone plan can add independent verification and review work in deterministic, capacity-bounded waves. Worker success, accepted verification, independent review, hosted proof, project acceptance, merge, and release keep separate labels throughout.
+The default workflow has one implementation owner. An explicitly selected milestone plan can add independent verification and review work in deterministic, capacity-bounded waves. Capacity belongs to one Run: plans default to two workers, ordinary limits are one through three, and limits four through eight need an explicit reasoned grant for that exact plan. Worker success, accepted verification, independent review, hosted proof, project acceptance, merge, and release keep separate labels throughout.
 
 Read [Execution contracts and recovery](docs/contracts-and-recovery.md) for the detailed state machine and [Validation evidence](docs/validation.md) for the evidence matrix.
 
@@ -125,6 +125,15 @@ orchestrate implement "Integrate the exact bounded milestone" --plan milestone-p
 
 The plan names the exact owner objective, specialist outputs, final reviewer, dependencies, gate kinds, settled shared-contract value, and worker limit. orchestrate does not infer that decomposition from objective prose. Follow-up packets bind each native Task to the post-owner candidate and contract digests and name a host-local result-file contract; only an exact admitted, natively settled worker plus an `accepted` result can satisfy verification or review. Resume may reassert the same path with `--plan`, but cannot select a different plan for the Run. The complete strict JSON shape and recovery rules are in [Execution contracts and recovery](docs/contracts-and-recovery.md).
 
+`maxWorkers` may be omitted for the default of two. Values one through three need no extra flag. A reviewed plan that genuinely needs four through eight records its operational grant before the first launch:
+
+```powershell
+orchestrate implement "Integrate the exact bounded milestone" --plan milestone-plan.json `
+  --allow-exceptional-capacity --capacity-reason "Five independent platform fixtures" --json
+```
+
+If that command stops before launch, `resume` accepts the same two flags and binds the grant to the existing Run and exact plan digest. A grant never transfers to a changed plan. Uncertain launches and unresolved releases keep occupying their slots; orchestrate does not launch a replacement merely because local completion was observed.
+
 The command waits in the foreground. Ctrl-C stops controller waiting; it does not pretend the active worker stopped. Continue with the Run ID:
 
 ```powershell
@@ -146,6 +155,17 @@ Inspect the immutable Task packet without consuming mail or calling a model:
 orchestrate packet --run <run-id> --task <task-id> --json
 ```
 
+`status` and `explain` include an `efficiency` object with the effective Run capacity, any exceptional grant, elapsed wall time, observed session counts and durations, repeated launch attempts, and intervention state. Session duration is observed wall time, not provider compute time. Historical counts, tokens, model turns, and enclosing-coordinator usage stay `unknown` when orchestrate did not observe them; only the deterministic controller's own instrumented model-call count is reported as zero.
+
+When a correction would repeat without new evidence, record the operator's exact proposal instead of starting another Dispatch:
+
+```powershell
+orchestrate intervention --run <run-id> --task <task-id> --record intervention.json --json
+orchestrate intervention --run <run-id> --task <task-id> --diagnosis diagnosis.json --json
+```
+
+The record contains exactly `obligation`, `failing_example`, `hypothesis`, `last_meaningful_evidence`, `next_discriminating_check`, and `correction_key`. A diagnosis file contains exactly `diagnosis_evidence`, as a string when it found new evidence or `null` when it did not. These commands update only the bounded host-local ledger: they do not create a Dispatch, clear admission, retry work, or override project governance.
+
 Omitting an objective resumes only when one local Run is unambiguous. Multiple Runs always require an explicit selection. A succeeded default owner leaves verification pending by design; a planned milestone reaches `review_accepted` only after every planned verification result and the exact final review are accepted.
 
 For a copyable disposable live exercise, use [Live first-increment exercise](docs/live-first-increment.md).
@@ -163,8 +183,9 @@ For a copyable disposable live exercise, use [Live first-increment exercise](doc
 - Deterministic Run creation, Task creation, one-worker launch, supervision, answer, release, acknowledgment, and resume.
 - An explicitly selected bounded native-DAG path for one integration owner, settled shared contracts, independent specialists, journaled native verification/review gates, exact result artifacts, and stale-review invalidation.
 - Host-local owner/specialist/reviewer launch choices with explicit Claude provider IDs and requested/effective receipt validation.
-- Exact-terminal reuse or Dispatch release decisions, including fail-closed `release_unknown` containment.
+- Fresh agent sessions for every new Task, while answers and recovery remain on the existing Dispatch session; settled sessions are released with fail-closed `release_unknown` containment.
 - Durable intervention records and one bounded diagnosis before an unchanged correction can repeat without new evidence.
+- Per-Run capacity grants, conservative occupied-slot accounting, and additive efficiency observations with stable event identities.
 - A state-free `orchestrate-wsl` argument/exit forwarding boundary to the canonical Windows installation.
 - Non-consuming `status`, model-free `explain`, and exact `packet` output.
 - A focused ordinary-terminal bootstrap with durable result, exit, and exact uncertain-close reconciliation receipts.
@@ -182,6 +203,7 @@ There is no parallel task database, worktree manager, provider API, policy engin
 - **Orca owns lifecycle.** Runs, Tasks, Dispatches, workers, environments, and UI remain native.
 - **Projects own authority.** A candidate policy edit cannot grant itself more power.
 - **One writer first.** Parallelism waits until work is independently useful and shared interfaces are settled.
+- **Fresh Task, fresh session.** A same-agent match never carries context across a new Task; long-lived sessions are reported at two hours and require a fresh-session handoff at eight.
 - **Admission is provenance, not a sandbox.** Managed workers prove exact preflight identity; hostile shell bypass and unrelated external writers remain outside this guarantee.
 - **Effects are replayed, not guessed.** Unknown external effects stop repetition.
 - **Every message counts.** FIFO Deliveries are processed in full and acknowledged as a whole.

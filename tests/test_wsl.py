@@ -64,6 +64,18 @@ class WslForwardingTests(unittest.TestCase):
         self.assertEqual(observed, [invocation])
         self.assertEqual(windows_unc_path(invocation), r"\\wsl.localhost\Arch\home\user\源 code")
 
+    def test_exceptional_capacity_flags_forward_without_translation(self) -> None:
+        argv = (
+            "resume",
+            "--run",
+            "run_1",
+            "--allow-exceptional-capacity",
+            "--capacity-reason",
+            "four independent checks",
+        )
+        invocation = make_invocation(distro="Ubuntu", linux_cwd="/repo", argv=argv)
+        self.assertEqual(decode_invocation(encode_invocation(invocation)).argv, argv)
+
     def test_linux_launcher_creates_no_second_state_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             forbidden_state = Path(directory) / "state-must-not-exist"

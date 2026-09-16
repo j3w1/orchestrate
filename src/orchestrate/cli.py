@@ -13,6 +13,7 @@ from .bootstrap import decode_payload, launch_controller
 from .controller import answer, explain, implement, packet, resume, status
 from .doctor import ProbeContractError, collect_doctor_report, create_run_probe, error_report, run_worker_probe
 from .errors import OrchestrateError
+from .intervention import run_intervention
 from .machine_bootstrap import ensure_machine
 from .orca import OrcaClient, OrcaCommandError
 from .profile import setup_project
@@ -42,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("objective", nargs="?", help="authorized objective; omit only to resume one unambiguous Run")
     _project_argument(run)
     run.add_argument("--plan", help="tracked orchestrate-milestone-plan/v1 JSON for bounded follow-up Tasks")
+    run.add_argument("--allow-exceptional-capacity", action="store_true", help="allow this Run's selected plan to use capacity 4 through 8")
+    run.add_argument("--capacity-reason", help="bounded operator reason for exceptional per-Run capacity")
     run.add_argument("--wait-timeout-ms", type=int, default=300_000)
     run.add_argument("--json", action="store_true")
 
@@ -56,6 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "resume":
             command.add_argument("--wait-timeout-ms", type=int, default=300_000)
             command.add_argument("--plan", help="reassert the Run's exact tracked milestone plan path")
+            command.add_argument("--allow-exceptional-capacity", action="store_true", help="allow this Run's selected plan to use capacity 4 through 8")
+            command.add_argument("--capacity-reason", help="bounded operator reason for exceptional per-Run capacity")
         command.add_argument("--json", action="store_true")
 
     packet_parser = subparsers.add_parser("packet", help="print one immutable Task packet")
@@ -70,6 +75,15 @@ def build_parser() -> argparse.ArgumentParser:
     answer_parser.add_argument("--question", required=True)
     answer_parser.add_argument("--text", required=True)
     answer_parser.add_argument("--json", action="store_true")
+
+    intervention = subparsers.add_parser("intervention", help="record one operator-led correction or bounded diagnosis")
+    _project_argument(intervention)
+    intervention.add_argument("--run", required=True)
+    intervention.add_argument("--task", required=True)
+    selection = intervention.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--record", type=Path, help="strict JSON correction proposal")
+    selection.add_argument("--diagnosis", type=Path, help="strict JSON diagnosis result")
+    intervention.add_argument("--json", action="store_true")
 
     preflight = subparsers.add_parser("worker-preflight", help="record the exact managed worker admission observation")
     _project_argument(preflight)
@@ -119,6 +133,14 @@ def _print_human(report: dict[str, Any]) -> None:
             print(f"  {label}: {report[key]}")
     if report.get("nextObligation"):
         print(f"  Next: {report['nextObligation']}")
+    efficiency = report.get("efficiency")
+    if isinstance(efficiency, dict):
+        print(
+            "  Efficiency: capacity "
+            f"{efficiency.get('effectiveCapacity', 'unknown')}; sessions "
+            f"{efficiency.get('activeSessions', 'unknown')} active / "
+            f"{efficiency.get('peakSessions', 'unknown')} peak"
+        )
     error = report.get("error")
     if isinstance(error, dict):
         print(f"  {error.get('code', 'error')}: {error.get('message', '')}")
@@ -186,6 +208,8 @@ def _execute(args: argparse.Namespace, raw_argv: list[str]) -> tuple[dict[str, A
             args.objective,
             client=client,
             milestone_plan=args.plan,
+            allow_exceptional_capacity=args.allow_exceptional_capacity,
+            capacity_reason=args.capacity_reason,
             wait_timeout_ms=args.wait_timeout_ms,
         ), args.json
     if args.command == "resume":
@@ -194,6 +218,8 @@ def _execute(args: argparse.Namespace, raw_argv: list[str]) -> tuple[dict[str, A
             args.run,
             client=client,
             milestone_plan=args.plan,
+            allow_exceptional_capacity=args.allow_exceptional_capacity,
+            capacity_reason=args.capacity_reason,
             wait_timeout_ms=args.wait_timeout_ms,
         ), args.json
     if args.command == "status":
@@ -204,6 +230,14 @@ def _execute(args: argparse.Namespace, raw_argv: list[str]) -> tuple[dict[str, A
         return packet(root, args.run, args.task), args.json
     if args.command == "answer":
         return answer(root, args.run, args.question, args.text, client=client), args.json
+    if args.command == "intervention":
+        return run_intervention(
+            root,
+            run_id=args.run,
+            task=args.task,
+            record_path=args.record,
+            diagnosis_path=args.diagnosis,
+        ), args.json
     if args.command == "worker-preflight":
         return worker_preflight(
             root,
@@ -322,6 +356,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "milestone_blocked",
             "milestone_cleanup_pending",
             "preflight_held",
+            "diagnosis_required",
+            "unresolved",
             "stale_review",
             "worker_failed",
             "worker_unadmitted",
