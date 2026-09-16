@@ -470,6 +470,102 @@ class _BoundedFile:
     identity: _PathIdentity
 
 
+def _operation_diagnostic(
+    operation: str,
+    form: str,
+    path: str | Path,
+    *,
+    path_form: str,
+    explicit_application_name: bool | None = None,
+    access: str | None = None,
+    share: str | None = None,
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "operation": operation,
+        "form": form,
+        "path": os.fspath(path),
+        "pathForm": path_form,
+    }
+    if explicit_application_name is not None:
+        value["explicitApplicationName"] = explicit_application_name
+    if access is not None:
+        value["access"] = access
+    if share is not None:
+        value["share"] = share
+    return value
+
+
+def _zip_structure(raw: bytes) -> str:
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            archive.infolist()
+            return "valid"
+    except (OSError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return "invalid"
+
+
+def _archive_stage_diagnostic(
+    stage: str,
+    raw: bytes,
+    *,
+    form: str,
+    path: str | Path,
+) -> dict[str, object]:
+    return {
+        "stage": stage,
+        "form": form,
+        "path": os.fspath(path),
+        "size": len(raw),
+        "sha256": f"sha256:{hashlib.sha256(raw).hexdigest()}",
+        "zipStructure": _zip_structure(raw),
+    }
+
+
+def _diagnostic_exception_note(exc: BaseException, data: Mapping[str, object]) -> None:
+    if isinstance(exc, OrchestrateError):
+        before = str(exc)
+        exc.add_diagnostic(data)
+        if str(exc) != before:
+            return
+    add_note = getattr(exc, "add_note", None)
+    if callable(add_note):
+        rendered = json.dumps(data, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        add_note(f"machine-bootstrap diagnostic: {rendered[:4096]}")
+
+
+def _anchor_ancestry_diagnostic(path: Path) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    current = path.parent
+    for _ in range(8):
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            results.append(
+                {
+                    "path": os.fspath(current),
+                    "result": "unavailable",
+                    "attributes": f"errno:{getattr(exc, 'errno', None)};winerror:{getattr(exc, 'winerror', None)}",
+                }
+            )
+            break
+        attributes = getattr(info, "st_file_attributes", 0)
+        result = "redirected" if _is_reparse(info) else (
+            "directory" if stat.S_ISDIR(info.st_mode) else "unexpected-node"
+        )
+        results.append(
+            {
+                "path": os.fspath(current),
+                "result": result,
+                "attributes": f"0x{attributes:08x}",
+            }
+        )
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return results
+
+
 def _opened_file_identity_matches(opened: os.stat_result, linked: os.stat_result) -> bool:
     """Compare Windows file identity, never the spelling used to reach it."""
 
@@ -509,13 +605,27 @@ def _path_identity(path: Path, *, directory: bool | None = None) -> _PathIdentit
         raise OrchestrateError(
             f"Machine bootstrap cannot prove the dedicated path identity: {path.name}",
             code="machine_bootstrap_install_identity_unproven",
+            data={
+                "component": "installNode.fileIdentity",
+                "expected": "available-and-matching",
+                "observed": "unavailable",
+                "path": os.fspath(path),
+                "errno": exc.errno,
+                "winerror": getattr(exc, "winerror", None),
+            },
         ) from exc
     expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
     if _is_reparse(info) or not expected:
         raise OrchestrateError(
             f"Machine bootstrap refuses a redirect or unexpected node in the dedicated installation: {path.name}",
             code="machine_bootstrap_install_identity_unproven",
-            data={"path": os.fspath(path)},
+            data={
+                "component": "installNode.nodeType",
+                "expected": "directory" if directory else "regular-file",
+                "observed": "redirected" if _is_reparse(info) else "unexpected-node",
+                "path": os.fspath(path),
+                "attributes": f"0x{getattr(info, 'st_file_attributes', 0):08x}",
+            },
         )
     return _PathIdentity.from_stat(info)
 
@@ -524,10 +634,24 @@ def _read_posix_bounded_file(path: Path, limit: int) -> _BoundedFile:
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     non_blocking = getattr(os, "O_NONBLOCK", 0)
     close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    operation = _operation_diagnostic(
+        "bounded-read",
+        "POSIX-open-descriptor",
+        path,
+        path_form="native-path",
+        access="O_RDONLY|O_NOFOLLOW|O_NONBLOCK",
+        share="not-applicable",
+    )
     if not no_follow or not non_blocking:
         raise OrchestrateError(
             "This host cannot provide no-follow machine-bootstrap reads",
             code="machine_bootstrap_safe_io_unavailable",
+            data={
+                "component": "boundedRead.flags",
+                "expected": "O_NOFOLLOW|O_NONBLOCK",
+                "observed": f"O_NOFOLLOW:{bool(no_follow)};O_NONBLOCK:{bool(non_blocking)}",
+                "operations": [operation],
+            },
         )
     descriptor: int | None = None
     try:
@@ -541,11 +665,26 @@ def _read_posix_bounded_file(path: Path, limit: int) -> _BoundedFile:
             raise OrchestrateError(
                 f"Machine bootstrap refuses a non-file state entry: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
+                data={
+                    "component": "boundedRead.nodeType",
+                    "expected": "regular-file",
+                    "observed": "redirected" if _is_reparse(info) else "unexpected-node",
+                    "path": os.fspath(path),
+                    "operations": [operation],
+                },
             )
         if info.st_size > limit:
             raise OrchestrateError(
                 f"Machine bootstrap state exceeds its bounded read limit: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
+                data={
+                    "component": "boundedRead.handleSize",
+                    "expected": f"0..{limit}",
+                    "observed": info.st_size,
+                    "handleSize": info.st_size,
+                    "path": os.fspath(path),
+                    "operations": [operation],
+                },
             )
         chunks: list[bytes] = []
         remaining = limit + 1
@@ -560,6 +699,14 @@ def _read_posix_bounded_file(path: Path, limit: int) -> _BoundedFile:
             raise OrchestrateError(
                 f"Machine bootstrap state changed during its bounded read: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
+                data={
+                    "component": "boundedRead.bytes",
+                    "expected": info.st_size,
+                    "observed": len(raw),
+                    "handleSize": info.st_size,
+                    "path": os.fspath(path),
+                    "operations": [operation],
+                },
             )
         return _BoundedFile(raw, _PathIdentity.from_stat(info))
     except OrchestrateError:
@@ -568,6 +715,14 @@ def _read_posix_bounded_file(path: Path, limit: int) -> _BoundedFile:
         raise OrchestrateError(
             f"Machine bootstrap state cannot be opened safely: {path.name}",
             code="machine_bootstrap_safe_io_unavailable",
+            data={
+                "component": "boundedRead.open",
+                "expected": "valid-handle",
+                "observed": "unavailable",
+                "path": os.fspath(path),
+                "errno": exc.errno,
+                "operations": [operation],
+            },
         ) from exc
     finally:
         if descriptor is not None:
@@ -625,6 +780,14 @@ def _read_windows_bounded_file(path: Path, limit: int) -> _BoundedFile:
         wintypes.LPVOID,
     )
     read_file.restype = wintypes.BOOL
+    operation = _operation_diagnostic(
+        "bounded-read",
+        "CreateFileW-handle",
+        path,
+        path_form="native-path",
+        access="FILE_READ_DATA|FILE_READ_ATTRIBUTES",
+        share="FILE_SHARE_READ",
+    )
 
     _before_bounded_file_open(path)
     handle = create_file(
@@ -637,9 +800,17 @@ def _read_windows_bounded_file(path: Path, limit: int) -> _BoundedFile:
         None,
     )
     if handle == ctypes.c_void_p(-1).value:
+        winerror = ctypes.get_last_error()
         raise OrchestrateError(
             f"Machine bootstrap state cannot be opened safely: {path.name}",
             code="machine_bootstrap_safe_io_unavailable",
+            data={
+                "component": "boundedRead.open",
+                "expected": "valid-handle",
+                "observed": "invalid-handle",
+                "winerror": winerror,
+                "operations": [operation],
+            },
         )
     descriptor: int | None = None
     try:
@@ -656,24 +827,62 @@ def _read_windows_bounded_file(path: Path, limit: int) -> _BoundedFile:
             raise OrchestrateError(
                 f"Machine bootstrap state changed while its handle identity was proved: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
+                data={
+                    "component": "boundedRead.fileIdentity",
+                    "expected": repr(_PathIdentity.from_stat(linked_info)),
+                    "observed": repr(_PathIdentity.from_stat(opened_info)),
+                    "handleIdentity": repr(_PathIdentity.from_stat(opened_info)),
+                    "linkedIdentity": repr(_PathIdentity.from_stat(linked_info)),
+                    "operations": [operation],
+                },
             )
         tag = FileAttributeTagInfo()
         raw_handle = msvcrt.get_osfhandle(descriptor)
         if not get_info(raw_handle, file_attribute_tag_info_class, ctypes.byref(tag), ctypes.sizeof(tag)):
+            winerror = ctypes.get_last_error()
             raise OrchestrateError(
                 f"Machine bootstrap state identity is unavailable: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
+                data={
+                    "component": "boundedRead.attributes",
+                    "expected": "available",
+                    "observed": "unavailable",
+                    "winerror": winerror,
+                    "operations": [operation],
+                },
             )
         if tag.FileAttributes & (file_attribute_reparse_point | file_attribute_directory):
             raise OrchestrateError(
                 f"Machine bootstrap refuses a redirected or non-file state entry: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
+                data={
+                    "component": "boundedRead.nodeType",
+                    "expected": "regular-file",
+                    "observed": (
+                        "redirected"
+                        if tag.FileAttributes & file_attribute_reparse_point
+                        else "directory"
+                    ),
+                    "attributes": f"0x{tag.FileAttributes:08x}",
+                    "nodeType": "reparse-or-directory",
+                    "operations": [operation],
+                },
             )
         size = ctypes.c_longlong()
-        if not get_size(raw_handle, ctypes.byref(size)) or size.value < 0 or size.value > limit:
+        size_available = bool(get_size(raw_handle, ctypes.byref(size)))
+        size_error = ctypes.get_last_error() if not size_available else None
+        if not size_available or size.value < 0 or size.value > limit:
             raise OrchestrateError(
                 f"Machine bootstrap state exceeds or lacks its bounded size: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
+                data={
+                    "component": "boundedRead.handleSize",
+                    "expected": f"0..{limit}",
+                    "observed": size.value if size_available else "unavailable",
+                    "handleSize": size.value if size_available else None,
+                    "winerror": size_error,
+                    "operations": [operation],
+                },
             )
         raw = bytearray()
         while len(raw) <= limit:
@@ -681,9 +890,18 @@ def _read_windows_bounded_file(path: Path, limit: int) -> _BoundedFile:
             chunk = ctypes.create_string_buffer(amount)
             received = wintypes.DWORD()
             if not read_file(raw_handle, chunk, amount, ctypes.byref(received), None):
+                winerror = ctypes.get_last_error()
                 raise OrchestrateError(
                     f"Machine bootstrap state cannot be read: {path.name}",
                     code="machine_bootstrap_safe_io_unavailable",
+                    data={
+                        "component": "boundedRead.bytes",
+                        "expected": size.value,
+                        "observed": len(raw),
+                        "handleSize": size.value,
+                        "winerror": winerror,
+                        "operations": [operation],
+                    },
                 )
             if received.value == 0:
                 break
@@ -692,6 +910,13 @@ def _read_windows_bounded_file(path: Path, limit: int) -> _BoundedFile:
             raise OrchestrateError(
                 f"Machine bootstrap state changed during its bounded read: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
+                data={
+                    "component": "boundedRead.bytes",
+                    "expected": size.value,
+                    "observed": len(raw),
+                    "handleSize": size.value,
+                    "operations": [operation],
+                },
             )
         return _BoundedFile(bytes(raw), _PathIdentity.from_stat(opened_info))
     finally:
@@ -727,6 +952,9 @@ def _shim_identity_data(path: Path, expected: str) -> dict[str, object]:
         "component": f"launcher.{path.name}.sha256",
         "expected": expected_digest,
         "observed": observed,
+        "form": "windows-cmd" if path.suffix.casefold() == ".cmd" else "wsl-shell",
+        "path": os.fspath(path),
+        "pathForm": "native-path",
     }
 
 
@@ -750,6 +978,11 @@ def _decode_pyvenv_config(raw: bytes) -> tuple[str, str]:
         raise OrchestrateError(
             "The dedicated environment has a non-UTF-8 pyvenv.cfg and its identity cannot be proven",
             code="machine_bootstrap_venv_identity_unproven",
+            data={
+                "component": "pyvenvConfig.form",
+                "expected": "utf8-key-value-record",
+                "observed": "non-utf8",
+            },
         ) from exc
     values: dict[str, str] = {}
     for line in text.splitlines():
@@ -761,6 +994,11 @@ def _decode_pyvenv_config(raw: bytes) -> tuple[str, str]:
             raise OrchestrateError(
                 "The dedicated environment has an ambiguous pyvenv.cfg and its identity cannot be proven",
                 code="machine_bootstrap_venv_identity_unproven",
+                data={
+                    "component": "pyvenvConfig.form",
+                    "expected": "unique-key-value-record",
+                    "observed": "ambiguous",
+                },
             )
         values[normalized] = value.strip()
     home = values.get("home", "")
@@ -771,11 +1009,21 @@ def _decode_pyvenv_config(raw: bytes) -> tuple[str, str]:
         raise OrchestrateError(
             "The dedicated environment has an invalid Python version identity",
             code="machine_bootstrap_venv_identity_unproven",
+            data={
+                "component": "pyvenvConfig.version.form",
+                "expected": "numeric-major-minor",
+                "observed": "invalid",
+            },
         ) from exc
     if not home or len(version_pair) != 2 or version_pair < MINIMUM_PYTHON:
         raise OrchestrateError(
             "The dedicated environment does not prove a supported Python identity",
             code="machine_bootstrap_venv_identity_unproven",
+            data={
+                "component": "pyvenvConfig.pythonIdentity",
+                "expected": "home-present-and-version-at-least-3.13",
+                "observed": "incomplete-or-unsupported",
+            },
         )
     return home, version
 
@@ -822,6 +1070,16 @@ def _open_windows_path_pin(path: Path, *, directory: bool) -> object:
     get_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
     get_info.restype = wintypes.BOOL
     flags = open_reparse_point | (backup_semantics if directory else 0)
+    access_name = "GENERIC_READ"
+    share_name = "FILE_SHARE_READ|FILE_SHARE_WRITE" if directory else "FILE_SHARE_READ"
+    operation = _operation_diagnostic(
+        "path-pin",
+        "CreateFileW-retained-handle",
+        path,
+        path_form="native-path",
+        access=access_name,
+        share=share_name,
+    )
     handle = create_file(
         os.fspath(path),
         generic_read,
@@ -832,18 +1090,34 @@ def _open_windows_path_pin(path: Path, *, directory: bool) -> object:
         None,
     )
     if handle == ctypes.c_void_p(-1).value:
+        winerror = ctypes.get_last_error()
         raise OrchestrateError(
             "The dedicated environment could not pin its Windows path identity",
             code="machine_bootstrap_venv_identity_unproven",
-            data={"path": path.name},
+            data={
+                "component": "pathPin.handle",
+                "expected": "valid-handle",
+                "observed": "invalid-handle",
+                "path": os.fspath(path),
+                "winerror": winerror,
+                "operations": [operation],
+            },
         )
     tag = FileAttributeTagInfo()
     if not get_info(handle, file_attribute_tag_info_class, ctypes.byref(tag), ctypes.sizeof(tag)):
+        winerror = ctypes.get_last_error()
         _close_windows_path_pin(handle)
         raise OrchestrateError(
             "The dedicated environment could not inspect its pinned Windows path identity",
             code="machine_bootstrap_venv_identity_unproven",
-            data={"path": path.name},
+            data={
+                "component": "pathPin.attributes",
+                "expected": "available",
+                "observed": "unavailable",
+                "path": os.fspath(path),
+                "winerror": winerror,
+                "operations": [operation],
+            },
         )
     actual_directory = bool(tag.FileAttributes & file_attribute_directory)
     if tag.FileAttributes & file_attribute_reparse_point or actual_directory != directory:
@@ -851,7 +1125,18 @@ def _open_windows_path_pin(path: Path, *, directory: bool) -> object:
         raise OrchestrateError(
             "The dedicated environment contains a redirected or unexpected Windows node",
             code="machine_bootstrap_venv_identity_unproven",
-            data={"path": path.name},
+            data={
+                "component": "pathPin.nodeType",
+                "expected": "directory" if directory else "regular-file",
+                "observed": (
+                    "redirected"
+                    if tag.FileAttributes & file_attribute_reparse_point
+                    else ("directory" if actual_directory else "file")
+                ),
+                "path": os.fspath(path),
+                "attributes": f"0x{tag.FileAttributes:08x}",
+                "operations": [operation],
+            },
         )
     return handle
 
@@ -948,6 +1233,7 @@ def _source_tree_records(root: Path) -> list[tuple[str, Path]]:
             raise OrchestrateError(
                 "The reviewed checkout could not be enumerated safely",
                 code="machine_bootstrap_source_unavailable",
+                data={"phase": "source-enumeration", "errno": exc.errno},
             ) from exc
         for entry in entries:
             relative = Path(entry.path).relative_to(root).as_posix()
@@ -959,12 +1245,25 @@ def _source_tree_records(root: Path) -> list[tuple[str, Path]]:
                 raise OrchestrateError(
                     "The reviewed checkout changed during source identity collection",
                     code="machine_bootstrap_source_identity_changed",
+                    data={
+                        "component": "sourceEntry.fileIdentity",
+                        "expected": "available-and-matching",
+                        "observed": "unavailable-or-divergent",
+                        "path": relative,
+                        "errno": exc.errno,
+                    },
                 ) from exc
             if _is_reparse(info) or stat.S_ISLNK(info.st_mode):
                 raise OrchestrateError(
                     "The reviewed checkout contains a redirected source entry",
                     code="machine_bootstrap_source_identity_unproven",
-                    data={"path": relative},
+                    data={
+                        "component": "sourceEntry.nodeType",
+                        "expected": "regular-file-or-directory",
+                        "observed": "redirected",
+                        "path": relative,
+                        "attributes": f"0x{getattr(info, 'st_file_attributes', 0):08x}",
+                    },
                 )
             if stat.S_ISDIR(info.st_mode):
                 if not _ignored_source_directory(entry.name):
@@ -974,7 +1273,12 @@ def _source_tree_records(root: Path) -> list[tuple[str, Path]]:
                 raise OrchestrateError(
                     "The reviewed checkout contains an unsupported source entry",
                     code="machine_bootstrap_source_identity_unproven",
-                    data={"path": relative},
+                    data={
+                        "component": "sourceEntry.nodeType",
+                        "expected": "regular-file-or-directory",
+                        "observed": f"mode:{stat.S_IFMT(info.st_mode):#x}",
+                        "path": relative,
+                    },
                 )
             if entry.name.endswith((".pyc", ".pyo")):
                 continue
@@ -983,6 +1287,11 @@ def _source_tree_records(root: Path) -> list[tuple[str, Path]]:
                 raise OrchestrateError(
                     "The reviewed checkout exceeds the bounded source-file limit",
                     code="machine_bootstrap_source_identity_unproven",
+                    data={
+                        "component": "sourceTree.fileCount",
+                        "expected": MAX_SOURCE_FILES,
+                        "observed": len(records),
+                    },
                 )
     return sorted(records)
 
@@ -998,6 +1307,11 @@ def _source_tree_digest(root: Path) -> str:
             raise OrchestrateError(
                 "The reviewed checkout exceeds the bounded source-byte limit",
                 code="machine_bootstrap_source_identity_unproven",
+                data={
+                    "component": "sourceTree.byteCount",
+                    "expected": MAX_SOURCE_BYTES,
+                    "observed": consumed,
+                },
             )
         opened = _read_bounded_regular_file(path, remaining)
         consumed += len(opened.raw)
@@ -1005,6 +1319,11 @@ def _source_tree_digest(root: Path) -> str:
             raise OrchestrateError(
                 "The reviewed checkout exceeds the bounded source-byte limit",
                 code="machine_bootstrap_source_identity_unproven",
+                data={
+                    "component": "sourceTree.byteCount",
+                    "expected": MAX_SOURCE_BYTES,
+                    "observed": consumed,
+                },
             )
         name = relative.encode("utf-8", errors="strict")
         digest.update(len(name).to_bytes(4, "big"))
@@ -1021,6 +1340,16 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
     def __init__(self, layout: MachineLayout) -> None:
         self._provider = _active_platform_provider()
         self.path = layout.source_root
+        self.operation = _operation_diagnostic(
+            "source-binding",
+            (
+                "retained-Windows-directory-handle+public-path"
+                if self._provider.native_windows
+                else "retained-directory-descriptor+proc-fd-path"
+            ),
+            self.path,
+            path_form="native-path" if self._provider.native_windows else "proc-self-fd",
+        )
         self._identity = _path_identity(self.path, directory=True)
         self._descriptor: int | None = None
         self._windows_handle: object | None = None
@@ -1041,18 +1370,38 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
                     raise OrchestrateError(
                         "The reviewed checkout changed while its root was being bound",
                         code="machine_bootstrap_source_identity_unproven",
+                        data={
+                            "component": "sourceRoot.fileIdentity",
+                            "expected": repr(self._identity),
+                            "observed": repr(opened),
+                            "operations": [self.operation],
+                        },
                     )
                 descriptor_path = Path(f"/proc/self/fd/{self._descriptor}")
+                self.operation = _operation_diagnostic(
+                    "source-binding",
+                    "retained-directory-descriptor+proc-fd-path",
+                    descriptor_path,
+                    path_form="proc-self-fd",
+                )
                 if not descriptor_path.exists():
                     raise OrchestrateError(
                         "This host cannot bind source archiving to the reviewed checkout descriptor",
                         code="machine_bootstrap_source_identity_unproven",
+                        data={
+                            "component": "sourceRoot.effectPath",
+                            "expected": "available-descriptor-path",
+                            "observed": "unavailable",
+                            "path": os.fspath(descriptor_path),
+                            "operations": [self.operation],
+                        },
                     )
                 self.effect_path = descriptor_path
             self.resolved = os.fspath(self.path.resolve(strict=True))
             self.tree_digest = _source_tree_digest(self.effect_path)
             self.verify()
-        except BaseException:
+        except BaseException as exc:
+            _diagnostic_exception_note(exc, {"operations": [self.operation]})
             self.close()
             raise
 
@@ -1060,20 +1409,43 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
         try:
             current = _path_identity(self.path, directory=True)
         except OrchestrateError as exc:
-            raise OrchestrateError(
+            failure = OrchestrateError(
                 "The reviewed checkout root changed after its identity was bound",
                 code="machine_bootstrap_source_identity_changed",
-            ) from exc
+                data={
+                    "component": "sourceRoot.fileIdentity",
+                    "expected": repr(self._identity),
+                    "observed": "unavailable-or-redirected",
+                    "operations": [self.operation],
+                },
+            )
+            raise failure from exc
         if not _same_identity(current, self._identity, directory=True):
             raise OrchestrateError(
                 "The reviewed checkout root changed after its identity was bound",
                 code="machine_bootstrap_source_identity_changed",
+                data={
+                    "component": "sourceRoot.fileIdentity",
+                    "expected": repr(self._identity),
+                    "observed": repr(current),
+                    "operations": [self.operation],
+                },
             )
-        if _source_tree_digest(self.effect_path) != self.tree_digest:
+        observed_digest = _source_tree_digest(self.effect_path)
+        if observed_digest != self.tree_digest:
             raise OrchestrateError(
                 "The reviewed checkout content changed during machine bootstrap",
                 code="machine_bootstrap_source_identity_changed",
+                data={
+                    "component": "sourceTree.sha256",
+                    "expected": f"sha256:{self.tree_digest}",
+                    "observed": f"sha256:{observed_digest}",
+                    "operations": [self.operation],
+                },
             )
+
+    def diagnostic_data(self) -> dict[str, object]:
+        return {"operations": [self.operation]}
 
     def receipt_fields(self) -> dict[str, object]:
         return {
@@ -1102,9 +1474,25 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
 class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
     """Pin the exact immutable archive consumed by pip."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        stage_diagnostics: Sequence[Mapping[str, object]] = (),
+    ) -> None:
         self.path = path
         self._provider = _active_platform_provider()
+        self.operation = _operation_diagnostic(
+            "archive-binding",
+            (
+                "retained-Windows-file-handle+public-path"
+                if self._provider.native_windows
+                else "retained-file-descriptor+proc-fd-path"
+            ),
+            path,
+            path_form="native-path" if self._provider.native_windows else "proc-self-fd",
+        )
+        self.stage_diagnostics = [dict(item) for item in stage_diagnostics]
         self._handle: object | None = None
         self._descriptor: int | None = None
         try:
@@ -1120,6 +1508,13 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
                     raise OrchestrateError(
                         "The installed-source archive identity is unavailable",
                         code="machine_bootstrap_source_identity_unproven",
+                        data={
+                            "component": "sourceArchive.formAndSize",
+                            "expected": f"regular-file;size:0..{MAX_SOURCE_ARCHIVE_BYTES}",
+                            "observed": f"mode:{stat.S_IFMT(info.st_mode):#x};size:{info.st_size}",
+                            "path": os.fspath(path),
+                            "operations": [self.operation],
+                        },
                     )
                 raw = bytearray()
                 while len(raw) <= MAX_SOURCE_ARCHIVE_BYTES:
@@ -1131,18 +1526,40 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
                     raise OrchestrateError(
                         "The installed-source archive changed while it was opened",
                         code="machine_bootstrap_source_identity_changed",
+                        data={
+                            "component": "sourceArchive.size",
+                            "expected": info.st_size,
+                            "observed": len(raw),
+                            "path": os.fspath(path),
+                            "operations": [self.operation],
+                        },
                     )
                 opened = _BoundedFile(bytes(raw), _PathIdentity.from_stat(info))
                 self.effect_path = Path(f"/proc/self/fd/{self._descriptor}")
+                self.operation = _operation_diagnostic(
+                    "archive-binding",
+                    "retained-file-descriptor+proc-fd-path",
+                    self.effect_path,
+                    path_form="proc-self-fd",
+                )
             self.digest = hashlib.sha256(opened.raw).hexdigest()
             self.size = len(opened.raw)
             self.identity = opened.identity
+            self.stage_diagnostics.append(
+                _archive_stage_diagnostic(
+                    "bound-handle",
+                    opened.raw,
+                    form=self.operation["form"],  # type: ignore[arg-type]
+                    path=self.effect_path,
+                )
+            )
             self.verify()
-        except BaseException:
+        except BaseException as exc:
+            _diagnostic_exception_note(exc, self.diagnostic_data())
             self.close()
             raise
 
-    def verify(self) -> None:
+    def verify(self, *, stage: str | None = None) -> None:
         if self._descriptor is not None:
             os.lseek(self._descriptor, 0, os.SEEK_SET)
             raw = bytearray()
@@ -1161,12 +1578,32 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
             ).raw
         observed = f"sha256:{hashlib.sha256(current_raw).hexdigest()}"
         expected = f"sha256:{self.digest}"
+        if stage is not None:
+            self.stage_diagnostics.append(
+                _archive_stage_diagnostic(
+                    stage,
+                    current_raw,
+                    form=self.operation["form"],  # type: ignore[arg-type]
+                    path=self.effect_path,
+                )
+            )
         if len(current_raw) != self.size or observed != expected:
             raise OrchestrateError(
                 "The installed-source archive changed after it was bound",
                 code="machine_bootstrap_source_identity_changed",
-                data={"component": "sourceArchiveSha256", "expected": expected, "observed": observed},
+                data={
+                    "component": "sourceArchive.sha256",
+                    "expected": expected,
+                    "observed": observed,
+                    **self.diagnostic_data(),
+                },
             )
+
+    def diagnostic_data(self) -> dict[str, object]:
+        return {
+            "operations": [self.operation],
+            "archiveStages": list(self.stage_diagnostics),
+        }
 
     def receipt_fields(self) -> dict[str, object]:
         return {
@@ -1189,7 +1626,10 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
         self.close()
 
 
-def _build_source_archive(layout: MachineLayout, source: _SourceBinding) -> None:
+def _build_source_archive(
+    layout: MachineLayout,
+    source: _SourceBinding,
+) -> list[dict[str, object]]:
     source.verify()
     buffer = io.BytesIO()
     consumed = 0
@@ -1201,6 +1641,12 @@ def _build_source_archive(layout: MachineLayout, source: _SourceBinding) -> None
                 raise OrchestrateError(
                     "The reviewed checkout exceeds the bounded source-byte limit",
                     code="machine_bootstrap_source_identity_unproven",
+                    data={
+                        "component": "sourceArchive.inputByteCount",
+                        "expected": MAX_SOURCE_BYTES,
+                        "observed": consumed,
+                        **source.diagnostic_data(),
+                    },
                 )
             info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
             info.create_system = 3
@@ -1212,13 +1658,29 @@ def _build_source_archive(layout: MachineLayout, source: _SourceBinding) -> None
         raise OrchestrateError(
             "The reviewed checkout archive exceeds its bounded byte limit",
             code="machine_bootstrap_source_identity_unproven",
+            data={
+                "component": "sourceArchive.size",
+                "expected": MAX_SOURCE_ARCHIVE_BYTES,
+                "observed": len(raw),
+                **source.diagnostic_data(),
+            },
         )
+    stages = [
+        _archive_stage_diagnostic(
+            "buffer",
+            raw,
+            form="in-memory-zip",
+            path=layout.source_archive,
+        )
+    ]
     _atomic_write_owned(
         layout.source_archive,
         raw,
         executable=False,
         expected_target=_target_identity(layout.source_archive),
+        archive_stages=stages,
     )
+    return stages
 
 
 class _VenvBinding(AbstractContextManager["_VenvBinding"]):
@@ -1262,6 +1724,12 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
                         raise OrchestrateError(
                             "The dedicated environment changed while its physical identity was being pinned",
                             code="machine_bootstrap_venv_identity_unproven",
+                            data={
+                                "component": "venvNode.fileIdentity",
+                                "expected": repr(self._identities[path]),
+                                "observed": repr(_PathIdentity.from_stat(os.fstat(descriptor))),
+                                "path": os.fspath(path),
+                            },
                         )
                     self._descriptors[path] = descriptor
             self.config_raw = _read_bounded_regular(self.config_path, MAX_PYVENV_CONFIG_BYTES)
@@ -1276,15 +1744,31 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
     def verify(self) -> None:
         for path, identity in self._identities.items():
             directory = stat.S_ISDIR(identity.mode)
-            if not _same_identity(_path_identity(path, directory=directory), identity, directory=directory):
+            observed_identity = _path_identity(path, directory=directory)
+            if not _same_identity(observed_identity, identity, directory=directory):
                 raise OrchestrateError(
                     "The dedicated environment changed after its physical identity was pinned",
                     code="machine_bootstrap_venv_identity_changed",
+                    data={
+                        "component": "venvNode.fileIdentity",
+                        "expected": repr(identity),
+                        "observed": repr(observed_identity),
+                        "path": os.fspath(path),
+                    },
                 )
-        if hashlib.sha256(_read_bounded_regular(self.config_path, MAX_PYVENV_CONFIG_BYTES)).hexdigest() != self.config_digest:
+        observed_config_digest = hashlib.sha256(
+            _read_bounded_regular(self.config_path, MAX_PYVENV_CONFIG_BYTES)
+        ).hexdigest()
+        if observed_config_digest != self.config_digest:
             raise OrchestrateError(
                 "The dedicated environment configuration changed after identity verification",
                 code="machine_bootstrap_venv_identity_changed",
+                data={
+                    "component": "pyvenvConfig.sha256",
+                    "expected": f"sha256:{self.config_digest}",
+                    "observed": f"sha256:{observed_config_digest}",
+                    "path": os.fspath(self.config_path),
+                },
             )
         # Path spellings are not identity evidence on Windows (short/long
         # aliases and case can differ).  The comparisons above use file IDs,
@@ -1312,6 +1796,20 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
             raise OrchestrateError(
                 "This host cannot execute the dedicated interpreter through its pinned descriptor",
                 code="machine_bootstrap_venv_identity_unproven",
+                data={
+                    "component": "interpreter.effectPath",
+                    "expected": "available-descriptor-path",
+                    "observed": "unavailable",
+                    "operations": [
+                        _operation_diagnostic(
+                            "interpreter-effect",
+                            "descriptor-executable+pass-fds",
+                            executable,
+                            path_form="proc-self-fd",
+                            explicit_application_name=False,
+                        )
+                    ],
+                },
             )
         return {"executable": executable, "pass_fds": (descriptor, *pass_fds)}
 
@@ -1373,7 +1871,10 @@ def _anchor_value(receipt: dict[str, object]) -> dict[str, object]:
     return {**payload, "anchorSha256": f"sha256:{hashlib.sha256(canonical).hexdigest()}"}
 
 
-def _read_canonical_json(path: Path, limit: int) -> object | None:
+def _read_canonical_json_diagnostic(
+    path: Path,
+    limit: int,
+) -> tuple[object | None, str]:
     try:
         raw_bytes = _read_bounded_regular(path, limit)
         raw = raw_bytes.decode("utf-8", errors="strict")
@@ -1382,10 +1883,20 @@ def _read_canonical_json(path: Path, limit: int) -> object | None:
             object_pairs_hook=_strict_json_object,
             parse_constant=_reject_json_constant,
         )
-    except (OrchestrateError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return None
+    except OrchestrateError as exc:
+        return None, exc.code
+    except UnicodeDecodeError:
+        return None, "non-utf8"
+    except json.JSONDecodeError:
+        return None, "invalid-json"
+    except ValueError:
+        return None, "duplicate-or-nonfinite-json"
     canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-    return value if raw_bytes == canonical else None
+    return (value, "canonical") if raw_bytes == canonical else (None, "noncanonical-json")
+
+
+def _read_canonical_json(path: Path, limit: int) -> object | None:
+    return _read_canonical_json_diagnostic(path, limit)[0]
 
 
 def _receipt_match_diagnostic(
@@ -1394,7 +1905,22 @@ def _receipt_match_diagnostic(
     source: _SourceBinding,
     archive: _ArchiveBinding,
 ) -> tuple[bool, dict[str, object]]:
-    value = _read_install_receipt(layout)
+    def mismatch(data: dict[str, object]) -> tuple[bool, dict[str, object]]:
+        archive_data = archive.diagnostic_data()
+        return False, {
+            **data,
+            "operations": [
+                *source.diagnostic_data()["operations"],  # type: ignore[misc]
+                *archive_data["operations"],  # type: ignore[misc]
+            ],
+            "archiveStages": archive_data["archiveStages"],
+            "anchorAncestry": _anchor_ancestry_diagnostic(layout.install_anchor),
+        }
+
+    value, receipt_form = _read_canonical_json_diagnostic(
+        layout.install_receipt,
+        MAX_INSTALL_RECEIPT_BYTES,
+    )
     expected_keys = {
         "schema",
         "installationId",
@@ -1410,13 +1936,21 @@ def _receipt_match_diagnostic(
         "receiptSha256",
     }
     if not isinstance(value, dict):
-        return False, {"component": "receipt.form", "expected": "canonical-object", "observed": type(value).__name__}
+        return mismatch(
+            {
+                "component": "receipt.form",
+                "expected": "canonical-object",
+                "observed": receipt_form,
+            }
+        )
     if set(value) != expected_keys:
-        return False, {
-            "component": "receipt.fields",
-            "expected": sorted(expected_keys),
-            "observed": sorted(str(key) for key in value),
-        }
+        return mismatch(
+            {
+                "component": "receipt.fields",
+                "expected": sorted(expected_keys),
+                "observed": sorted(str(key) for key in value),
+            }
+        )
     string_keys = (
         "schema",
         "installationId",
@@ -1435,17 +1969,41 @@ def _receipt_match_diagnostic(
     )
     for key in string_keys:
         if not isinstance(value.get(key), str):
-            return False, {"component": f"receipt.{key}.form", "expected": "string", "observed": type(value.get(key)).__name__}
+            return mismatch(
+                {
+                    "component": f"receipt.{key}.form",
+                    "expected": "string",
+                    "observed": type(value.get(key)).__name__,
+                }
+            )
     for key in integer_keys:
         if type(value.get(key)) is not int or value[key] < 0:
-            return False, {"component": f"receipt.{key}.form", "expected": "nonnegative-integer", "observed": repr(value.get(key))}
+            return mismatch(
+                {
+                    "component": f"receipt.{key}.form",
+                    "expected": "nonnegative-integer",
+                    "observed": type(value.get(key)).__name__,
+                }
+            )
     if not value["installationId"]:
-        return False, {"component": "receipt.installationId.form", "expected": "nonempty-string", "observed": "empty-string"}
+        return mismatch(
+            {
+                "component": "receipt.installationId.form",
+                "expected": "nonempty-string",
+                "observed": "empty-string",
+            }
+        )
     if not _receipt_integrity_matches(value):
         payload = {key: item for key, item in value.items() if key != "receiptSha256"}
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         expected_digest = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
-        return False, {"component": "receipt.receiptSha256", "expected": expected_digest, "observed": value["receiptSha256"]}
+        return mismatch(
+            {
+                "component": "receipt.receiptSha256",
+                "expected": expected_digest,
+                "observed": value["receiptSha256"],
+            }
+        )
     expected = _receipt_value(binding, source, archive, installation_id=value["installationId"])
     for key in sorted(expected):
         if key == "receiptSha256":
@@ -1455,14 +2013,40 @@ def _receipt_match_diagnostic(
         ):
             continue
         if value[key] != expected[key]:
-            return False, {"component": f"receipt.{key}", "expected": expected[key], "observed": value[key]}
-    anchor = _read_canonical_json(layout.install_anchor, MAX_INSTALL_RECEIPT_BYTES)
+            diagnostic: dict[str, object] = {
+                "component": f"receipt.{key}",
+                "expected": expected[key],
+                "observed": value[key],
+            }
+            if key in {"sourceRoot", "venvRoot", "pythonPath"}:
+                diagnostic["pathComparison"] = {
+                    "expectedNormalized": _normalize_path_entry(os.fspath(expected[key])),
+                    "observedNormalized": _normalize_path_entry(os.fspath(value[key])),
+                    "matched": False,
+                }
+            return mismatch(diagnostic)
+    anchor, anchor_form = _read_canonical_json_diagnostic(
+        layout.install_anchor,
+        MAX_INSTALL_RECEIPT_BYTES,
+    )
     expected_anchor = _anchor_value(value)
     if not isinstance(anchor, dict):
-        return False, {"component": "anchor.form", "expected": "canonical-object", "observed": type(anchor).__name__}
+        return mismatch(
+            {
+                "component": "anchor.form",
+                "expected": "canonical-object",
+                "observed": anchor_form,
+            }
+        )
     for key in sorted(set(expected_anchor) | set(anchor)):
         if anchor.get(key) != expected_anchor.get(key):
-            return False, {"component": f"anchor.{key}", "expected": expected_anchor.get(key), "observed": anchor.get(key)}
+            return mismatch(
+                {
+                    "component": f"anchor.{key}",
+                    "expected": expected_anchor.get(key),
+                    "observed": anchor.get(key),
+                }
+            )
     return True, {"component": "receipt-and-anchor", "expected": "matching", "observed": "matching"}
 
 
@@ -1487,6 +2071,12 @@ def _command_proof(path: Path) -> _BoundedFile:
         raise OrchestrateError(
             "The installed orchestrate command is not a single owned file",
             code="machine_bootstrap_command_identity_unproven",
+            data={
+                "component": "command.linkCount",
+                "expected": 1,
+                "observed": opened.identity.links,
+                "path": os.fspath(path),
+            },
         )
     return opened
 
@@ -1504,11 +2094,29 @@ def _target_identity(path: Path) -> _PathIdentity | None:
         raise OrchestrateError(
             f"Machine bootstrap cannot inspect the replacement target: {path.name}",
             code="machine_bootstrap_target_identity_unproven",
+            data={
+                "component": "target.fileIdentity",
+                "expected": "available-and-matching",
+                "observed": "unavailable",
+                "path": os.fspath(path),
+                "errno": exc.errno,
+                "winerror": getattr(exc, "winerror", None),
+            },
         ) from exc
     if _is_reparse(info) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise OrchestrateError(
             f"Machine bootstrap refuses to replace an unowned target entry: {path.name}",
             code="machine_bootstrap_target_identity_unproven",
+            data={
+                "component": "target.nodeTypeAndLinks",
+                "expected": "owned-single-link-regular-file",
+                "observed": (
+                    "redirected"
+                    if _is_reparse(info)
+                    else f"mode:{stat.S_IFMT(info.st_mode):#x};links:{info.st_nlink}"
+                ),
+                "path": os.fspath(path),
+            },
         )
     return _PathIdentity.from_stat(info)
 
@@ -1524,11 +2132,29 @@ def _target_identity_at(parent_fd: int | None, parent: Path, name: str) -> _Path
         raise OrchestrateError(
             f"Machine bootstrap cannot inspect the replacement target: {name}",
             code="machine_bootstrap_target_identity_unproven",
+            data={
+                "component": "target.fileIdentity",
+                "expected": "available-and-matching",
+                "observed": "unavailable",
+                "path": os.fspath(parent / name),
+                "errno": exc.errno,
+                "winerror": getattr(exc, "winerror", None),
+            },
         ) from exc
     if _is_reparse(info) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise OrchestrateError(
             f"Machine bootstrap refuses to replace an unowned target entry: {name}",
             code="machine_bootstrap_target_identity_unproven",
+            data={
+                "component": "target.nodeTypeAndLinks",
+                "expected": "owned-single-link-regular-file",
+                "observed": (
+                    "redirected"
+                    if _is_reparse(info)
+                    else f"mode:{stat.S_IFMT(info.st_mode):#x};links:{info.st_nlink}"
+                ),
+                "path": os.fspath(parent / name),
+            },
         )
     return _PathIdentity.from_stat(info)
 
@@ -1568,13 +2194,35 @@ def _atomic_write_owned(
     *,
     executable: bool,
     expected_target: _PathIdentity | None,
+    archive_stages: list[dict[str, object]] | None = None,
 ) -> None:
     provider = _active_platform_provider()
+    staging_operation = _operation_diagnostic(
+        "atomic-staging",
+        (
+            "Windows-path+retained-parent-handle"
+            if provider.native_windows
+            else (
+                "Windows-path+descriptor-backed-parent-pin"
+                if provider.windows_semantics
+                else "directory-fd-relative"
+            )
+        ),
+        path,
+        path_form="native-path" if provider.windows_semantics else "directory-fd-relative",
+    )
     parent_identity = _path_identity(path.parent, directory=True)
     if expected_target is not None:
         raise OrchestrateError(
             f"Machine bootstrap refuses to overwrite the existing target: {path.name}",
             code="machine_bootstrap_target_identity_unproven",
+            data={
+                "component": "target.fileIdentity",
+                "expected": "absent",
+                "observed": repr(expected_target),
+                "path": os.fspath(path),
+                "operations": [staging_operation],
+            },
         )
     parent_fd: int | None = None
     parent_handle: object | None = None
@@ -1589,13 +2237,28 @@ def _atomic_write_owned(
                 raise OrchestrateError(
                     "Machine bootstrap staging parent could not be bound",
                     code="machine_bootstrap_parent_identity_changed",
+                    data={
+                        "component": "stagingParent.fileIdentity",
+                        "expected": repr(parent_identity),
+                        "observed": getattr(exc, "code", type(exc).__name__),
+                        "path": os.fspath(path.parent),
+                        "errno": getattr(exc, "errno", None),
+                        "winerror": getattr(exc, "winerror", None),
+                        "operations": [staging_operation],
+                    },
                 ) from exc
-            if not _same_identity(
-                _path_identity(path.parent, directory=True), parent_identity, directory=True
-            ):
+            observed_parent = _path_identity(path.parent, directory=True)
+            if not _same_identity(observed_parent, parent_identity, directory=True):
                 raise OrchestrateError(
                     "Machine bootstrap staging parent changed while it was being bound",
                     code="machine_bootstrap_parent_identity_changed",
+                    data={
+                        "component": "stagingParent.fileIdentity",
+                        "expected": repr(parent_identity),
+                        "observed": repr(observed_parent),
+                        "path": os.fspath(path.parent),
+                        "operations": [staging_operation],
+                    },
                 )
         else:
             flags = (
@@ -1610,18 +2273,40 @@ def _atomic_write_owned(
                 raise OrchestrateError(
                     "Machine bootstrap staging parent could not be bound",
                     code="machine_bootstrap_parent_identity_changed",
+                    data={
+                        "component": "stagingParent.fileIdentity",
+                        "expected": repr(parent_identity),
+                        "observed": "unavailable",
+                        "path": os.fspath(path.parent),
+                        "errno": exc.errno,
+                        "operations": [staging_operation],
+                    },
                 ) from exc
-            if not _same_identity(
-                _PathIdentity.from_stat(os.fstat(parent_fd)), parent_identity, directory=True
-            ):
+            observed_parent = _PathIdentity.from_stat(os.fstat(parent_fd))
+            if not _same_identity(observed_parent, parent_identity, directory=True):
                 raise OrchestrateError(
                     "Machine bootstrap staging parent changed while it was being bound",
                     code="machine_bootstrap_parent_identity_changed",
+                    data={
+                        "component": "stagingParent.fileIdentity",
+                        "expected": repr(parent_identity),
+                        "observed": repr(observed_parent),
+                        "path": os.fspath(path.parent),
+                        "operations": [staging_operation],
+                    },
                 )
-        if _target_identity_at(parent_fd, path.parent, path.name) != expected_target:
+        observed_target = _target_identity_at(parent_fd, path.parent, path.name)
+        if observed_target != expected_target:
             raise OrchestrateError(
                 f"Machine bootstrap target changed before staging: {path.name}",
                 code="machine_bootstrap_target_identity_changed",
+                data={
+                    "component": "target.fileIdentity",
+                    "expected": repr(expected_target),
+                    "observed": repr(observed_target),
+                    "path": os.fspath(path),
+                    "operations": [staging_operation],
+                },
             )
         for _ in range(32):
             temporary_name = f".{path.name}.{secrets.token_hex(16)}.tmp"
@@ -1639,6 +2324,13 @@ def _atomic_write_owned(
             raise OrchestrateError(
                 "Machine bootstrap could not reserve an exclusive staging file",
                 code="machine_bootstrap_temporary_identity_unproven",
+                data={
+                    "component": "stagingTemporary.form",
+                    "expected": "exclusive-owned-regular-file",
+                    "observed": "reservation-exhausted",
+                    "path": os.fspath(path.parent),
+                    "operations": [staging_operation],
+                },
             )
         opened = os.fstat(descriptor)
         linked = os.stat(
@@ -1655,6 +2347,17 @@ def _atomic_write_owned(
             raise OrchestrateError(
                 "Machine bootstrap could not prove exclusive ownership of its staging file",
                 code="machine_bootstrap_temporary_identity_unproven",
+                data={
+                    "component": "stagingTemporary.fileIdentity",
+                    "expected": "regular-file;links:1;opened-equals-linked",
+                    "observed": (
+                        f"opened:{_PathIdentity.from_stat(opened)!r};"
+                        f"linked:{_PathIdentity.from_stat(linked)!r};"
+                        f"reparse:{_is_reparse(opened)}"
+                    ),
+                    "path": os.fspath(path.parent / temporary_name),
+                    "operations": [staging_operation],
+                },
             )
         view = memoryview(raw)
         while view:
@@ -1667,12 +2370,53 @@ def _atomic_write_owned(
         else:
             os.chmod(path.parent / temporary_name, 0o755 if executable else 0o600)
         os.fsync(descriptor)
+        if archive_stages is not None:
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                staged = bytearray()
+                while len(staged) <= MAX_SOURCE_ARCHIVE_BYTES:
+                    chunk = os.read(
+                        descriptor,
+                        min(64 * 1024, MAX_SOURCE_ARCHIVE_BYTES + 1 - len(staged)),
+                    )
+                    if not chunk:
+                        break
+                    staged.extend(chunk)
+                archive_stages.append(
+                    _archive_stage_diagnostic(
+                        "staged-temp-after-fsync",
+                        bytes(staged),
+                        form=(
+                            "Windows-path-staging"
+                            if provider.windows_semantics
+                            else "directory-fd-staging"
+                        ),
+                        path=path.parent / temporary_name,
+                    )
+                )
+            except OSError:
+                archive_stages.append(
+                    {
+                        "stage": "staged-temp-after-fsync",
+                        "form": "unavailable",
+                        "path": os.fspath(path.parent / temporary_name),
+                        "zipStructure": "unavailable",
+                    }
+                )
         os.close(descriptor)
         descriptor = None
-        if _target_identity_at(parent_fd, path.parent, path.name) != expected_target:
+        observed_target = _target_identity_at(parent_fd, path.parent, path.name)
+        if observed_target != expected_target:
             raise OrchestrateError(
                 f"Machine bootstrap target changed before atomic replacement: {path.name}",
                 code="machine_bootstrap_target_identity_changed",
+                data={
+                    "component": "target.fileIdentity",
+                    "expected": repr(expected_target),
+                    "observed": repr(observed_target),
+                    "path": os.fspath(path),
+                    "operations": [staging_operation],
+                },
             )
         _commit_staged_no_replace(
             temporary_name,
@@ -1680,11 +2424,40 @@ def _atomic_write_owned(
             parent_fd=parent_fd,
             parent=path.parent,
         )
+        if archive_stages is not None:
+            try:
+                committed = provider.read_bounded_file(path, MAX_SOURCE_ARCHIVE_BYTES).raw
+                archive_stages.append(
+                    _archive_stage_diagnostic(
+                        "committed-target",
+                        committed,
+                        form="public-path",
+                        path=path,
+                    )
+                )
+            except (OSError, OrchestrateError):
+                archive_stages.append(
+                    {
+                        "stage": "committed-target",
+                        "form": "unavailable",
+                        "path": os.fspath(path),
+                        "zipStructure": "unavailable",
+                    }
+                )
         os.unlink(
             temporary_name if parent_fd is not None else os.fspath(path.parent / temporary_name),
             **({} if parent_fd is None else {"dir_fd": parent_fd}),
         )
         temporary_name = None
+    except BaseException as exc:
+        _diagnostic_exception_note(
+            exc,
+            {
+                "operations": [staging_operation],
+                "archiveStages": [] if archive_stages is None else archive_stages,
+            },
+        )
+        raise
     finally:
         if descriptor is not None:
             try:
@@ -1795,7 +2568,18 @@ def _machine_readiness_diagnostic(
         return {"component": "userPath.indices", "expected": [0], "observed": matches}
     resolved = resolver("orchestrate", user_path)
     if not resolved or not _same_path(resolved, layout.windows_shim):
-        return {"component": "command.resolution", "expected": os.fspath(layout.windows_shim), "observed": resolved}
+        return {
+            "component": "command.resolution",
+            "expected": os.fspath(layout.windows_shim),
+            "observed": resolved,
+            "pathComparison": {
+                "expectedNormalized": _normalize_path_entry(os.fspath(layout.windows_shim)),
+                "observedNormalized": (
+                    _normalize_path_entry(os.fspath(resolved)) if resolved else "absent"
+                ),
+                "matched": False,
+            },
+        }
     if not _shim_matches(layout.windows_shim, _windows_shim_text()):
         return _shim_identity_data(layout.windows_shim, _windows_shim_text())
     if not _shim_matches(layout.wsl_shim, _wsl_shim_text()):
@@ -1828,7 +2612,14 @@ def _run_step(
     *,
     phase: str,
     runner_kwargs: Mapping[str, object] | None = None,
+    operation_diagnostics: Sequence[Mapping[str, object]] = (),
+    extra_diagnostics: Mapping[str, object] | None = None,
 ) -> None:
+    diagnostic = {
+        **({} if extra_diagnostics is None else extra_diagnostics),
+        "operations": list(operation_diagnostics),
+        "phase": phase,
+    }
     try:
         completed = runner(
             tuple(argv),
@@ -1838,17 +2629,42 @@ def _run_step(
             **({} if runner_kwargs is None else runner_kwargs),
         )
     except OSError as exc:
-        raise OrchestrateError(
+        failure = OrchestrateError(
             f"Machine bootstrap could not start its {phase} step; correct the reported OS error and rerun setup",
             code="machine_bootstrap_process_failed",
-            data={"phase": phase},
-        ) from exc
+            data={
+                "phase": phase,
+                "errno": exc.errno,
+                "winerror": getattr(exc, "winerror", None),
+            },
+        )
+        _diagnostic_exception_note(
+            failure,
+            {
+                **diagnostic,
+                "component": "process.launch",
+                "expected": "success",
+                "observed": "os-error",
+            },
+        )
+        raise failure from exc
+    except Exception as exc:
+        _diagnostic_exception_note(
+            exc,
+            diagnostic,
+        )
+        raise
     if type(completed.returncode) is not int or completed.returncode != 0:
-        raise OrchestrateError(
+        failure = OrchestrateError(
             f"Machine bootstrap {phase} failed; the dedicated installation is incomplete and setup may be rerun safely",
             code="machine_bootstrap_command_failed",
             data={"phase": phase, "returnCode": completed.returncode},
         )
+        _diagnostic_exception_note(
+            failure,
+            diagnostic,
+        )
+        raise failure
 
 
 def _write_shim(
@@ -1945,26 +2761,78 @@ def _run_bound_step(
 ) -> None:
     binding.verify()
     if source is not None:
-        source.verify()
+        if isinstance(source, _ArchiveBinding):
+            source.verify(stage="pre-effect")
+        else:
+            source.verify()
     try:
+        runner_kwargs = binding.runner_kwargs(
+            pass_fds=() if source is None else source.pass_fds()
+        )
+        operations: list[Mapping[str, object]] = [
+            _operation_diagnostic(
+                "interpreter-effect",
+                (
+                    "native-path+explicit-application-name"
+                    if binding._provider.native_windows
+                    else "descriptor-executable+pass-fds"
+                ),
+                (
+                    binding.python_path
+                    if binding._provider.native_windows
+                    else runner_kwargs["executable"]
+                ),
+                path_form=(
+                    "native-path" if binding._provider.native_windows else "proc-self-fd"
+                ),
+                explicit_application_name=binding._provider.native_windows,
+            )
+        ]
+        if source is not None:
+            operations.extend(source.diagnostic_data().get("operations", []))  # type: ignore[arg-type]
+        extra_diagnostics = {} if source is None else source.diagnostic_data()
         _run_step(
             runner,
             argv,
             phase=phase,
-            runner_kwargs=binding.runner_kwargs(
-                pass_fds=() if source is None else source.pass_fds()
-            ),
+            runner_kwargs=runner_kwargs,
+            operation_diagnostics=operations,
+            extra_diagnostics=extra_diagnostics,
         )
-    except OrchestrateError:
+    except OrchestrateError as exc:
         # Identity divergence is more actionable than the downstream process
         # symptom and must win error precedence.
         binding.verify()
         if source is not None:
-            source.verify()
+            if isinstance(source, _ArchiveBinding):
+                source.verify(stage="post-failure")
+            else:
+                source.verify()
+            _diagnostic_exception_note(
+                exc,
+                {
+                    **source.diagnostic_data(),
+                    "component": "postFailure.identity",
+                    "expected": "matching",
+                    "observed": "matching",
+                },
+            )
+        else:
+            _diagnostic_exception_note(
+                exc,
+                {
+                    "component": "postFailure.identity",
+                    "expected": "matching",
+                    "observed": "matching",
+                },
+            )
         raise
     binding.verify()
     if source is not None:
-        source.verify()
+        if isinstance(source, _ArchiveBinding):
+            source.verify(stage="post-effect")
+        else:
+            source.verify()
 
 
 def _require_source_checkout(layout: MachineLayout) -> None:
@@ -1991,6 +2859,16 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
     def __init__(self, path: Path) -> None:
         self.path = path
         self._provider = _active_platform_provider()
+        self.operation = _operation_diagnostic(
+            "venv-creation",
+            (
+                "retained-Windows-parent-and-child-handles+public-path"
+                if self._provider.native_windows
+                else "retained-parent-and-child-descriptors+proc-fd-path"
+            ),
+            path,
+            path_form="native-path" if self._provider.native_windows else "proc-self-fd",
+        )
         self._parent_handle: object | None = None
         self._parent_fd: int | None = None
         self._child_handle: object | None = None
@@ -2000,12 +2878,18 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
             _before_venv_parent_open(path.parent)
             if self._provider.native_windows:
                 self._parent_handle = self._provider.open_path_pin(path.parent, directory=True)
-                if not _same_identity(
-                    _path_identity(path.parent, directory=True), parent_identity, directory=True
-                ):
+                observed_parent = _path_identity(path.parent, directory=True)
+                if not _same_identity(observed_parent, parent_identity, directory=True):
                     raise OrchestrateError(
                         "The virtual-environment parent changed while it was bound",
                         code="machine_bootstrap_parent_identity_changed",
+                        data={
+                            "component": "venvParent.fileIdentity",
+                            "expected": repr(parent_identity),
+                            "observed": repr(observed_parent),
+                            "path": os.fspath(path.parent),
+                            **self.diagnostic_data(),
+                        },
                     )
                 os.mkdir(path)
                 self._child_handle = self._provider.open_path_pin(path, directory=True)
@@ -2017,14 +2901,28 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
                     raise OrchestrateError(
                         "The virtual-environment parent changed while it was bound",
                         code="machine_bootstrap_parent_identity_changed",
+                        data={
+                            "component": "venvParent.fileIdentity",
+                            "expected": repr(parent_identity),
+                            "observed": repr(opened_parent),
+                            "path": os.fspath(path.parent),
+                            **self.diagnostic_data(),
+                        },
                     )
                 os.mkdir(path.name, dir_fd=self._parent_fd)
                 flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
                 self._child_fd = os.open(path.name, flags, dir_fd=self._parent_fd)
                 self.effect_path = Path(f"/proc/self/fd/{self._child_fd}")
+                self.operation = _operation_diagnostic(
+                    "venv-creation",
+                    "retained-parent-and-child-descriptors+proc-fd-path",
+                    self.effect_path,
+                    path_form="proc-self-fd",
+                )
             self._identity = _path_identity(path, directory=True)
             self.verify()
-        except BaseException:
+        except BaseException as exc:
+            _diagnostic_exception_note(exc, self.diagnostic_data())
             self.close()
             raise
 
@@ -2039,14 +2937,23 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
                     "component": "venv.fileIdentity",
                     "expected": repr(self._identity),
                     "observed": "unavailable-or-redirected",
+                    **self.diagnostic_data(),
                 },
             ) from exc
         if not _same_identity(observed, self._identity, directory=True):
             raise OrchestrateError(
                 "The dedicated environment changed during its bound creation",
                 code="machine_bootstrap_venv_identity_changed",
-                data={"component": "venv.fileIdentity", "expected": repr(self._identity), "observed": repr(observed)},
+                data={
+                    "component": "venv.fileIdentity",
+                    "expected": repr(self._identity),
+                    "observed": repr(observed),
+                    **self.diagnostic_data(),
+                },
             )
+
+    def diagnostic_data(self) -> dict[str, object]:
+        return {"operations": [self.operation]}
 
     def pass_fds(self) -> tuple[int, ...]:
         return () if self._child_fd is None else (self._child_fd,)
@@ -2131,9 +3038,19 @@ def ensure_machine(
                             if creation.pass_fds()
                             else None
                         ),
+                        operation_diagnostics=[creation.operation],
                     )
-                except OrchestrateError:
+                except OrchestrateError as exc:
                     creation.verify()
+                    _diagnostic_exception_note(
+                        exc,
+                        {
+                            **creation.diagnostic_data(),
+                            "component": "postFailure.venvIdentity",
+                            "expected": "matching",
+                            "observed": "matching",
+                        },
+                    )
                     raise
                 creation.verify()
             _validate_existing_install_tree(selected_layout)
@@ -2145,6 +3062,7 @@ def ensure_machine(
             actions.append("created_environment")
 
         _require_source_checkout(selected_layout)
+        archive_stages_evidence: list[dict[str, object]] = []
         with _SourceBinding(selected_layout) as source, _VenvBinding(selected_layout) as binding:
             receipt_target = _target_identity(selected_layout.install_receipt)
             anchor_target = _target_identity(selected_layout.install_anchor)
@@ -2231,8 +3149,11 @@ def ensure_machine(
                         (os.fspath(binding.python_path), "-m", "pip", "install", "--upgrade", "pip"),
                         phase="pip upgrade",
                     )
-                    _build_source_archive(selected_layout, source)
-                    archive = _ArchiveBinding(selected_layout.source_archive)
+                    archive_stages = _build_source_archive(selected_layout, source)
+                    archive = _ArchiveBinding(
+                        selected_layout.source_archive,
+                        stage_diagnostics=archive_stages,
+                    )
                     source.verify()
                     _run_bound_step(
                         binding,
@@ -2266,6 +3187,7 @@ def ensure_machine(
                     actions.append("installed_reviewed_source")
             finally:
                 if archive is not None:
+                    archive_stages_evidence = list(archive.stage_diagnostics)
                     archive.close()
 
             _ensure_directory(selected_layout.bin_root, code="machine_bootstrap_shim_write_failed")
@@ -2298,14 +3220,31 @@ def ensure_machine(
                     "component": "command.resolution",
                     "expected": os.fspath(selected_layout.windows_shim),
                     "observed": resolved,
+                    "pathComparison": {
+                        "expectedNormalized": _normalize_path_entry(
+                            os.fspath(selected_layout.windows_shim)
+                        ),
+                        "observedNormalized": (
+                            _normalize_path_entry(os.fspath(resolved))
+                            if resolved
+                            else "absent"
+                        ),
+                        "matched": False,
+                    },
                 },
             )
         if not machine_ready(selected_layout, selected_store, resolver=resolver):
+            readiness_diagnostic = _machine_readiness_diagnostic(
+                selected_layout, selected_store, resolver=resolver
+            )
+            if archive_stages_evidence:
+                readiness_diagnostic = {
+                    **readiness_diagnostic,
+                    "archiveStages": archive_stages_evidence,
+                }
             raise OrchestrateError(
                 "Machine bootstrap verification found an incomplete Windows or WSL launcher; rerun setup to repair it",
                 code="machine_bootstrap_verification_failed",
-                data=_machine_readiness_diagnostic(
-                    selected_layout, selected_store, resolver=resolver
-                ),
+                data=readiness_diagnostic,
             )
         return MachineBootstrapResult("repaired", tuple(actions))
