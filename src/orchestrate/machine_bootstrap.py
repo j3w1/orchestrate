@@ -21,6 +21,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import zipfile
+import io
 from typing import Protocol
 
 from .errors import OrchestrateError
@@ -30,13 +32,15 @@ from .state import RunLock
 MINIMUM_PYTHON = (3, 13)
 WINDOWS_COMMAND = "orchestrate.cmd"
 WSL_COMMAND = "orchestrate"
-INSTALL_RECEIPT_SCHEMA = "orchestrate-machine-install/v4"
+INSTALL_RECEIPT_SCHEMA = "orchestrate-machine-install/v5"
+INSTALL_ANCHOR_SCHEMA = "orchestrate-machine-install-anchor/v1"
 MAX_INSTALL_RECEIPT_BYTES = 4096
 MAX_PYVENV_CONFIG_BYTES = 16 * 1024
 MAX_SHIM_BYTES = 32 * 1024
 MAX_COMMAND_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_FILES = 4096
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
+MAX_SOURCE_ARCHIVE_BYTES = 72 * 1024 * 1024
 MACHINE_LOCK_NAME = ".machine-bootstrap.lock"
 SIMULATED_WIN32_PROVIDER_ENV = "ORCHESTRATE_BOOTSTRAP_PROVIDER"
 
@@ -321,6 +325,8 @@ class MachineLayout:
     scripts_root: Path
     command_path: Path
     install_receipt: Path
+    install_anchor: Path
+    source_archive: Path
     bin_root: Path
     windows_shim: Path
     wsl_shim: Path
@@ -352,6 +358,7 @@ def default_layout(
             code="machine_bootstrap_home_unavailable",
         )
     install_root = Path(local_app_data) / "orchestrate"
+    state_root = Path(local_app_data) / "orchestrate-state"
     venv_root = install_root / "venv"
     scripts_root = venv_root / "Scripts"
     selected_source = Path(__file__).resolve().parents[2] if source_root is None else source_root.resolve()
@@ -362,6 +369,8 @@ def default_layout(
         scripts_root=scripts_root,
         command_path=scripts_root / "orchestrate.exe",
         install_receipt=install_root / "install.json",
+        install_anchor=state_root / "machine-install.json",
+        source_archive=install_root / "installed-source.zip",
         bin_root=install_root / "bin",
         windows_shim=install_root / "bin" / WINDOWS_COMMAND,
         wsl_shim=install_root / "bin" / WSL_COMMAND,
@@ -707,6 +716,20 @@ def _shim_matches(path: Path, expected: str) -> bool:
         return False
 
 
+def _shim_identity_data(path: Path, expected: str) -> dict[str, object]:
+    expected_digest = f"sha256:{hashlib.sha256(expected.encode('utf-8')).hexdigest()}"
+    try:
+        raw = _read_bounded_regular(path, MAX_SHIM_BYTES)
+        observed: object = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+    except OrchestrateError as exc:
+        observed = exc.code
+    return {
+        "component": f"launcher.{path.name}.sha256",
+        "expected": expected_digest,
+        "observed": observed,
+    }
+
+
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     value: dict[str, object] = {}
     for key, item in pairs:
@@ -904,10 +927,17 @@ def _active_platform_provider() -> _PlatformProvider:
     return _NATIVE_WIN32_PROVIDER if sys.platform == "win32" else _POSIX_PROVIDER
 
 
-def _source_tree_digest(root: Path) -> str:
-    """Hash the bounded editable-install input tree without following links."""
+def _ignored_source_directory(name: str) -> bool:
+    """The exact local/generated directory convention excluded from installs."""
 
-    ignored_directories = {".git", ".venv", "__pycache__", ".pytest_cache", "build", "dist"}
+    return (
+        name in {".git", ".venv", "venv", "__pycache__", ".pytest_cache", "build", "dist"}
+        or name.startswith((".venv-", "venv-"))
+        or name.endswith((".egg-info", "-venv"))
+    )
+
+
+def _source_tree_records(root: Path) -> list[tuple[str, Path]]:
     records: list[tuple[str, Path]] = []
     pending = [root]
     while pending:
@@ -937,7 +967,7 @@ def _source_tree_digest(root: Path) -> str:
                     data={"path": relative},
                 )
             if stat.S_ISDIR(info.st_mode):
-                if entry.name not in ignored_directories and not entry.name.endswith(".egg-info"):
+                if not _ignored_source_directory(entry.name):
                     pending.append(Path(entry.path))
                 continue
             if not stat.S_ISREG(info.st_mode):
@@ -954,10 +984,15 @@ def _source_tree_digest(root: Path) -> str:
                     "The reviewed checkout exceeds the bounded source-file limit",
                     code="machine_bootstrap_source_identity_unproven",
                 )
+    return sorted(records)
+
+
+def _source_tree_digest(root: Path) -> str:
+    """Hash the bounded install input tree without following links."""
 
     digest = hashlib.sha256()
     consumed = 0
-    for relative, path in sorted(records):
+    for relative, path in _source_tree_records(root):
         remaining = MAX_SOURCE_BYTES - consumed
         if remaining < 0:
             raise OrchestrateError(
@@ -981,7 +1016,7 @@ def _source_tree_digest(root: Path) -> str:
 
 
 class _SourceBinding(AbstractContextManager["_SourceBinding"]):
-    """Bind the reviewed checkout used by editable installation and receipts."""
+    """Bind the reviewed checkout used to build the install archive and receipt."""
 
     def __init__(self, layout: MachineLayout) -> None:
         self._provider = _active_platform_provider()
@@ -990,7 +1025,7 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
         self._descriptor: int | None = None
         self._windows_handle: object | None = None
         try:
-            if self._provider.windows_semantics:
+            if self._provider.native_windows:
                 self._windows_handle = self._provider.open_path_pin(self.path, directory=True)
                 self.effect_path = self.path
             else:
@@ -1010,7 +1045,7 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
                 descriptor_path = Path(f"/proc/self/fd/{self._descriptor}")
                 if not descriptor_path.exists():
                     raise OrchestrateError(
-                        "This host cannot bind editable installation to the reviewed checkout descriptor",
+                        "This host cannot bind source archiving to the reviewed checkout descriptor",
                         code="machine_bootstrap_source_identity_unproven",
                     )
                 self.effect_path = descriptor_path
@@ -1043,8 +1078,6 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
     def receipt_fields(self) -> dict[str, object]:
         return {
             "sourceRoot": self.resolved,
-            "sourceDevice": self._identity.device,
-            "sourceInode": self._identity.inode,
             "sourceTreeSha256": f"sha256:{self.tree_digest}",
         }
 
@@ -1064,6 +1097,128 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
+    """Pin the exact immutable archive consumed by pip."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._provider = _active_platform_provider()
+        self._handle: object | None = None
+        self._descriptor: int | None = None
+        try:
+            if self._provider.native_windows:
+                self._handle = self._provider.open_path_pin(path, directory=False)
+                opened = _read_bounded_regular_file(path, MAX_SOURCE_ARCHIVE_BYTES)
+                self.effect_path = path
+            else:
+                descriptor = self._provider.open_path_pin(path, directory=False)
+                self._descriptor = int(descriptor)
+                info = os.fstat(self._descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_ARCHIVE_BYTES:
+                    raise OrchestrateError(
+                        "The installed-source archive identity is unavailable",
+                        code="machine_bootstrap_source_identity_unproven",
+                    )
+                raw = bytearray()
+                while len(raw) <= MAX_SOURCE_ARCHIVE_BYTES:
+                    chunk = os.read(self._descriptor, min(64 * 1024, MAX_SOURCE_ARCHIVE_BYTES + 1 - len(raw)))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                if len(raw) != info.st_size:
+                    raise OrchestrateError(
+                        "The installed-source archive changed while it was opened",
+                        code="machine_bootstrap_source_identity_changed",
+                    )
+                opened = _BoundedFile(bytes(raw), _PathIdentity.from_stat(info))
+                self.effect_path = Path(f"/proc/self/fd/{self._descriptor}")
+            self.digest = hashlib.sha256(opened.raw).hexdigest()
+            self.size = len(opened.raw)
+            self.identity = opened.identity
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+
+    def verify(self) -> None:
+        if self._descriptor is not None:
+            os.lseek(self._descriptor, 0, os.SEEK_SET)
+            raw = bytearray()
+            while len(raw) <= MAX_SOURCE_ARCHIVE_BYTES:
+                chunk = os.read(
+                    self._descriptor,
+                    min(64 * 1024, MAX_SOURCE_ARCHIVE_BYTES + 1 - len(raw)),
+                )
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            current_raw = bytes(raw)
+        else:
+            current_raw = _read_bounded_regular_file(
+                self.effect_path, MAX_SOURCE_ARCHIVE_BYTES
+            ).raw
+        observed = f"sha256:{hashlib.sha256(current_raw).hexdigest()}"
+        expected = f"sha256:{self.digest}"
+        if len(current_raw) != self.size or observed != expected:
+            raise OrchestrateError(
+                "The installed-source archive changed after it was bound",
+                code="machine_bootstrap_source_identity_changed",
+                data={"component": "sourceArchiveSha256", "expected": expected, "observed": observed},
+            )
+
+    def receipt_fields(self) -> dict[str, object]:
+        return {
+            "sourceArchiveSha256": f"sha256:{self.digest}",
+            "sourceArchiveSize": self.size,
+        }
+
+    def pass_fds(self) -> tuple[int, ...]:
+        return () if self._descriptor is None else (self._descriptor,)
+
+    def close(self) -> None:
+        if self._descriptor is not None:
+            os.close(self._descriptor)
+            self._descriptor = None
+        if self._handle is not None:
+            self._provider.close_path_pin(self._handle)
+            self._handle = None
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+def _build_source_archive(layout: MachineLayout, source: _SourceBinding) -> None:
+    source.verify()
+    buffer = io.BytesIO()
+    consumed = 0
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED, strict_timestamps=True) as archive:
+        for relative, path in _source_tree_records(source.effect_path):
+            opened = _read_bounded_regular_file(path, MAX_SOURCE_BYTES - consumed)
+            consumed += len(opened.raw)
+            if consumed > MAX_SOURCE_BYTES:
+                raise OrchestrateError(
+                    "The reviewed checkout exceeds the bounded source-byte limit",
+                    code="machine_bootstrap_source_identity_unproven",
+                )
+            info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = ((0o755 if opened.identity.mode & 0o111 else 0o644) & 0xFFFF) << 16
+            archive.writestr(info, opened.raw)
+    source.verify()
+    raw = buffer.getvalue()
+    if len(raw) > MAX_SOURCE_ARCHIVE_BYTES:
+        raise OrchestrateError(
+            "The reviewed checkout archive exceeds its bounded byte limit",
+            code="machine_bootstrap_source_identity_unproven",
+        )
+    _atomic_write_owned(
+        layout.source_archive,
+        raw,
+        executable=False,
+        expected_target=_target_identity(layout.source_archive),
+    )
 
 
 class _VenvBinding(AbstractContextManager["_VenvBinding"]):
@@ -1087,7 +1242,7 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
         try:
             for path, directory in nodes:
                 self._identities[path] = _path_identity(path, directory=directory)
-                if self._provider.windows_semantics:
+                if self._provider.native_windows:
                     self._windows_handles.append(
                         self._provider.open_path_pin(path, directory=directory)
                     )
@@ -1141,14 +1296,12 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
             "venvRoot": self.root_resolved,
             "pythonPath": self.python_resolved,
             "pyvenvConfigSha256": f"sha256:{self.config_digest}",
-            "commandDevice": command.identity.device,
-            "commandInode": command.identity.inode,
             "commandSize": command.identity.size,
             "commandSha256": f"sha256:{hashlib.sha256(command.raw).hexdigest()}",
         }
 
     def runner_kwargs(self, *, pass_fds: tuple[int, ...] = ()) -> dict[str, object]:
-        if self._provider.windows_semantics:
+        if self._provider.native_windows:
             # subprocess forwards this as CreateProcess's explicit application
             # name.  The retained GENERIC_READ handle permits image reads while
             # denying writes/deletes until the post-effect identity proof.
@@ -1177,10 +1330,18 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
         self.close()
 
 
-def _receipt_value(binding: _VenvBinding, source: _SourceBinding) -> dict[str, object]:
+def _receipt_value(
+    binding: _VenvBinding,
+    source: _SourceBinding,
+    archive: _ArchiveBinding,
+    *,
+    installation_id: str,
+) -> dict[str, object]:
     payload = {
         "schema": INSTALL_RECEIPT_SCHEMA,
+        "installationId": installation_id,
         **source.receipt_fields(),
+        **archive.receipt_fields(),
         **binding.receipt_fields(),
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1199,53 +1360,123 @@ def _receipt_integrity_matches(value: dict[str, object]) -> bool:
     return recorded == f"sha256:{hashlib.sha256(canonical).hexdigest()}"
 
 
+def _anchor_value(receipt: dict[str, object]) -> dict[str, object]:
+    payload = {
+        "schema": INSTALL_ANCHOR_SCHEMA,
+        "installationId": receipt["installationId"],
+        "receiptSha256": receipt["receiptSha256"],
+        "sourceTreeSha256": receipt["sourceTreeSha256"],
+        "sourceArchiveSha256": receipt["sourceArchiveSha256"],
+        "commandSha256": receipt["commandSha256"],
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {**payload, "anchorSha256": f"sha256:{hashlib.sha256(canonical).hexdigest()}"}
+
+
+def _read_canonical_json(path: Path, limit: int) -> object | None:
+    try:
+        raw_bytes = _read_bounded_regular(path, limit)
+        raw = raw_bytes.decode("utf-8", errors="strict")
+        value = json.loads(
+            raw,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (OrchestrateError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    return value if raw_bytes == canonical else None
+
+
+def _receipt_match_diagnostic(
+    layout: MachineLayout,
+    binding: _VenvBinding,
+    source: _SourceBinding,
+    archive: _ArchiveBinding,
+) -> tuple[bool, dict[str, object]]:
+    value = _read_install_receipt(layout)
+    expected_keys = {
+        "schema",
+        "installationId",
+        "sourceRoot",
+        "sourceTreeSha256",
+        "sourceArchiveSha256",
+        "sourceArchiveSize",
+        "venvRoot",
+        "pythonPath",
+        "pyvenvConfigSha256",
+        "commandSize",
+        "commandSha256",
+        "receiptSha256",
+    }
+    if not isinstance(value, dict):
+        return False, {"component": "receipt.form", "expected": "canonical-object", "observed": type(value).__name__}
+    if set(value) != expected_keys:
+        return False, {
+            "component": "receipt.fields",
+            "expected": sorted(expected_keys),
+            "observed": sorted(str(key) for key in value),
+        }
+    string_keys = (
+        "schema",
+        "installationId",
+        "sourceRoot",
+        "sourceTreeSha256",
+        "sourceArchiveSha256",
+        "venvRoot",
+        "pythonPath",
+        "pyvenvConfigSha256",
+        "commandSha256",
+        "receiptSha256",
+    )
+    integer_keys = (
+        "commandSize",
+        "sourceArchiveSize",
+    )
+    for key in string_keys:
+        if not isinstance(value.get(key), str):
+            return False, {"component": f"receipt.{key}.form", "expected": "string", "observed": type(value.get(key)).__name__}
+    for key in integer_keys:
+        if type(value.get(key)) is not int or value[key] < 0:
+            return False, {"component": f"receipt.{key}.form", "expected": "nonnegative-integer", "observed": repr(value.get(key))}
+    if not value["installationId"]:
+        return False, {"component": "receipt.installationId.form", "expected": "nonempty-string", "observed": "empty-string"}
+    if not _receipt_integrity_matches(value):
+        payload = {key: item for key, item in value.items() if key != "receiptSha256"}
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        expected_digest = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+        return False, {"component": "receipt.receiptSha256", "expected": expected_digest, "observed": value["receiptSha256"]}
+    expected = _receipt_value(binding, source, archive, installation_id=value["installationId"])
+    for key in sorted(expected):
+        if key == "receiptSha256":
+            continue
+        if key in {"sourceRoot", "venvRoot", "pythonPath"} and _same_path(
+            value[key], expected[key]
+        ):
+            continue
+        if value[key] != expected[key]:
+            return False, {"component": f"receipt.{key}", "expected": expected[key], "observed": value[key]}
+    anchor = _read_canonical_json(layout.install_anchor, MAX_INSTALL_RECEIPT_BYTES)
+    expected_anchor = _anchor_value(value)
+    if not isinstance(anchor, dict):
+        return False, {"component": "anchor.form", "expected": "canonical-object", "observed": type(anchor).__name__}
+    for key in sorted(set(expected_anchor) | set(anchor)):
+        if anchor.get(key) != expected_anchor.get(key):
+            return False, {"component": f"anchor.{key}", "expected": expected_anchor.get(key), "observed": anchor.get(key)}
+    return True, {"component": "receipt-and-anchor", "expected": "matching", "observed": "matching"}
+
+
 def _install_receipt_matches(
     layout: MachineLayout,
     binding: _VenvBinding,
     source: _SourceBinding,
+    archive: _ArchiveBinding | None = None,
 ) -> bool:
     try:
-        value = _read_install_receipt(layout)
-        if not isinstance(value, dict) or set(value) != {
-            "schema",
-            "sourceRoot",
-            "sourceDevice",
-            "sourceInode",
-            "sourceTreeSha256",
-            "venvRoot",
-            "pythonPath",
-            "pyvenvConfigSha256",
-            "commandDevice",
-            "commandInode",
-            "commandSize",
-            "commandSha256",
-            "receiptSha256",
-        }:
-            return False
-        if any(
-            not isinstance(value.get(key), str)
-            for key in (
-                "schema",
-                "sourceRoot",
-                "sourceTreeSha256",
-                "venvRoot",
-                "pythonPath",
-                "pyvenvConfigSha256",
-                "commandSha256",
-                "receiptSha256",
-            )
-        ) or any(
-            type(value.get(key)) is not int or value[key] < 0
-            for key in (
-                "sourceDevice",
-                "sourceInode",
-                "commandDevice",
-                "commandInode",
-                "commandSize",
-            )
-        ):
-            return False
-        return _receipt_integrity_matches(value) and value == _receipt_value(binding, source)
+        if archive is None:
+            with _ArchiveBinding(layout.source_archive) as selected_archive:
+                return _receipt_match_diagnostic(layout, binding, source, selected_archive)[0]
+        return _receipt_match_diagnostic(layout, binding, source, archive)[0]
     except OrchestrateError:
         return False
 
@@ -1261,18 +1492,7 @@ def _command_proof(path: Path) -> _BoundedFile:
 
 
 def _read_install_receipt(layout: MachineLayout) -> object | None:
-    try:
-        raw_bytes = _read_bounded_regular(layout.install_receipt, MAX_INSTALL_RECEIPT_BYTES)
-        raw = raw_bytes.decode("utf-8", errors="strict")
-        value = json.loads(
-            raw,
-            object_pairs_hook=_strict_json_object,
-            parse_constant=_reject_json_constant,
-        )
-    except (OrchestrateError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return None
-    canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-    return value if raw_bytes == canonical else None
+    return _read_canonical_json(layout.install_receipt, MAX_INSTALL_RECEIPT_BYTES)
 
 
 def _target_identity(path: Path) -> _PathIdentity | None:
@@ -1365,7 +1585,7 @@ def _atomic_write_owned(
         if provider.windows_semantics:
             try:
                 parent_handle = provider.open_path_pin(path.parent, directory=True)
-            except OrchestrateError as exc:
+            except (OSError, OrchestrateError) as exc:
                 raise OrchestrateError(
                     "Machine bootstrap staging parent could not be bound",
                     code="machine_bootstrap_parent_identity_changed",
@@ -1492,13 +1712,23 @@ def _write_install_receipt(
     layout: MachineLayout,
     binding: _VenvBinding,
     source: _SourceBinding,
+    archive: _ArchiveBinding,
     *,
     expected_target: _PathIdentity | None,
+    expected_anchor: _PathIdentity | None,
 ) -> None:
-    raw = (
-        json.dumps(_receipt_value(binding, source), sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode("utf-8")
+    receipt = _receipt_value(binding, source, archive, installation_id=secrets.token_hex(32))
+    anchor = _anchor_value(receipt)
+    raw = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    anchor_raw = (json.dumps(anchor, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     try:
+        layout.install_anchor.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_owned(
+            layout.install_anchor,
+            anchor_raw,
+            executable=False,
+            expected_target=expected_anchor,
+        )
         _atomic_write_owned(
             layout.install_receipt,
             raw,
@@ -1509,6 +1739,11 @@ def _write_install_receipt(
         raise OrchestrateError(
             "Machine bootstrap installed the checkout but could not record its local receipt; rerun setup to converge",
             code="machine_bootstrap_receipt_write_failed",
+            data={
+                "component": "receipt-and-anchor.write",
+                "expected": "both-canonical-records",
+                "observed": type(exc).__name__,
+            },
         ) from exc
 
 
@@ -1531,15 +1766,60 @@ def machine_ready(
         return False
     try:
         _require_source_checkout(layout)
-        with _SourceBinding(layout) as source, _VenvBinding(layout) as binding:
+        with (
+            _SourceBinding(layout) as source,
+            _ArchiveBinding(layout.source_archive) as archive,
+            _VenvBinding(layout) as binding,
+        ):
             return bool(
                 _owned_file_exists(layout.command_path)
-                and _install_receipt_matches(layout, binding, source)
+                and _install_receipt_matches(layout, binding, source, archive)
                 and _shim_matches(layout.windows_shim, _windows_shim_text())
                 and _shim_matches(layout.wsl_shim, _wsl_shim_text())
             )
     except OrchestrateError:
         return False
+
+
+def _machine_readiness_diagnostic(
+    layout: MachineLayout,
+    path_store: UserPathStore,
+    *,
+    resolver: Resolver,
+) -> dict[str, object]:
+    user_path = path_store.read().value
+    entries = user_path.split(";") if user_path else []
+    wanted = _normalize_path_entry(os.fspath(layout.bin_root))
+    matches = [index for index, item in enumerate(entries) if _normalize_path_entry(item) == wanted]
+    if matches != [0]:
+        return {"component": "userPath.indices", "expected": [0], "observed": matches}
+    resolved = resolver("orchestrate", user_path)
+    if not resolved or not _same_path(resolved, layout.windows_shim):
+        return {"component": "command.resolution", "expected": os.fspath(layout.windows_shim), "observed": resolved}
+    if not _shim_matches(layout.windows_shim, _windows_shim_text()):
+        return _shim_identity_data(layout.windows_shim, _windows_shim_text())
+    if not _shim_matches(layout.wsl_shim, _wsl_shim_text()):
+        return _shim_identity_data(layout.wsl_shim, _wsl_shim_text())
+    try:
+        with (
+            _SourceBinding(layout) as source,
+            _ArchiveBinding(layout.source_archive) as archive,
+            _VenvBinding(layout) as binding,
+        ):
+            matches_receipt, diagnostic = _receipt_match_diagnostic(
+                layout, binding, source, archive
+            )
+            if not matches_receipt:
+                return diagnostic
+            if not _owned_file_exists(layout.command_path):
+                return {"component": "command.form", "expected": "owned-regular-file", "observed": "absent"}
+    except OrchestrateError as exc:
+        return exc.data or {
+            "component": "readiness.identity",
+            "expected": "available-and-matching",
+            "observed": exc.code,
+        }
+    return {"component": "readiness", "expected": "complete", "observed": "incomplete"}
 
 
 def _run_step(
@@ -1584,6 +1864,7 @@ def _write_shim(
         raise OrchestrateError(
             f"Machine bootstrap refuses to overwrite the unrecognized launcher {path.name}; move it aside after inspection and rerun setup",
             code="machine_bootstrap_shim_identity_unproven",
+            data=_shim_identity_data(path, text),
         )
     try:
         _atomic_write_owned(
@@ -1637,6 +1918,7 @@ def _validate_existing_install_tree(layout: MachineLayout) -> None:
         layout.scripts_root / "python.exe",
         layout.command_path,
         layout.install_receipt,
+        layout.source_archive,
         layout.windows_shim,
         layout.wsl_shim,
     ):
@@ -1645,6 +1927,12 @@ def _validate_existing_install_tree(layout: MachineLayout) -> None:
         except FileNotFoundError:
             continue
         _target_identity(candidate)
+    try:
+        layout.install_anchor.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        _target_identity(layout.install_anchor)
 
 
 def _run_bound_step(
@@ -1658,14 +1946,22 @@ def _run_bound_step(
     binding.verify()
     if source is not None:
         source.verify()
-    _run_step(
-        runner,
-        argv,
-        phase=phase,
-        runner_kwargs=binding.runner_kwargs(
-            pass_fds=() if source is None else source.pass_fds()
-        ),
-    )
+    try:
+        _run_step(
+            runner,
+            argv,
+            phase=phase,
+            runner_kwargs=binding.runner_kwargs(
+                pass_fds=() if source is None else source.pass_fds()
+            ),
+        )
+    except OrchestrateError:
+        # Identity divergence is more actionable than the downstream process
+        # symptom and must win error precedence.
+        binding.verify()
+        if source is not None:
+            source.verify()
+        raise
     binding.verify()
     if source is not None:
         source.verify()
@@ -1683,6 +1979,92 @@ def _require_source_checkout(layout: MachineLayout) -> None:
 
 def _owned_file_exists(path: Path) -> bool:
     return _target_identity(path) is not None
+
+
+def _before_venv_parent_open(_: Path) -> None:
+    """Fault seam before the absent-venv parent is physically bound."""
+
+
+class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
+    """Create the absent venv relative to a bound parent and retain its identity."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._provider = _active_platform_provider()
+        self._parent_handle: object | None = None
+        self._parent_fd: int | None = None
+        self._child_handle: object | None = None
+        self._child_fd: int | None = None
+        parent_identity = _path_identity(path.parent, directory=True)
+        try:
+            _before_venv_parent_open(path.parent)
+            if self._provider.native_windows:
+                self._parent_handle = self._provider.open_path_pin(path.parent, directory=True)
+                if not _same_identity(
+                    _path_identity(path.parent, directory=True), parent_identity, directory=True
+                ):
+                    raise OrchestrateError(
+                        "The virtual-environment parent changed while it was bound",
+                        code="machine_bootstrap_parent_identity_changed",
+                    )
+                os.mkdir(path)
+                self._child_handle = self._provider.open_path_pin(path, directory=True)
+                self.effect_path = path
+            else:
+                self._parent_fd = int(self._provider.open_path_pin(path.parent, directory=True))
+                opened_parent = _PathIdentity.from_stat(os.fstat(self._parent_fd))
+                if not _same_identity(opened_parent, parent_identity, directory=True):
+                    raise OrchestrateError(
+                        "The virtual-environment parent changed while it was bound",
+                        code="machine_bootstrap_parent_identity_changed",
+                    )
+                os.mkdir(path.name, dir_fd=self._parent_fd)
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+                self._child_fd = os.open(path.name, flags, dir_fd=self._parent_fd)
+                self.effect_path = Path(f"/proc/self/fd/{self._child_fd}")
+            self._identity = _path_identity(path, directory=True)
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+
+    def verify(self) -> None:
+        try:
+            observed = _path_identity(self.path, directory=True)
+        except OrchestrateError as exc:
+            raise OrchestrateError(
+                "The dedicated environment changed during its bound creation",
+                code="machine_bootstrap_venv_identity_changed",
+                data={
+                    "component": "venv.fileIdentity",
+                    "expected": repr(self._identity),
+                    "observed": "unavailable-or-redirected",
+                },
+            ) from exc
+        if not _same_identity(observed, self._identity, directory=True):
+            raise OrchestrateError(
+                "The dedicated environment changed during its bound creation",
+                code="machine_bootstrap_venv_identity_changed",
+                data={"component": "venv.fileIdentity", "expected": repr(self._identity), "observed": repr(observed)},
+            )
+
+    def pass_fds(self) -> tuple[int, ...]:
+        return () if self._child_fd is None else (self._child_fd,)
+
+    def close(self) -> None:
+        for descriptor_name in ("_child_fd", "_parent_fd"):
+            descriptor = getattr(self, descriptor_name)
+            if descriptor is not None:
+                os.close(descriptor)
+                setattr(self, descriptor_name, None)
+        for handle_name in ("_child_handle", "_parent_handle"):
+            handle = getattr(self, handle_name)
+            if handle is not None:
+                self._provider.close_path_pin(handle)
+                setattr(self, handle_name, None)
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def ensure_machine(
@@ -1738,11 +2120,22 @@ def ensure_machine(
                     code="machine_bootstrap_venv_incomplete",
                     data={"path": os.fspath(selected_layout.venv_root)},
                 )
-            _run_step(
-                runner,
-                (sys.executable, "-m", "venv", os.fspath(selected_layout.venv_root)),
-                phase="virtual-environment creation",
-            )
+            with _VenvCreationBinding(selected_layout.venv_root) as creation:
+                try:
+                    _run_step(
+                        runner,
+                        (sys.executable, "-m", "venv", os.fspath(creation.effect_path)),
+                        phase="virtual-environment creation",
+                        runner_kwargs=(
+                            {"pass_fds": creation.pass_fds()}
+                            if creation.pass_fds()
+                            else None
+                        ),
+                    )
+                except OrchestrateError:
+                    creation.verify()
+                    raise
+                creation.verify()
             _validate_existing_install_tree(selected_layout)
             if not _owned_file_exists(venv_python):
                 raise OrchestrateError(
@@ -1754,6 +2147,7 @@ def ensure_machine(
         _require_source_checkout(selected_layout)
         with _SourceBinding(selected_layout) as source, _VenvBinding(selected_layout) as binding:
             receipt_target = _target_identity(selected_layout.install_receipt)
+            anchor_target = _target_identity(selected_layout.install_anchor)
             windows_target = _target_identity(selected_layout.windows_shim)
             wsl_target = _target_identity(selected_layout.wsl_shim)
             # Existing launchers are independent owned targets.  Report their
@@ -1765,6 +2159,9 @@ def ensure_machine(
                 raise OrchestrateError(
                     f"Machine bootstrap refuses to overwrite the unrecognized launcher {selected_layout.windows_shim.name}; move it aside after inspection and rerun setup",
                     code="machine_bootstrap_shim_identity_unproven",
+                    data=_shim_identity_data(
+                        selected_layout.windows_shim, _windows_shim_text()
+                    ),
                 )
             if wsl_target is not None and not _shim_matches(
                 selected_layout.wsl_shim, _wsl_shim_text()
@@ -1772,64 +2169,104 @@ def ensure_machine(
                 raise OrchestrateError(
                     f"Machine bootstrap refuses to overwrite the unrecognized launcher {selected_layout.wsl_shim.name}; move it aside after inspection and rerun setup",
                     code="machine_bootstrap_shim_identity_unproven",
+                    data=_shim_identity_data(selected_layout.wsl_shim, _wsl_shim_text()),
                 )
-            receipt_matches = _install_receipt_matches(selected_layout, binding, source)
-            if receipt_target != _target_identity(selected_layout.install_receipt):
-                raise OrchestrateError(
-                    "The machine-install receipt changed during ownership verification",
-                    code="machine_bootstrap_receipt_identity_changed",
-                )
-            command_target = _target_identity(selected_layout.command_path)
-            if not receipt_matches:
-                if receipt_target is not None:
-                    raise OrchestrateError(
-                        "The existing machine-install receipt does not prove the current command; move it aside after inspection and rerun setup",
-                        code="machine_bootstrap_receipt_identity_unproven",
+            archive_target = _target_identity(selected_layout.source_archive)
+            archive: _ArchiveBinding | None = None
+            if archive_target is not None:
+                archive = _ArchiveBinding(selected_layout.source_archive)
+            try:
+                if archive is None:
+                    receipt_matches = False
+                    receipt_diagnostic = {
+                        "component": "sourceArchive.form",
+                        "expected": "owned-regular-file",
+                        "observed": "absent",
+                    }
+                else:
+                    receipt_matches, receipt_diagnostic = _receipt_match_diagnostic(
+                        selected_layout, binding, source, archive
                     )
-                if command_target is not None:
+                if receipt_target != _target_identity(selected_layout.install_receipt):
                     raise OrchestrateError(
-                        "The existing command has no matching machine-install receipt; move it aside after inspection and rerun setup",
-                        code="machine_bootstrap_command_identity_unproven",
+                        "The machine-install receipt changed during ownership verification",
+                        code="machine_bootstrap_receipt_identity_changed",
+                        data={"component": "receipt.fileIdentity", "expected": repr(receipt_target), "observed": repr(_target_identity(selected_layout.install_receipt))},
                     )
-                _run_bound_step(
-                    binding,
-                    runner,
-                    (os.fspath(binding.python_path), "-m", "ensurepip", "--upgrade"),
-                    phase="pip preparation",
-                )
-                _run_bound_step(
-                    binding,
-                    runner,
-                    (os.fspath(binding.python_path), "-m", "pip", "install", "--upgrade", "pip"),
-                    phase="pip upgrade",
-                )
-                _run_bound_step(
-                    binding,
-                    runner,
-                    (
-                        os.fspath(binding.python_path),
-                        "-m",
-                        "pip",
-                        "install",
-                        "--editable",
-                        os.fspath(source.effect_path),
-                    ),
-                    phase="editable install",
-                    source=source,
-                )
-                if not _owned_file_exists(selected_layout.command_path):
-                    raise OrchestrateError(
-                        "Editable install reported success without creating the orchestrate command",
-                        code="machine_bootstrap_command_missing",
+                command_target = _target_identity(selected_layout.command_path)
+                if not receipt_matches:
+                    if receipt_target is not None:
+                        raise OrchestrateError(
+                            "The existing machine-install receipt does not prove the current command; move it aside after inspection and rerun setup",
+                            code="machine_bootstrap_receipt_identity_unproven",
+                            data=receipt_diagnostic,
+                        )
+                    if command_target is not None:
+                        raise OrchestrateError(
+                            "The existing command has no matching machine-install receipt; move it aside after inspection and rerun setup",
+                            code="machine_bootstrap_command_identity_unproven",
+                            data={"component": "command.receipt", "expected": "matching-receipt", "observed": "absent"},
+                        )
+                    if anchor_target is not None:
+                        raise OrchestrateError(
+                            "A host-local installation anchor exists without its receipt; move it aside after inspection and rerun setup",
+                            code="machine_bootstrap_receipt_identity_unproven",
+                            data={"component": "anchor.receipt", "expected": "matching-receipt", "observed": "receipt-absent"},
+                        )
+                    if archive is not None:
+                        raise OrchestrateError(
+                            "An unreceipted installed-source archive already exists; move it aside after inspection and rerun setup",
+                            code="machine_bootstrap_source_identity_unproven",
+                            data={"component": "sourceArchive.receipt", "expected": "absent-before-install", "observed": "existing-unreceipted-archive"},
+                        )
+                    _run_bound_step(
+                        binding,
+                        runner,
+                        (os.fspath(binding.python_path), "-m", "ensurepip", "--upgrade"),
+                        phase="pip preparation",
                     )
-                binding.verify()
-                _write_install_receipt(
-                    selected_layout,
-                    binding,
-                    source,
-                    expected_target=receipt_target,
-                )
-                actions.append("installed_editable_checkout")
+                    _run_bound_step(
+                        binding,
+                        runner,
+                        (os.fspath(binding.python_path), "-m", "pip", "install", "--upgrade", "pip"),
+                        phase="pip upgrade",
+                    )
+                    _build_source_archive(selected_layout, source)
+                    archive = _ArchiveBinding(selected_layout.source_archive)
+                    source.verify()
+                    _run_bound_step(
+                        binding,
+                        runner,
+                        (
+                            os.fspath(binding.python_path),
+                            "-m",
+                            "pip",
+                            "install",
+                            os.fspath(archive.effect_path),
+                        ),
+                        phase="reviewed source install",
+                        source=archive,  # type: ignore[arg-type]
+                    )
+                    source.verify()
+                    if not _owned_file_exists(selected_layout.command_path):
+                        raise OrchestrateError(
+                            "Source install reported success without creating the orchestrate command",
+                            code="machine_bootstrap_command_missing",
+                            data={"component": "command.form", "expected": "owned-regular-file", "observed": "absent"},
+                        )
+                    binding.verify()
+                    _write_install_receipt(
+                        selected_layout,
+                        binding,
+                        source,
+                        archive,
+                        expected_target=receipt_target,
+                        expected_anchor=anchor_target,
+                    )
+                    actions.append("installed_reviewed_source")
+            finally:
+                if archive is not None:
+                    archive.close()
 
             _ensure_directory(selected_layout.bin_root, code="machine_bootstrap_shim_write_failed")
             source.verify()
@@ -1857,10 +2294,18 @@ def ensure_machine(
             raise OrchestrateError(
                 "Machine bootstrap completed its writes but the user PATH does not resolve the canonical orchestrate command; open a new terminal and rerun setup",
                 code="machine_bootstrap_verification_failed",
+                data={
+                    "component": "command.resolution",
+                    "expected": os.fspath(selected_layout.windows_shim),
+                    "observed": resolved,
+                },
             )
         if not machine_ready(selected_layout, selected_store, resolver=resolver):
             raise OrchestrateError(
                 "Machine bootstrap verification found an incomplete Windows or WSL launcher; rerun setup to repair it",
                 code="machine_bootstrap_verification_failed",
+                data=_machine_readiness_diagnostic(
+                    selected_layout, selected_store, resolver=resolver
+                ),
             )
         return MachineBootstrapResult("repaired", tuple(actions))

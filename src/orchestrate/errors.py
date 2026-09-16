@@ -18,4 +18,12 @@ class OrchestrateError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.code = code
+        if data is None and code.startswith("machine_bootstrap_") and (
+            "identity" in code or code == "machine_bootstrap_verification_failed"
+        ):
+            data = {
+                "component": "identity-proof",
+                "expected": "available-and-matching",
+                "observed": "unavailable-or-divergent",
+            }
         self.data = dict(data) if data is not None else None

@@ -13,6 +13,7 @@ import threading
 from types import ModuleType
 from types import SimpleNamespace
 import unittest
+import zipfile
 from unittest.mock import patch
 
 from orchestrate.errors import OrchestrateError
@@ -22,9 +23,13 @@ from orchestrate.machine_bootstrap import (
     MachineBootstrapResult,
     RegistryUserPathStore,
     UserPathValue,
+    _anchor_value,
+    _ArchiveBinding,
     _atomic_write_owned,
+    _build_source_archive,
     _commit_staged_no_replace,
     _install_receipt_matches,
+    _NATIVE_WIN32_PROVIDER,
     _opened_file_identity_matches,
     _receipt_value,
     _run_bound_step,
@@ -87,6 +92,8 @@ def fixture_layout(root: Path) -> MachineLayout:
         scripts_root=scripts,
         command_path=scripts / "orchestrate.exe",
         install_receipt=install / "install.json",
+        install_anchor=root / "local" / "orchestrate-state" / "machine-install.json",
+        source_archive=install / "installed-source.zip",
         bin_root=install / "bin",
         windows_shim=install / "bin" / "orchestrate.cmd",
         wsl_shim=install / "bin" / "orchestrate",
@@ -100,15 +107,29 @@ def write_pyvenv_config(layout: MachineLayout) -> bytes:
 
 
 def install_ready_files(layout: MachineLayout) -> None:
+    for stale in (layout.install_receipt, layout.install_anchor, layout.source_archive):
+        stale.unlink(missing_ok=True)
     layout.scripts_root.mkdir(parents=True, exist_ok=True)
     write_pyvenv_config(layout)
     (layout.scripts_root / "python.exe").write_bytes(b"fixture")
     layout.command_path.write_bytes(b"fixture")
-    with _SourceBinding(layout) as source, _VenvBinding(layout) as binding:
-        receipt = _receipt_value(binding, source)
+    with _SourceBinding(layout) as source:
+        _build_source_archive(layout, source)
+        with _ArchiveBinding(layout.source_archive) as archive, _VenvBinding(layout) as binding:
+            receipt = _receipt_value(
+                binding,
+                source,
+                archive,
+                installation_id="fixture-installation",
+            )
     layout.install_receipt.write_text(
         json.dumps(receipt, sort_keys=True, separators=(",", ":"))
         + "\n",
+        encoding="utf-8",
+    )
+    layout.install_anchor.parent.mkdir(parents=True, exist_ok=True)
+    layout.install_anchor.write_text(
+        json.dumps(_anchor_value(receipt), sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
     layout.bin_root.mkdir(parents=True, exist_ok=True)
@@ -130,7 +151,7 @@ class SyntheticInstaller:
             self.layout.scripts_root.mkdir(parents=True)
             write_pyvenv_config(self.layout)
             (self.layout.scripts_root / "python.exe").write_bytes(b"fixture")
-        if "--editable" in argv:
+        if argv[1:4] == ("-m", "pip", "install") and "--upgrade" not in argv:
             self.layout.command_path.write_bytes(b"fixture")
         return subprocess.CompletedProcess(argv, 0)
 
@@ -212,7 +233,7 @@ class MachineBootstrapTests(unittest.TestCase):
                 first.actions,
                 (
                     "created_environment",
-                    "installed_editable_checkout",
+                    "installed_reviewed_source",
                     "installed_windows_shim",
                     "installed_wsl_shim",
                     "registered_user_path",
@@ -326,10 +347,8 @@ class MachineBootstrapTests(unittest.TestCase):
             write_pyvenv_config(layout)
             (layout.scripts_root / "python.exe").write_bytes(b"fixture")
 
-            with patch.dict(
-                os.environ,
-                {"ORCHESTRATE_BOOTSTRAP_PROVIDER": "simulated-win32"},
-            ), _VenvBinding(layout) as binding:
+            with _VenvBinding(layout) as binding:
+                binding._provider = _NATIVE_WIN32_PROVIDER
                 kwargs = binding.runner_kwargs()
 
             self.assertEqual(kwargs, {"executable": str(layout.scripts_root / "python.exe")})
@@ -468,7 +487,7 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(fault.interceptions, 1)
 
     @unittest.skipIf(sys.platform == "win32", "uses a POSIX directory replacement analogue")
-    def test_editable_install_is_bound_to_the_reviewed_source_root(self) -> None:
+    def test_source_archive_is_bound_to_the_reviewed_source_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             layout = fixture_layout(root)
@@ -489,10 +508,11 @@ class MachineBootstrapTests(unittest.TestCase):
             def swapping_runner(
                 argv: tuple[str, ...], **_: object
             ) -> subprocess.CompletedProcess[object]:
-                if "--editable" in argv:
+                if argv[1:4] == ("-m", "pip", "install") and "--upgrade" not in argv:
                     os.replace(layout.source_root, original)
                     layout.source_root.symlink_to(replacement, target_is_directory=True)
-                    observed.append((Path(argv[-1]) / "pyproject.toml").read_text(encoding="utf-8"))
+                    with zipfile.ZipFile(argv[-1]) as archive:
+                        observed.append(archive.read("pyproject.toml").decode("utf-8"))
                     layout.command_path.write_bytes(b"fixture")
                 return subprocess.CompletedProcess(argv, 0)
 
@@ -550,6 +570,132 @@ class MachineBootstrapTests(unittest.TestCase):
                 )
             self.assertEqual(tampered.exception.code, "machine_bootstrap_receipt_identity_unproven")
             self.assertEqual(runner.calls, [])
+
+    def test_recomputed_receipt_cannot_launder_a_replacement_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            install_ready_files(layout)
+            store = FakeUserPath(str(layout.bin_root))
+            old_command = layout.command_path.read_bytes()
+            (layout.source_root / "pyproject.toml").write_text(
+                "[project]\nname='replacement'\n", encoding="utf-8"
+            )
+            recorded = json.loads(layout.install_receipt.read_text(encoding="utf-8"))
+            with (
+                _SourceBinding(layout) as source,
+                _ArchiveBinding(layout.source_archive) as archive,
+                _VenvBinding(layout) as binding,
+            ):
+                forged = _receipt_value(
+                    binding,
+                    source,
+                    archive,
+                    installation_id=recorded["installationId"],
+                )
+            layout.install_receipt.write_text(
+                json.dumps(forged, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=store,
+                    resolver=resolving(layout, store),
+                    runner=SyntheticInstaller(layout),
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_receipt_identity_unproven")
+            self.assertTrue(held.exception.data["component"].startswith("anchor."))
+            self.assertEqual(layout.command_path.read_bytes(), old_command)
+
+    def test_install_consumes_the_pre_effect_source_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            store = FakeUserPath()
+            runner = SyntheticInstaller(layout)
+            original_call = runner.__call__
+            source_file = layout.source_root / "pyproject.toml"
+            original = source_file.read_bytes()
+            observed: list[bytes] = []
+
+            def transient_source(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[object]:
+                if argv[1:4] == ("-m", "pip", "install") and "--upgrade" not in argv:
+                    source_file.write_bytes(b"[project]\nname='transient'\n")
+                    with zipfile.ZipFile(argv[-1]) as archive:
+                        observed.append(archive.read("pyproject.toml"))
+                    source_file.write_bytes(original)
+                return original_call(argv, **kwargs)
+
+            result = ensure_machine(
+                layout=layout,
+                path_store=store,
+                resolver=resolving(layout, store),
+                runner=transient_source,
+                platform="win32",
+                version_info=(3, 13),
+            )
+
+            self.assertEqual(result.state, "repaired")
+            self.assertEqual(observed, [original])
+            self.assertEqual(
+                ensure_machine(
+                    layout=layout,
+                    path_store=store,
+                    resolver=resolving(layout, store),
+                    runner=runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                ).state,
+                "ready",
+            )
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX analogue for parent-relative venv creation")
+    def test_venv_creation_does_not_follow_a_late_redirect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            original = root / "bound-venv"
+            unrelated = root / "unrelated"
+            unrelated.mkdir()
+
+            def redirecting_runner(argv: tuple[str, ...], **_: object) -> subprocess.CompletedProcess[object]:
+                if argv[1:3] == ("-m", "venv"):
+                    os.replace(layout.venv_root, original)
+                    layout.venv_root.symlink_to(unrelated, target_is_directory=True)
+                    effect_root = Path(argv[-1])
+                    (effect_root / "Scripts").mkdir()
+                    (effect_root / "Scripts" / "python.exe").write_bytes(b"fixture")
+                    (effect_root / "pyvenv.cfg").write_bytes(
+                        b"home = C:\\Python313\nversion = 3.13.9\n"
+                    )
+                return subprocess.CompletedProcess(argv, 0)
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=FakeUserPath(),
+                    resolver=lambda *_: None,
+                    runner=redirecting_runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_venv_identity_changed")
+            self.assertEqual(list(unrelated.iterdir()), [])
+            self.assertTrue((original / "Scripts" / "python.exe").is_file())
+
+    def test_named_local_venv_directories_are_excluded_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            local_venv = layout.source_root / ".venv-audit2"
+            local_venv.mkdir()
+            (local_venv / "lib64").symlink_to("lib")
+            install_ready_files(layout)
+            store = FakeUserPath(str(layout.bin_root))
+            self.assertTrue(machine_ready(layout, store, resolver=resolving(layout, store)))
 
     @unittest.skipIf(sys.platform == "win32", "uses a POSIX directory-symlink analogue")
     def test_staging_refuses_a_substituted_parent_before_creating_a_file(self) -> None:
@@ -792,7 +938,7 @@ class MachineBootstrapTests(unittest.TestCase):
             )
 
             self.assertEqual(runner.calls, [])
-            self.assertNotIn("installed_editable_checkout", result.actions)
+            self.assertNotIn("installed_reviewed_source", result.actions)
             self.assertTrue(machine_ready(layout, store, resolver=resolving(layout, store)))
 
     def test_failed_install_is_explicit_and_rerunnable(self) -> None:
@@ -819,7 +965,7 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(store.writes, [])
             self.assertFalse(layout.windows_shim.exists())
 
-    def test_failed_editable_install_cannot_be_mistaken_for_a_completed_install(self) -> None:
+    def test_failed_source_install_cannot_be_mistaken_for_a_completed_install(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             layout = fixture_layout(Path(directory))
             layout.scripts_root.mkdir(parents=True)
@@ -828,7 +974,7 @@ class MachineBootstrapTests(unittest.TestCase):
             store = FakeUserPath()
 
             def partial_runner(argv: tuple[str, ...], **_: object) -> subprocess.CompletedProcess[object]:
-                if "--editable" in argv:
+                if argv[1:4] == ("-m", "pip", "install") and "--upgrade" not in argv:
                     layout.command_path.write_bytes(b"partial")
                     return subprocess.CompletedProcess(argv, 17)
                 return subprocess.CompletedProcess(argv, 0)
@@ -858,6 +1004,7 @@ class MachineBootstrapTests(unittest.TestCase):
                 )
             self.assertEqual(blocked.exception.code, "machine_bootstrap_command_identity_unproven")
             layout.command_path.unlink()
+            layout.source_archive.unlink()
             result = ensure_machine(
                 layout=layout,
                 path_store=store,
@@ -867,7 +1014,12 @@ class MachineBootstrapTests(unittest.TestCase):
                 version_info=(3, 13),
             )
             self.assertEqual(result.state, "repaired")
-            self.assertTrue(any("--editable" in call for call in runner.calls))
+            self.assertTrue(
+                any(
+                    call[1:4] == ("-m", "pip", "install") and "--upgrade" not in call
+                    for call in runner.calls
+                )
+            )
             self.assertTrue(layout.install_receipt.exists())
 
     def test_fast_path_rejects_a_poisoned_installed_command(self) -> None:
