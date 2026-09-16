@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -66,7 +67,13 @@ class _PlatformProvider(Protocol):
 
     def read_bounded_file(self, path: Path, limit: int) -> _BoundedFile: ...
 
-    def open_path_pin(self, path: Path, *, directory: bool) -> object: ...
+    def open_path_pin(
+        self,
+        path: Path,
+        *,
+        directory: bool,
+        allow_write_share: bool = False,
+    ) -> object: ...
 
     def close_path_pin(self, handle: object) -> None: ...
 
@@ -621,14 +628,15 @@ def _path_identity(path: Path, *, directory: bool | None = None) -> _PathIdentit
             },
         ) from exc
     expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
-    if _is_reparse(info) or not expected:
+    redirected = _is_reparse(info) or stat.S_ISLNK(info.st_mode)
+    if redirected or not expected:
         raise OrchestrateError(
             f"Machine bootstrap refuses a redirect or unexpected node in the dedicated installation: {path.name}",
             code="machine_bootstrap_install_identity_unproven",
             data={
                 "component": "installNode.nodeType",
                 "expected": "directory" if directory else "regular-file",
-                "observed": "redirected" if _is_reparse(info) else "unexpected-node",
+                "observed": "redirected" if redirected else "unexpected-node",
                 "path": os.fspath(path),
                 "attributes": f"0x{getattr(info, 'st_file_attributes', 0):08x}",
             },
@@ -1034,7 +1042,12 @@ def _decode_pyvenv_config(raw: bytes) -> tuple[str, str]:
     return home, version
 
 
-def _open_windows_path_pin(path: Path, *, directory: bool) -> object:
+def _open_windows_path_pin(
+    path: Path,
+    *,
+    directory: bool,
+    allow_write_share: bool = False,
+) -> object:
     """Hold a non-reparse node with sharing that denies replacement.
 
     Attribute-only access is not sufficient: Windows exempts attribute access
@@ -1077,7 +1090,8 @@ def _open_windows_path_pin(path: Path, *, directory: bool) -> object:
     get_info.restype = wintypes.BOOL
     flags = open_reparse_point | (backup_semantics if directory else 0)
     access_name = "GENERIC_READ"
-    share_name = "FILE_SHARE_READ|FILE_SHARE_WRITE" if directory else "FILE_SHARE_READ"
+    write_shared = directory or allow_write_share
+    share_name = "FILE_SHARE_READ|FILE_SHARE_WRITE" if write_shared else "FILE_SHARE_READ"
     operation = _operation_diagnostic(
         "path-pin",
         "CreateFileW-retained-handle",
@@ -1089,7 +1103,7 @@ def _open_windows_path_pin(path: Path, *, directory: bool) -> object:
     handle = create_file(
         os.fspath(path),
         generic_read,
-        share_read | (share_write if directory else 0),
+        share_read | (share_write if write_shared else 0),
         None,
         open_existing,
         flags,
@@ -1165,7 +1179,13 @@ class _PosixPlatformProvider:
     def read_bounded_file(self, path: Path, limit: int) -> _BoundedFile:
         return _read_posix_bounded_file(path, limit)
 
-    def open_path_pin(self, path: Path, *, directory: bool) -> object:
+    def open_path_pin(
+        self,
+        path: Path,
+        *,
+        directory: bool,
+        allow_write_share: bool = False,
+    ) -> object:
         flags = (
             os.O_RDONLY
             | getattr(os, "O_CLOEXEC", 0)
@@ -1190,8 +1210,18 @@ class _NativeWin32PlatformProvider:
     def read_bounded_file(self, path: Path, limit: int) -> _BoundedFile:
         return _read_windows_bounded_file(path, limit)
 
-    def open_path_pin(self, path: Path, *, directory: bool) -> object:
-        return _open_windows_path_pin(path, directory=directory)
+    def open_path_pin(
+        self,
+        path: Path,
+        *,
+        directory: bool,
+        allow_write_share: bool = False,
+    ) -> object:
+        return _open_windows_path_pin(
+            path,
+            directory=directory,
+            allow_write_share=allow_write_share,
+        )
 
     def close_path_pin(self, handle: object) -> None:
         _close_windows_path_pin(handle)
@@ -1297,6 +1327,74 @@ class _AnchorAncestryBinding(AbstractContextManager["_AnchorAncestryBinding"]):
                     code="machine_bootstrap_anchor_identity_changed",
                     data={
                         "component": "anchorAncestry.fileIdentity",
+                        "expected": repr(identity),
+                        "observed": repr(observed),
+                        "path": os.fspath(directory),
+                    },
+                )
+
+    def close(self) -> None:
+        for pin in reversed(self._pins):
+            self._provider.close_path_pin(pin)
+        self._pins.clear()
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+class _InstallAncestryBinding(AbstractContextManager["_InstallAncestryBinding"]):
+    """Reject redirected installation ancestors before any repair mutation."""
+
+    def __init__(self, install_root: Path) -> None:
+        self.install_root = install_root
+        self._provider = _active_platform_provider()
+        self._pins: list[object] = []
+        self._identities: list[tuple[Path, _PathIdentity]] = []
+        try:
+            for directory in _physical_ancestry(install_root.parent):
+                identity = _path_identity(directory, directory=True)
+                pin = self._provider.open_path_pin(directory, directory=True)
+                observed = _path_identity(directory, directory=True)
+                if not _same_identity(observed, identity, directory=True):
+                    self._provider.close_path_pin(pin)
+                    raise OrchestrateError(
+                        "The installation ancestry changed while it was bound",
+                        code="machine_bootstrap_install_identity_changed",
+                        data={
+                            "component": "installAncestry.fileIdentity",
+                            "expected": repr(identity),
+                            "observed": repr(observed),
+                            "path": os.fspath(directory),
+                        },
+                    )
+                self._pins.append(pin)
+                self._identities.append((directory, identity))
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+
+    def verify(self) -> None:
+        for directory, identity in self._identities:
+            try:
+                observed = _path_identity(directory, directory=True)
+            except OrchestrateError as exc:
+                raise OrchestrateError(
+                    "The installation ancestry changed after it was bound",
+                    code="machine_bootstrap_install_identity_changed",
+                    data={
+                        "component": "installAncestry.fileIdentity",
+                        "expected": repr(identity),
+                        "observed": "unavailable-or-redirected",
+                        "path": os.fspath(directory),
+                    },
+                ) from exc
+            if not _same_identity(observed, identity, directory=True):
+                raise OrchestrateError(
+                    "The installation ancestry changed after it was bound",
+                    code="machine_bootstrap_install_identity_changed",
+                    data={
+                        "component": "installAncestry.fileIdentity",
                         "expected": repr(identity),
                         "observed": repr(observed),
                         "path": os.fspath(directory),
@@ -1589,6 +1687,7 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
         path: Path,
         *,
         stage_diagnostics: Sequence[Mapping[str, object]] = (),
+        staged_descriptor: int | None = None,
     ) -> None:
         self.path = path
         self._provider = _active_platform_provider()
@@ -1604,9 +1703,89 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
         )
         self.stage_diagnostics = [dict(item) for item in stage_diagnostics]
         self._handle: object | None = None
-        self._descriptor: int | None = None
+        self._descriptor: int | None = staged_descriptor
         try:
-            if self._provider.native_windows:
+            if staged_descriptor is not None:
+                info = os.fstat(staged_descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_ARCHIVE_BYTES:
+                    raise OrchestrateError(
+                        "The committed installed-source archive identity is unavailable",
+                        code="machine_bootstrap_source_identity_unproven",
+                        data={
+                            "component": "sourceArchive.committedDescriptor",
+                            "expected": f"regular-file;size:0..{MAX_SOURCE_ARCHIVE_BYTES}",
+                            "observed": f"mode:{stat.S_IFMT(info.st_mode):#x};size:{info.st_size}",
+                            "path": os.fspath(path),
+                        },
+                    )
+                os.lseek(staged_descriptor, 0, os.SEEK_SET)
+                raw = bytearray()
+                while len(raw) <= MAX_SOURCE_ARCHIVE_BYTES:
+                    chunk = os.read(
+                        staged_descriptor,
+                        min(64 * 1024, MAX_SOURCE_ARCHIVE_BYTES + 1 - len(raw)),
+                    )
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                opened = _BoundedFile(bytes(raw), _PathIdentity.from_stat(info))
+                if self._provider.native_windows:
+                    # Hand the no-delete pin from the read/write staging
+                    # descriptor to a write-sharing read handle, then to the
+                    # strict read-only archive pin.  This keeps one continuous
+                    # retained chain without asking a strict share mode to
+                    # coexist with the staging descriptor's write access.
+                    handoff = self._provider.open_path_pin(
+                        path,
+                        directory=False,
+                        allow_write_share=True,
+                    )
+                    os.close(staged_descriptor)
+                    self._descriptor = None
+                    try:
+                        self._handle = self._provider.open_path_pin(
+                            path, directory=False
+                        )
+                    finally:
+                        self._provider.close_path_pin(handoff)
+                    committed = self._provider.read_bounded_file(
+                        path, MAX_SOURCE_ARCHIVE_BYTES
+                    )
+                    self.effect_path = path
+                    self.operation = _operation_diagnostic(
+                        "archive-binding",
+                        "retained-staging-descriptor+Windows-file-handle+public-path",
+                        path,
+                        path_form="native-path",
+                    )
+                else:
+                    committed = self._provider.read_bounded_file(
+                        path, MAX_SOURCE_ARCHIVE_BYTES
+                    )
+                    self.effect_path = Path(f"/proc/self/fd/{staged_descriptor}")
+                    self.operation = _operation_diagnostic(
+                        "archive-binding",
+                        "retained-commit-descriptor+proc-fd-path",
+                        self.effect_path,
+                        path_form="proc-self-fd",
+                    )
+                if (
+                    committed.raw != opened.raw
+                    or not _same_identity(
+                        committed.identity, opened.identity, directory=False
+                    )
+                ):
+                    raise OrchestrateError(
+                        "The committed archive diverged before its effect binding",
+                        code="machine_bootstrap_source_identity_changed",
+                        data={
+                            "component": "sourceArchive.commitToBinding",
+                            "expected": f"sha256:{hashlib.sha256(opened.raw).hexdigest()}",
+                            "observed": f"sha256:{hashlib.sha256(committed.raw).hexdigest()}",
+                            "path": os.fspath(path),
+                        },
+                    )
+            elif self._provider.native_windows:
                 self._handle = self._provider.open_path_pin(path, directory=False)
                 opened = _read_bounded_regular_file(path, MAX_SOURCE_ARCHIVE_BYTES)
                 self.effect_path = path
@@ -1697,14 +1876,40 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
                     path=self.effect_path,
                 )
             )
-        if len(current_raw) != self.size or observed != expected:
+        try:
+            public_identity = _target_identity(self.path)
+        except OrchestrateError as exc:
+            raise OrchestrateError(
+                "The public installed-source archive changed after it was bound",
+                code="machine_bootstrap_source_identity_changed",
+                data={
+                    "component": "sourceArchive.publicIdentity",
+                    "expected": repr(self.identity),
+                    "observed": "unavailable-or-divergent",
+                    **self.diagnostic_data(),
+                },
+            ) from exc
+        if (
+            len(current_raw) != self.size
+            or observed != expected
+            or public_identity is None
+            or not _same_identity(public_identity, self.identity, directory=False)
+        ):
             raise OrchestrateError(
                 "The installed-source archive changed after it was bound",
                 code="machine_bootstrap_source_identity_changed",
                 data={
-                    "component": "sourceArchive.sha256",
+                    "component": (
+                        "sourceArchive.sha256"
+                        if len(current_raw) != self.size or observed != expected
+                        else "sourceArchive.publicIdentity"
+                    ),
                     "expected": expected,
-                    "observed": observed,
+                    "observed": (
+                        observed
+                        if len(current_raw) != self.size or observed != expected
+                        else repr(public_identity)
+                    ),
                     **self.diagnostic_data(),
                 },
             )
@@ -1739,7 +1944,7 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
 def _build_source_archive(
     layout: MachineLayout,
     source: _SourceBinding,
-) -> list[dict[str, object]]:
+) -> _ArchiveBinding:
     source.verify()
     buffer = io.BytesIO()
     consumed = 0
@@ -1797,14 +2002,29 @@ def _build_source_archive(
             path=layout.source_archive,
         )
     ]
-    _atomic_write_owned(
+    descriptor = _atomic_write_owned(
         layout.source_archive,
         raw,
         executable=False,
         expected_target=_target_identity(layout.source_archive),
         archive_stages=stages,
+        retain_descriptor=True,
     )
-    return stages
+    if descriptor is None:
+        raise OrchestrateError(
+            "The committed installed-source archive descriptor was not retained",
+            code="machine_bootstrap_commit_identity_unproven",
+            data={
+                "component": "sourceArchive.retainedDescriptor",
+                "expected": "available",
+                "observed": "unavailable",
+            },
+        )
+    return _ArchiveBinding(
+        layout.source_archive,
+        stage_diagnostics=stages,
+        staged_descriptor=descriptor,
+    )
 
 
 class _VenvBinding(AbstractContextManager["_VenvBinding"]):
@@ -2320,27 +2540,22 @@ def _commit_staged_no_replace(
     parent: Path,
     staged_descriptor: int | None = None,
     native_windows: bool = False,
+    anonymous: bool = False,
 ) -> None:
     """One fault-injection seam around the platform's no-overwrite commit."""
 
-    if staged_descriptor is not None and not native_windows:
-        descriptor_path = f"/proc/self/fd/{staged_descriptor}"
-        if not os.path.exists(descriptor_path):
+    if anonymous:
+        if staged_descriptor is None or parent_fd is None:
             raise OrchestrateError(
-                "Machine bootstrap cannot bind its commit to the staged descriptor",
+                "Machine bootstrap cannot bind its anonymous staging file",
                 code="machine_bootstrap_commit_identity_unproven",
                 data={
                     "component": "commit.stagedDescriptor",
-                    "expected": "available",
+                    "expected": "anonymous-descriptor-and-parent-descriptor",
                     "observed": "unavailable",
                 },
             )
-        os.link(
-            descriptor_path,
-            target_name if parent_fd is not None else os.fspath(parent / target_name),
-            **({} if parent_fd is None else {"dst_dir_fd": parent_fd}),
-            follow_symlinks=True,
-        )
+        _link_descriptor_no_replace(staged_descriptor, target_name, parent_fd)
     elif parent_fd is None:
         os.link(
             os.fspath(parent / temporary_name),
@@ -2354,6 +2569,41 @@ def _commit_staged_no_replace(
             src_dir_fd=parent_fd,
             dst_dir_fd=parent_fd,
             follow_symlinks=False,
+        )
+
+
+def _link_descriptor_no_replace(
+    staged_descriptor: int,
+    target_name: str,
+    parent_fd: int,
+) -> None:
+    """Materialize an ``O_TMPFILE`` descriptor with Linux ``AT_EMPTY_PATH``."""
+
+    import ctypes
+
+    at_empty_path = 0x1000
+    libc = ctypes.CDLL(None, use_errno=True)
+    linkat = libc.linkat
+    linkat.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    )
+    linkat.restype = ctypes.c_int
+    if linkat(
+        staged_descriptor,
+        b"",
+        parent_fd,
+        os.fsencode(target_name),
+        at_empty_path,
+    ) != 0:
+        observed_errno = ctypes.get_errno()
+        raise OSError(
+            observed_errno,
+            os.strerror(observed_errno),
+            target_name,
         )
 
 
@@ -2372,7 +2622,8 @@ def _atomic_write_owned(
     executable: bool,
     expected_target: _PathIdentity | None,
     archive_stages: list[dict[str, object]] | None = None,
-) -> None:
+    retain_descriptor: bool = False,
+) -> int | None:
     provider = _active_platform_provider()
     staging_operation = _operation_diagnostic(
         "atomic-staging",
@@ -2405,9 +2656,10 @@ def _atomic_write_owned(
     parent_handle: object | None = None
     descriptor: int | None = None
     temporary_name: str | None = None
+    anonymous = False
     try:
         _before_staging_parent_open(path.parent)
-        if provider.windows_semantics:
+        if provider.native_windows:
             try:
                 parent_handle = provider.open_path_pin(path.parent, directory=True)
             except (OSError, OrchestrateError) as exc:
@@ -2485,22 +2737,48 @@ def _atomic_write_owned(
                     "operations": [staging_operation],
                 },
             )
-        for _ in range(32):
-            temporary_name = f".{path.name}.{secrets.token_hex(16)}.tmp"
+        temporary_name = f".{path.name}.{secrets.token_hex(16)}.tmp"
+        temporary_flag = getattr(os, "O_TMPFILE", 0)
+        if parent_fd is not None and temporary_flag:
             try:
                 descriptor = os.open(
-                    temporary_name if parent_fd is not None else os.fspath(path.parent / temporary_name),
+                    ".",
                     os.O_RDWR
-                    | os.O_CREAT
-                    | os.O_EXCL
+                    | temporary_flag
                     | getattr(os, "O_CLOEXEC", 0)
                     | _binary_open_flag(),
                     0o600,
-                    **({} if parent_fd is None else {"dir_fd": parent_fd}),
+                    dir_fd=parent_fd,
                 )
-                break
-            except FileExistsError:
-                temporary_name = None
+                anonymous = True
+            except OSError as exc:
+                if exc.errno not in {
+                    errno.EINVAL,
+                    errno.EISDIR,
+                    errno.ENOSYS,
+                    errno.EOPNOTSUPP,
+                    errno.EPERM,
+                }:
+                    raise
+        if descriptor is None:
+            temporary_name = None
+            for _ in range(32):
+                temporary_name = f".{path.name}.{secrets.token_hex(16)}.tmp"
+                try:
+                    descriptor = os.open(
+                        temporary_name if parent_fd is not None else os.fspath(path.parent / temporary_name),
+                        os.O_RDWR
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | _binary_open_flag(),
+                        0o600,
+                        **({} if parent_fd is None else {"dir_fd": parent_fd}),
+                    )
+                    break
+                except FileExistsError:
+                    temporary_name = None
         if descriptor is None or temporary_name is None:
             raise OrchestrateError(
                 "Machine bootstrap could not reserve an exclusive staging file",
@@ -2514,15 +2792,23 @@ def _atomic_write_owned(
                 },
             )
         opened = os.fstat(descriptor)
-        linked = os.stat(
-            temporary_name,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        ) if parent_fd is not None else (path.parent / temporary_name).lstat()
+        linked = (
+            opened
+            if anonymous
+            else (
+                os.stat(
+                    temporary_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if parent_fd is not None
+                else (path.parent / temporary_name).lstat()
+            )
+        )
         if (
             not stat.S_ISREG(opened.st_mode)
             or _is_reparse(opened)
-            or opened.st_nlink != 1
+            or opened.st_nlink != (0 if anonymous else 1)
             or _PathIdentity.from_stat(opened) != _PathIdentity.from_stat(linked)
         ):
             raise OrchestrateError(
@@ -2530,7 +2816,11 @@ def _atomic_write_owned(
                 code="machine_bootstrap_temporary_identity_unproven",
                 data={
                     "component": "stagingTemporary.fileIdentity",
-                    "expected": "regular-file;links:1;opened-equals-linked",
+                    "expected": (
+                        "regular-file;links:0;anonymous"
+                        if anonymous
+                        else "regular-file;links:1;opened-equals-linked"
+                    ),
                     "observed": (
                         f"opened:{_PathIdentity.from_stat(opened)!r};"
                         f"linked:{_PathIdentity.from_stat(linked)!r};"
@@ -2546,7 +2836,7 @@ def _atomic_write_owned(
             if written <= 0:
                 raise OSError("short staging write")
             view = view[written:]
-        if not provider.windows_semantics:
+        if not provider.native_windows:
             os.fchmod(descriptor, 0o755 if executable else 0o600)
         else:
             os.chmod(path.parent / temporary_name, 0o755 if executable else 0o600)
@@ -2577,9 +2867,13 @@ def _atomic_write_owned(
                     "staged-temp-after-fsync",
                     bytes(staged_raw),
                     form=(
-                        "Windows-path-staging"
-                        if provider.windows_semantics
-                        else "directory-fd-staging"
+                        "anonymous-parent-fd-staging"
+                        if anonymous
+                        else (
+                            "Windows-path-staging"
+                            if provider.windows_semantics
+                            else "directory-fd-staging"
+                        )
                     ),
                     path=path.parent / temporary_name,
                 )
@@ -2598,14 +2892,151 @@ def _atomic_write_owned(
                 },
             )
         _before_staged_commit(path.parent / temporary_name)
-        _commit_staged_no_replace(
-            temporary_name,
-            path.name,
-            parent_fd=parent_fd,
-            parent=path.parent,
-            staged_descriptor=descriptor,
-            native_windows=provider.native_windows,
-        )
+        if not anonymous:
+            staged_info = os.fstat(descriptor)
+            linked_info = (
+                os.stat(
+                    temporary_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if parent_fd is not None
+                else (path.parent / temporary_name).lstat()
+            )
+            if (
+                staged_info.st_nlink != 1
+                or _PathIdentity.from_stat(staged_info)
+                != _PathIdentity.from_stat(linked_info)
+            ):
+                raise OrchestrateError(
+                    "Machine bootstrap staging name changed before commit",
+                    code="machine_bootstrap_commit_identity_changed",
+                    data={
+                        "component": "commit.stagedNameIdentity",
+                        "expected": repr(_PathIdentity.from_stat(staged_info)),
+                        "observed": repr(_PathIdentity.from_stat(linked_info)),
+                        "path": os.fspath(path.parent / temporary_name),
+                    },
+                )
+        try:
+            _commit_staged_no_replace(
+                temporary_name,
+                path.name,
+                parent_fd=parent_fd,
+                parent=path.parent,
+                staged_descriptor=descriptor,
+                native_windows=provider.native_windows,
+                anonymous=anonymous,
+            )
+        except OSError as exc:
+            if (
+                exc.errno
+                not in {
+                    errno.EXDEV,
+                    errno.EINVAL,
+                    errno.ENOENT,
+                    errno.ENOSYS,
+                    errno.EOPNOTSUPP,
+                    errno.EPERM,
+                }
+                or not anonymous
+                or parent_fd is None
+            ):
+                raise
+            # Some kernels/filesystems reject materializing an anonymous inode
+            # even though the target parent supports O_TMPFILE.  Restage the
+            # already verified bytes into an unpredictable exclusive name in
+            # that same retained parent, then use the portable same-directory
+            # hard-link commit.
+            fallback_descriptor: int | None = None
+            fallback_name: str | None = None
+            for _ in range(32):
+                fallback_name = f".{path.name}.{secrets.token_hex(16)}.tmp"
+                try:
+                    fallback_descriptor = os.open(
+                        fallback_name,
+                        os.O_RDWR
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | _binary_open_flag(),
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                    break
+                except FileExistsError:
+                    fallback_name = None
+            if fallback_descriptor is None or fallback_name is None:
+                raise OrchestrateError(
+                    "Machine bootstrap could not reserve its same-device commit fallback",
+                    code="machine_bootstrap_temporary_identity_unproven",
+                    data={
+                        "component": "stagingFallback.form",
+                        "expected": "exclusive-owned-regular-file",
+                        "observed": "reservation-exhausted",
+                    },
+                ) from exc
+            try:
+                fallback_view = memoryview(staged_raw)
+                while fallback_view:
+                    written = os.write(fallback_descriptor, fallback_view)
+                    if written <= 0:
+                        raise OSError("short fallback staging write")
+                    fallback_view = fallback_view[written:]
+                os.fchmod(fallback_descriptor, 0o755 if executable else 0o600)
+                os.fsync(fallback_descriptor)
+                os.lseek(fallback_descriptor, 0, os.SEEK_SET)
+                fallback_raw = os.read(fallback_descriptor, len(raw) + 1)
+                if fallback_raw != raw:
+                    raise OrchestrateError(
+                        "Machine bootstrap fallback staging changed the exact bytes",
+                        code="machine_bootstrap_commit_identity_changed",
+                        data={
+                            "component": "commit.fallbackStagedSha256",
+                            "expected": f"sha256:{hashlib.sha256(raw).hexdigest()}",
+                            "observed": f"sha256:{hashlib.sha256(fallback_raw).hexdigest()}",
+                            "expectedSize": len(raw),
+                            "observedSize": len(fallback_raw),
+                        },
+                    )
+                fallback_opened = os.fstat(fallback_descriptor)
+                fallback_linked = os.stat(
+                    fallback_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    fallback_opened.st_nlink != 1
+                    or _PathIdentity.from_stat(fallback_opened)
+                    != _PathIdentity.from_stat(fallback_linked)
+                ):
+                    raise OrchestrateError(
+                        "Machine bootstrap could not prove its same-device commit fallback",
+                        code="machine_bootstrap_commit_identity_changed",
+                        data={
+                            "component": "commit.fallbackNameIdentity",
+                            "expected": repr(_PathIdentity.from_stat(fallback_opened)),
+                            "observed": repr(_PathIdentity.from_stat(fallback_linked)),
+                        },
+                    )
+            except BaseException:
+                os.close(fallback_descriptor)
+                os.unlink(fallback_name, dir_fd=parent_fd)
+                raise
+            os.close(descriptor)
+            descriptor = fallback_descriptor
+            temporary_name = fallback_name
+            anonymous = False
+            _commit_staged_no_replace(
+                temporary_name,
+                path.name,
+                parent_fd=parent_fd,
+                parent=path.parent,
+                staged_descriptor=descriptor,
+                native_windows=False,
+                anonymous=False,
+            )
         committed_file = provider.read_bounded_file(path, max(len(raw), 1))
         committed = committed_file.raw
         staged_identity = _PathIdentity.from_stat(os.fstat(descriptor))
@@ -2652,13 +3083,17 @@ def _atomic_write_owned(
                     path=path,
                 )
             )
-        os.close(descriptor)
-        descriptor = None
-        os.unlink(
-            temporary_name if parent_fd is not None else os.fspath(path.parent / temporary_name),
-            **({} if parent_fd is None else {"dir_fd": parent_fd}),
-        )
+        if not anonymous:
+            os.unlink(
+                temporary_name if parent_fd is not None else os.fspath(path.parent / temporary_name),
+                **({} if parent_fd is None else {"dir_fd": parent_fd}),
+            )
         temporary_name = None
+        retained = descriptor if retain_descriptor else None
+        if not retain_descriptor:
+            os.close(descriptor)
+        descriptor = None
+        return retained
     except BaseException as exc:
         _diagnostic_exception_note(
             exc,
@@ -2674,7 +3109,7 @@ def _atomic_write_owned(
                 os.close(descriptor)
             except OSError:
                 pass
-        if temporary_name is not None:
+        if temporary_name is not None and not anonymous:
             try:
                 os.unlink(
                     temporary_name if parent_fd is not None else os.fspath(path.parent / temporary_name),
@@ -2731,9 +3166,8 @@ def _write_install_receipt(
             "Machine bootstrap installed the checkout but could not record its local receipt; rerun setup to converge",
             code="machine_bootstrap_receipt_write_failed",
             data={
-                "component": "receipt-and-anchor.write",
-                "expected": "both-canonical-records",
-                "observed": exc.code,
+                **exc.data,
+                "receiptWriteCause": exc.code,
             },
         ) from exc
     except OSError as exc:
@@ -2949,14 +3383,42 @@ def _ensure_directory(path: Path, *, code: str) -> None:
     _path_identity(path, directory=True)
 
 
+def _ensure_install_parent(path: Path) -> None:
+    """Create missing installation ancestors without traversing redirects."""
+
+    provider = _active_platform_provider()
+    for directory in _physical_ancestry(path):
+        try:
+            directory.lstat()
+        except FileNotFoundError:
+            parent = directory.parent
+            parent_identity = _path_identity(parent, directory=True)
+            pin = provider.open_path_pin(parent, directory=True)
+            try:
+                if provider.native_windows:
+                    os.mkdir(directory)
+                else:
+                    os.mkdir(directory.name, dir_fd=int(pin))
+                observed_parent = _path_identity(parent, directory=True)
+                if not _same_identity(
+                    observed_parent, parent_identity, directory=True
+                ):
+                    raise OrchestrateError(
+                        "The installation parent changed while an ancestor was created",
+                        code="machine_bootstrap_install_identity_changed",
+                        data={
+                            "component": "installAncestry.fileIdentity",
+                            "expected": repr(parent_identity),
+                            "observed": repr(observed_parent),
+                            "path": os.fspath(parent),
+                        },
+                    )
+            finally:
+                provider.close_path_pin(pin)
+        _path_identity(directory, directory=True)
+
+
 def _ensure_install_root(layout: MachineLayout) -> None:
-    try:
-        layout.install_root.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise OrchestrateError(
-            "The dedicated orchestrate installation parent is unavailable",
-            code="machine_bootstrap_home_unavailable",
-        ) from exc
     _ensure_directory(layout.install_root, code="machine_bootstrap_home_unavailable")
 
 
@@ -3169,7 +3631,13 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
                     path_form="proc-self-fd",
                 )
             self._identity = _path_identity(path, directory=True)
-            for relative in (Path("Include"), Path("Lib"), Path("Lib") / "site-packages", Path("Scripts")):
+            for relative in (
+                Path("Include"),
+                Path("Lib"),
+                Path("Lib") / "site-packages",
+                Path("Lib") / "site-packages" / "pip",
+                Path("Scripts"),
+            ):
                 descendant = path / relative
                 descendant.mkdir(exist_ok=True)
                 identity = _path_identity(descendant, directory=True)
@@ -3322,14 +3790,21 @@ def ensure_machine(
     if machine_ready(selected_layout, selected_store, resolver=resolver):
         return MachineBootstrapResult("ready")
 
-    _ensure_install_root(selected_layout)
+    _ensure_install_parent(selected_layout.install_root.parent)
+    install_ancestry = _InstallAncestryBinding(selected_layout.install_root)
+    try:
+        _ensure_install_root(selected_layout)
+    except BaseException:
+        install_ancestry.close()
+        raise
     lock = RunLock(
         selected_layout.install_root / MACHINE_LOCK_NAME,
         timeout_seconds=30.0,
         contention_code="machine_bootstrap_contention",
         contention_message="Timed out waiting for the machine-bootstrap mutation lock",
     )
-    with lock:
+    with install_ancestry, lock:
+        install_ancestry.verify()
         _validate_existing_install_tree(selected_layout)
         if machine_ready(selected_layout, selected_store, resolver=resolver):
             return MachineBootstrapResult("ready")
@@ -3470,11 +3945,7 @@ def ensure_machine(
                         (os.fspath(binding.python_path), "-m", "pip", "install", "--upgrade", "pip"),
                         phase="pip upgrade",
                     )
-                    archive_stages = _build_source_archive(selected_layout, source)
-                    archive = _ArchiveBinding(
-                        selected_layout.source_archive,
-                        stage_diagnostics=archive_stages,
-                    )
+                    archive = _build_source_archive(selected_layout, source)
                     source.verify()
                     _run_bound_step(
                         binding,

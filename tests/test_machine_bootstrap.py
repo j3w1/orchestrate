@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext, redirect_stdout
 import io
+import errno
 import json
 import os
 from pathlib import Path
@@ -115,8 +116,7 @@ def install_ready_files(layout: MachineLayout) -> None:
     (layout.scripts_root / "python.exe").write_bytes(b"fixture")
     layout.command_path.write_bytes(b"fixture")
     with _SourceBinding(layout) as source:
-        _build_source_archive(layout, source)
-        with _ArchiveBinding(layout.source_archive) as archive, _VenvBinding(layout) as binding:
+        with _build_source_archive(layout, source) as archive, _VenvBinding(layout) as binding:
             receipt = _receipt_value(
                 binding,
                 source,
@@ -505,6 +505,33 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(held.exception.data["component"], "commit.stagedSha256")
             self.assertFalse(drifted.exists())
 
+    @unittest.skipIf(sys.platform == "win32", "exercises the POSIX O_TMPFILE fallback")
+    def test_anonymous_commit_exdev_falls_back_with_exact_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "install.json"
+            raw = b"canonical\nreceipt\n"
+            interceptions = 0
+
+            def cross_device(*_: object) -> None:
+                nonlocal interceptions
+                interceptions += 1
+                raise OSError(errno.EXDEV, "synthetic cross-device link")
+
+            with patch(
+                "orchestrate.machine_bootstrap._link_descriptor_no_replace",
+                side_effect=cross_device,
+            ):
+                _atomic_write_owned(
+                    target,
+                    raw,
+                    executable=False,
+                    expected_target=None,
+                )
+
+            self.assertEqual(interceptions, 1)
+            self.assertEqual(target.read_bytes(), raw)
+            self.assertEqual(target.stat().st_nlink, 1)
+
     def test_commit_uses_retained_staged_bytes_after_name_substitution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -518,7 +545,7 @@ class MachineBootstrapTests(unittest.TestCase):
                 interceptions += 1
                 try:
                     os.replace(staged, displaced)
-                except PermissionError:
+                except (FileNotFoundError, PermissionError):
                     return
                 staged.write_bytes(b"attacker\narchive\n")
 
@@ -745,6 +772,48 @@ class MachineBootstrapTests(unittest.TestCase):
                 "ready",
             )
 
+    @unittest.skipIf(sys.platform == "win32", "uses a POSIX replacement analogue")
+    def test_post_commit_archive_replacement_is_never_installed_or_receipted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            runner = SyntheticInstaller(layout)
+            real_builder = _build_source_archive
+            attacker_archive = root / "attacker.zip"
+            attacker_buffer = io.BytesIO()
+            with zipfile.ZipFile(attacker_buffer, "w") as archive:
+                archive.writestr("pyproject.toml", b"[project]\nname='attacker'\n")
+            attacker_archive.write_bytes(attacker_buffer.getvalue())
+
+            def replace_after_commit(
+                selected_layout: MachineLayout,
+                source: _SourceBinding,
+            ) -> _ArchiveBinding:
+                binding = real_builder(selected_layout, source)
+                os.replace(attacker_archive, selected_layout.source_archive)
+                return binding
+
+            with patch(
+                "orchestrate.machine_bootstrap._build_source_archive",
+                side_effect=replace_after_commit,
+            ):
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        layout=layout,
+                        path_store=FakeUserPath(),
+                        resolver=lambda *_: None,
+                        runner=runner,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_source_identity_changed")
+            self.assertEqual(held.exception.data["component"], "sourceArchive.publicIdentity")
+            self.assertFalse(layout.install_receipt.exists())
+            self.assertFalse(
+                any(call[1:4] == ("-m", "pip", "install") and "--upgrade" not in call for call in runner.calls)
+            )
+
     def test_archive_rejects_bytes_not_causally_bound_to_reviewed_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             layout = fixture_layout(Path(directory))
@@ -840,6 +909,97 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(held.exception.code, "machine_bootstrap_venv_identity_changed")
             self.assertEqual(held.exception.data["component"], "venvDescendant.deniedRedirect")
             self.assertEqual(list(unrelated.iterdir()), [])
+
+    def test_venv_creation_refuses_nested_pip_redirect_before_external_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            unrelated = root / "unrelated"
+            unrelated.mkdir()
+            pip_root = layout.venv_root / "Lib" / "site-packages" / "pip"
+
+            def redirecting_runner(
+                argv: tuple[str, ...], **_: object
+            ) -> subprocess.CompletedProcess[object]:
+                if argv[1:3] == ("-m", "venv"):
+                    pip_root.symlink_to(unrelated, target_is_directory=True)
+                    (pip_root / "escaped.py").write_bytes(b"outside")
+                return subprocess.CompletedProcess(argv, 0)
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=FakeUserPath(),
+                    resolver=lambda *_: None,
+                    runner=redirecting_runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_venv_identity_changed")
+            self.assertEqual(held.exception.data["component"], "venvDescendant.deniedRedirect")
+            self.assertEqual(list(unrelated.iterdir()), [])
+
+    def test_redirected_install_ancestry_is_refused_before_any_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            unrelated = root / "unrelated"
+            unrelated.mkdir()
+            layout.install_root.parent.symlink_to(unrelated, target_is_directory=True)
+            runner = SyntheticInstaller(layout)
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=FakeUserPath(),
+                    resolver=lambda *_: None,
+                    runner=runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_install_identity_unproven")
+            self.assertEqual(held.exception.data["component"], "installNode.nodeType")
+            self.assertEqual(runner.calls, [])
+            self.assertEqual(list(unrelated.iterdir()), [])
+
+    def test_receipt_wrapper_preserves_anchor_identity_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            store = FakeUserPath()
+            runner = SyntheticInstaller(layout)
+            original_call = runner.__call__
+            unrelated = root / "unrelated-anchor"
+            unrelated.mkdir()
+
+            def redirect_anchor_before_receipt(
+                argv: tuple[str, ...], **kwargs: object
+            ) -> subprocess.CompletedProcess[object]:
+                completed = original_call(argv, **kwargs)
+                if argv[1:4] == ("-m", "pip", "install") and "--upgrade" not in argv:
+                    layout.install_anchor.parent.symlink_to(
+                        unrelated, target_is_directory=True
+                    )
+                return completed
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=store,
+                    resolver=resolving(layout, store),
+                    runner=redirect_anchor_before_receipt,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_receipt_write_failed")
+            self.assertEqual(held.exception.data["receiptWriteCause"], "machine_bootstrap_install_identity_unproven")
+            self.assertEqual(held.exception.data["component"], "installNode.nodeType")
+            self.assertEqual(held.exception.data["expected"], "directory")
+            self.assertEqual(held.exception.data["observed"], "redirected")
+            self.assertIn('"component":"installNode.nodeType"', str(held.exception))
 
     @unittest.skipIf(sys.platform == "win32", "native Windows uses an ancestor junction probe")
     def test_redirected_anchor_ancestor_cannot_authorize_a_receipt(self) -> None:

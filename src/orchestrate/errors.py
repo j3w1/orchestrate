@@ -222,6 +222,7 @@ def _sanitize_machine_diagnostic(code: str, data: Mapping[str, Any] | None) -> d
         "nodeType",
         "handleIdentity",
         "linkedIdentity",
+        "receiptWriteCause",
     ):
         value = incoming.get(key)
         if isinstance(value, str):
@@ -292,6 +293,7 @@ class OrchestrateError(RuntimeError):
             in {
                 "machine_bootstrap_safe_io_unavailable",
                 "machine_bootstrap_verification_failed",
+                "machine_bootstrap_receipt_write_failed",
             }
         )
         if self._machine_diagnostic:
