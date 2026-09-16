@@ -3411,6 +3411,121 @@ def _commit_staged_no_replace(
         )
 
 
+def _after_committed_stage_read(_: int) -> None:
+    """Fault seam after commit readback and before its final descriptor proof."""
+
+
+def _commit_file_identity(info: os.stat_result) -> str:
+    return (
+        f"device:{info.st_dev};inode:{info.st_ino};"
+        f"type:{stat.S_IFMT(info.st_mode):#x}"
+    )
+
+
+def _commit_opened_metadata(info: os.stat_result, *, size: int | None = None) -> str:
+    return (
+        f"mode:{info.st_mode:#x};size:{info.st_size if size is None else size};"
+        f"change-token:{info.st_ctime_ns}"
+    )
+
+
+def _verify_committed_stage(
+    descriptor: int,
+    linked_info: os.stat_result,
+    raw: bytes,
+    *,
+    path: Path,
+    staging_operation: Mapping[str, object],
+    archive_stages: list[dict[str, object]] | None,
+) -> tuple[bytes, os.stat_result]:
+    """Prove each post-commit invariant without conflating identity and bytes."""
+
+    opened_before = os.fstat(descriptor)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    committed_buffer = bytearray()
+    while len(committed_buffer) <= len(raw):
+        chunk = os.read(
+            descriptor,
+            min(64 * 1024, len(raw) + 1 - len(committed_buffer)),
+        )
+        if not chunk:
+            break
+        committed_buffer.extend(chunk)
+    committed = bytes(committed_buffer)
+    _after_committed_stage_read(descriptor)
+    opened_after = os.fstat(descriptor)
+    if archive_stages is not None:
+        archive_stages.append(
+            _archive_stage_diagnostic(
+                "committed-target",
+                committed,
+                form="public-path",
+                path=path,
+            )
+        )
+
+    if _is_reparse(linked_info) or not stat.S_ISREG(linked_info.st_mode):
+        raise OrchestrateError(
+            "Machine bootstrap committed target has an unexpected node type",
+            code="machine_bootstrap_commit_identity_changed",
+            data={
+                "component": "commit.nodeTypeAndReparse",
+                "expected": "regular-file",
+                "observed": (
+                    "redirected" if _is_reparse(linked_info) else "unexpected-node"
+                ),
+                "attributes": f"0x{getattr(linked_info, 'st_file_attributes', 0):08x}",
+                "operations": [staging_operation],
+            },
+        )
+
+    if not _opened_file_identity_matches(opened_before, linked_info):
+        raise OrchestrateError(
+            "Machine bootstrap committed target does not name the staged file",
+            code="machine_bootstrap_commit_identity_changed",
+            data={
+                "component": "commit.operationFileIdentity",
+                "expected": _commit_file_identity(opened_before),
+                "observed": _commit_file_identity(linked_info),
+                "handleIdentity": _commit_file_identity(opened_before),
+                "linkedIdentity": _commit_file_identity(linked_info),
+                "operations": [staging_operation],
+            },
+        )
+
+    if (
+        opened_before.st_mode != opened_after.st_mode
+        or opened_before.st_size != len(raw)
+        or opened_after.st_size != len(raw)
+        or opened_before.st_ctime_ns != opened_after.st_ctime_ns
+    ):
+        raise OrchestrateError(
+            "Machine bootstrap staged file metadata changed during commit verification",
+            code="machine_bootstrap_commit_identity_changed",
+            data={
+                "component": "commit.modeSizeChangeToken",
+                "expected": _commit_opened_metadata(opened_before, size=len(raw)),
+                "observed": _commit_opened_metadata(opened_after),
+                "operations": [staging_operation],
+            },
+        )
+
+    if committed != raw:
+        raise OrchestrateError(
+            "Machine bootstrap committed bytes differ from the retained staging file",
+            code="machine_bootstrap_commit_identity_changed",
+            data={
+                "component": "commit.committedSha256",
+                "expected": f"sha256:{hashlib.sha256(raw).hexdigest()}",
+                "observed": f"sha256:{hashlib.sha256(committed).hexdigest()}",
+                "expectedSize": len(raw),
+                "observedSize": len(committed),
+                "operations": [staging_operation],
+            },
+        )
+    return committed, opened_after
+
+
 def _link_descriptor_no_replace(
     staged_descriptor: int,
     target_name: str,
@@ -4066,55 +4181,14 @@ def _atomic_write_owned(
             if parent_fd is None
             else os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         )
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        committed_buffer = bytearray()
-        while len(committed_buffer) <= len(raw):
-            chunk = os.read(
-                descriptor,
-                min(64 * 1024, len(raw) + 1 - len(committed_buffer)),
-            )
-            if not chunk:
-                break
-            committed_buffer.extend(chunk)
-        committed = bytes(committed_buffer)
-        staged_identity = _PathIdentity.from_stat(os.fstat(descriptor))
-        linked_identity = _PathIdentity.from_stat(linked_info)
-        if (
-            _is_reparse(linked_info)
-            or not stat.S_ISREG(linked_info.st_mode)
-            or not _same_identity(staged_identity, linked_identity, directory=False)
-            or committed != raw
-        ):
-            if archive_stages is not None:
-                archive_stages.append(
-                    _archive_stage_diagnostic(
-                        "committed-target",
-                        committed,
-                        form="public-path",
-                        path=path,
-                    )
-                )
-            raise OrchestrateError(
-                "Machine bootstrap committed bytes differ from the retained staging file",
-                code="machine_bootstrap_commit_identity_changed",
-                data={
-                    "component": "commit.committedSha256",
-                    "expected": f"sha256:{hashlib.sha256(raw).hexdigest()}",
-                    "observed": f"sha256:{hashlib.sha256(committed).hexdigest()}",
-                    "expectedSize": len(raw),
-                    "observedSize": len(committed),
-                    "operations": [staging_operation],
-                },
-            )
-        if archive_stages is not None:
-            archive_stages.append(
-                _archive_stage_diagnostic(
-                    "committed-target",
-                    committed,
-                    form="public-path",
-                    path=path,
-                )
-            )
+        committed, committed_info = _verify_committed_stage(
+            descriptor,
+            linked_info,
+            raw,
+            path=path,
+            staging_operation=staging_operation,
+            archive_stages=archive_stages,
+        )
         retained_temporary_path: Path | None = None
         retained_temporary_parent_descriptor: int | None = None
         if not anonymous:
@@ -4152,10 +4226,10 @@ def _atomic_write_owned(
         retained = (
             _RetainedStage(
                 descriptor=descriptor,
-                identity=_PathIdentity.from_stat(os.fstat(descriptor)),
+                identity=_PathIdentity.from_stat(committed_info),
                 digest=hashlib.sha256(committed).hexdigest(),
                 size=len(committed),
-                changed_ns=os.fstat(descriptor).st_ctime_ns,
+                changed_ns=committed_info.st_ctime_ns,
                 temporary_path=retained_temporary_path,
                 temporary_parent_descriptor=retained_temporary_parent_descriptor,
             )

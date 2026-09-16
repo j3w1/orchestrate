@@ -163,6 +163,11 @@ def _sanitize_identity_value(component: str, value: object) -> object:
         value,
     ):
         return value
+    if re.fullmatch(
+        r"mode:0x[0-9a-f]+;size:[0-9]+;change-token:[0-9]+",
+        value,
+    ):
+        return value
     if value.startswith(("orchestrate-machine-install/", "orchestrate-machine-install-anchor/")):
         return _bounded_text(value)
     return _redacted_string_identity(value)

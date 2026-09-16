@@ -43,6 +43,7 @@ from orchestrate.machine_bootstrap import (
     _run_bound_step,
     _SourceBinding,
     _target_identity,
+    _verify_committed_stage,
     _VenvBinding,
     _windows_shim_text,
     _wsl_shim_text,
@@ -112,6 +113,21 @@ def write_pyvenv_config(layout: MachineLayout) -> bytes:
     raw = b"home = C:\\Python313\ninclude-system-site-packages = false\nversion = 3.13.9\n"
     (layout.venv_root / "pyvenv.cfg").write_bytes(raw)
     return raw
+
+
+def stat_view(info: os.stat_result, **changes: int) -> SimpleNamespace:
+    values = {
+        "st_dev": info.st_dev,
+        "st_ino": info.st_ino,
+        "st_mode": info.st_mode,
+        "st_nlink": info.st_nlink,
+        "st_size": info.st_size,
+        "st_mtime_ns": info.st_mtime_ns,
+        "st_ctime_ns": info.st_ctime_ns,
+        "st_file_attributes": getattr(info, "st_file_attributes", 0),
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
 
 
 def install_ready_files(layout: MachineLayout) -> None:
@@ -539,6 +555,181 @@ class MachineBootstrapTests(unittest.TestCase):
                 )
             self.assertEqual(target.read_bytes(), b"forced-named\n")
 
+    def test_commit_verifier_rejects_wrong_operation_identity_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "committed-stage"
+            raw = b"reviewed-bytes"
+            target.write_bytes(raw)
+            descriptor = os.open(target, os.O_RDWR)
+            try:
+                opened = os.fstat(descriptor)
+                for field in ("st_dev", "st_ino"):
+                    with self.subTest(field=field):
+                        linked = stat_view(
+                            opened,
+                            **{field: getattr(opened, field) + 1},
+                        )
+                        with self.assertRaises(OrchestrateError) as held:
+                            _verify_committed_stage(
+                                descriptor,
+                                linked,
+                                raw,
+                                path=target,
+                                staging_operation={"operation": "test"},
+                                archive_stages=None,
+                            )
+                        self.assertEqual(
+                            held.exception.data["component"],
+                            "commit.operationFileIdentity",
+                        )
+                        self.assertIn("device:", held.exception.data["expected"])
+                        self.assertIn("inode:", held.exception.data["expected"])
+                        self.assertIn("type:", held.exception.data["expected"])
+                        self.assertNotEqual(
+                            held.exception.data["expected"],
+                            held.exception.data["observed"],
+                        )
+            finally:
+                os.close(descriptor)
+
+    def test_commit_verifier_rejects_wrong_type_and_reparse_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "committed-stage"
+            raw = b"reviewed-bytes"
+            target.write_bytes(raw)
+            descriptor = os.open(target, os.O_RDWR)
+            try:
+                opened = os.fstat(descriptor)
+                cases = (
+                    (
+                        "wrong-type",
+                        stat_view(opened, st_mode=stat.S_IFDIR | 0o700),
+                        "unexpected-node",
+                    ),
+                    (
+                        "reparse",
+                        stat_view(
+                            opened,
+                            st_file_attributes=getattr(
+                                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+                            ),
+                        ),
+                        "redirected",
+                    ),
+                )
+                for label, linked, observed in cases:
+                    with self.subTest(label=label):
+                        with self.assertRaises(OrchestrateError) as held:
+                            _verify_committed_stage(
+                                descriptor,
+                                linked,
+                                raw,
+                                path=target,
+                                staging_operation={"operation": "test"},
+                                archive_stages=None,
+                            )
+                        self.assertEqual(
+                            held.exception.data["component"],
+                            "commit.nodeTypeAndReparse",
+                        )
+                        self.assertEqual(held.exception.data["observed"], observed)
+            finally:
+                os.close(descriptor)
+
+    def test_commit_verifier_rejects_mode_size_change_token_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "committed-stage"
+            raw = b"reviewed-bytes"
+            target.write_bytes(raw)
+            descriptor = os.open(target, os.O_RDWR)
+            try:
+                opened = os.fstat(descriptor)
+                changed = stat_view(opened, st_ctime_ns=opened.st_ctime_ns + 1)
+                with patch(
+                    "orchestrate.machine_bootstrap.os.fstat",
+                    side_effect=(opened, changed),
+                ):
+                    with self.assertRaises(OrchestrateError) as held:
+                        _verify_committed_stage(
+                            descriptor,
+                            opened,
+                            raw,
+                            path=target,
+                            staging_operation={"operation": "test"},
+                            archive_stages=None,
+                        )
+                self.assertEqual(
+                    held.exception.data["component"],
+                    "commit.modeSizeChangeToken",
+                )
+                self.assertIn("mode:", held.exception.data["expected"])
+                self.assertIn("size:", held.exception.data["expected"])
+                self.assertIn("change-token:", held.exception.data["expected"])
+            finally:
+                os.close(descriptor)
+
+    def test_commit_verifier_reports_content_only_for_different_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "committed-stage"
+            raw = b"reviewed-bytes"
+            target.write_bytes(b"x" * len(raw))
+            descriptor = os.open(target, os.O_RDWR)
+            try:
+                linked = os.fstat(descriptor)
+                with self.assertRaises(OrchestrateError) as held:
+                    _verify_committed_stage(
+                        descriptor,
+                        linked,
+                        raw,
+                        path=target,
+                        staging_operation={"operation": "test"},
+                        archive_stages=None,
+                    )
+                self.assertEqual(
+                    held.exception.data["component"],
+                    "commit.committedSha256",
+                )
+                self.assertNotEqual(
+                    held.exception.data["expected"],
+                    held.exception.data["observed"],
+                )
+            finally:
+                os.close(descriptor)
+
+    @unittest.skipIf(sys.platform == "win32", "simulated provider uses descriptor-host APIs")
+    def test_simulated_commit_accepts_path_descriptor_mode_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "orchestrate.machine_bootstrap._active_platform_provider",
+            return_value=_SIMULATED_WIN32_PROVIDER,
+        ), patch(
+            "orchestrate.machine_bootstrap._staging_strategy",
+            return_value="named",
+        ):
+            target = Path(directory) / "orchestrate.cmd"
+            raw = b"@echo off\r\n"
+            real_stat = os.stat
+
+            def path_sensitive_mode(
+                candidate: object, *args: object, **kwargs: object
+            ) -> os.stat_result:
+                info = real_stat(candidate, *args, **kwargs)
+                if (
+                    os.fspath(candidate) == target.name
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    return stat_view(info, st_mode=info.st_mode | 0o111)  # type: ignore[return-value]
+                return info
+
+            with patch("orchestrate.machine_bootstrap.os.stat", path_sensitive_mode):
+                _atomic_write_owned(
+                    target,
+                    raw,
+                    executable=False,
+                    expected_target=None,
+                )
+
+            self.assertEqual(target.read_bytes(), raw)
+
     @unittest.skipIf(sys.platform == "win32", "simulated provider uses descriptor-host APIs")
     def test_forced_named_staging_uses_provider_lifetime_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -914,6 +1105,7 @@ class MachineBootstrapTests(unittest.TestCase):
             finally:
                 _SIMULATED_WIN32_PROVIDER.close_staging_file(descriptor)
 
+    @unittest.skipIf(sys.platform == "win32", "simulated provider uses descriptor-host APIs")
     def test_simulated_named_stage_is_public_until_explicit_abandonment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -928,6 +1120,7 @@ class MachineBootstrapTests(unittest.TestCase):
                 self.assertTrue(stat.S_ISREG(stage.lstat().st_mode))
             finally:
                 _SIMULATED_WIN32_PROVIDER.close_staging_file(descriptor)
+
             _SIMULATED_WIN32_PROVIDER.unlink_staging_file(stage)
             self.assertFalse(stage.exists())
 
@@ -942,6 +1135,33 @@ class MachineBootstrapTests(unittest.TestCase):
                 self.assertFalse(delete_pending.exists())
             finally:
                 _SIMULATED_WIN32_PROVIDER.close_staging_file(descriptor)
+
+    @unittest.skipUnless(sys.platform == "win32", "native Windows staging lifetime")
+    def test_native_named_stage_abandonment_closes_before_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "orchestrate.cmd"
+
+            def abandon(_: Path) -> None:
+                raise RuntimeError("synthetic abandonment")
+
+            with patch(
+                "orchestrate.machine_bootstrap._staging_strategy",
+                return_value="named",
+            ), patch(
+                "orchestrate.machine_bootstrap._before_staged_commit",
+                side_effect=abandon,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "synthetic abandonment"):
+                    _atomic_write_owned(
+                        target,
+                        b"@echo off\r\n",
+                        executable=False,
+                        expected_target=None,
+                    )
+
+            self.assertFalse(target.exists())
+            self.assertEqual(list(root.glob(".orchestrate.cmd.*.tmp")), [])
 
     @unittest.skipIf(sys.platform == "win32", "simulated provider uses descriptor-host APIs")
     def test_retained_writer_cleanup_hands_off_before_delete(self) -> None:
@@ -1026,10 +1246,11 @@ class MachineBootstrapTests(unittest.TestCase):
                 retained = real_write(path, raw, **kwargs)
                 if kwargs.get("retain_descriptor") and path == layout.source_archive:
                     changed = True
-                    with path.open("r+b") as stream:
-                        stream.seek(0)
-                        stream.write(b"not-the-reviewed-archive")
-                        stream.truncate()
+                    self.assertIsNotNone(retained)
+                    os.lseek(retained.descriptor, 0, os.SEEK_SET)
+                    os.write(retained.descriptor, b"not-the-reviewed-archive")
+                    os.ftruncate(retained.descriptor, len(b"not-the-reviewed-archive"))
+                    os.fsync(retained.descriptor)
                 return retained
 
             with patch(
@@ -1053,6 +1274,10 @@ class MachineBootstrapTests(unittest.TestCase):
                 "sourceArchive.stageToBindingSha256",
             )
             self.assertFalse(layout.install_receipt.exists())
+            self.assertEqual(
+                list(layout.install_root.glob(".installed-source.zip.*.tmp")),
+                [],
+            )
 
     def test_same_inode_archive_change_during_effect_is_detected_and_not_consumed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1060,10 +1285,12 @@ class MachineBootstrapTests(unittest.TestCase):
             delegate = SyntheticInstaller(layout)
             original_call = delegate.__call__
             observed: list[bytes] = []
+            write_denied = False
 
             def transient_archive(
                 argv: tuple[str, ...], **kwargs: object
             ) -> subprocess.CompletedProcess[object]:
+                nonlocal write_denied
                 if argv[1:4] == ("-m", "pip", "install") and "--upgrade" not in argv:
                     original = layout.source_archive.read_bytes()
                     timestamps = layout.source_archive.stat()
@@ -1073,7 +1300,11 @@ class MachineBootstrapTests(unittest.TestCase):
                             "pyproject.toml",
                             b"[project]\nname='attacker'\n",
                         )
-                    layout.source_archive.write_bytes(attacker.getvalue())
+                    try:
+                        layout.source_archive.write_bytes(attacker.getvalue())
+                    except PermissionError:
+                        write_denied = True
+                        return original_call(argv, **kwargs)
                     with zipfile.ZipFile(argv[-1]) as archive:
                         observed.append(archive.read("pyproject.toml"))
                     layout.source_archive.write_bytes(original)
@@ -1083,8 +1314,8 @@ class MachineBootstrapTests(unittest.TestCase):
                     )
                 return original_call(argv, **kwargs)
 
-            with self.assertRaises(OrchestrateError) as held:
-                ensure_machine(
+            if sys.platform == "win32":
+                result = ensure_machine(
                     layout=layout,
                     path_store=FakeUserPath(),
                     resolver=lambda *_: None,
@@ -1092,10 +1323,28 @@ class MachineBootstrapTests(unittest.TestCase):
                     platform="win32",
                     version_info=(3, 13),
                 )
+                self.assertTrue(write_denied)
+                self.assertEqual(observed, [])
+                self.assertEqual(result.state, "repaired")
+                self.assertTrue(layout.install_receipt.exists())
+            else:
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        layout=layout,
+                        path_store=FakeUserPath(),
+                        resolver=lambda *_: None,
+                        runner=transient_archive,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
 
-            self.assertEqual(observed, [b"[project]\nname='fixture'\n"])
-            self.assertEqual(held.exception.code, "machine_bootstrap_source_identity_changed")
-            self.assertFalse(layout.install_receipt.exists())
+                self.assertFalse(write_denied)
+                self.assertEqual(observed, [b"[project]\nname='fixture'\n"])
+                self.assertEqual(
+                    held.exception.code,
+                    "machine_bootstrap_source_identity_changed",
+                )
+                self.assertFalse(layout.install_receipt.exists())
 
     @unittest.skipIf(sys.platform == "win32", "non-native effect snapshot branch")
     def test_forced_named_effect_snapshot_rejects_change_and_restore(self) -> None:
