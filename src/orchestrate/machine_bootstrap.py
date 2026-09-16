@@ -402,6 +402,15 @@ class MachineBootstrapResult:
         return {"state": self.state, "actions": list(self.actions)}
 
 
+@dataclass(frozen=True, slots=True)
+class _ReceiptMatchResult:
+    """Retain receipt diagnostics and any authenticated source classification."""
+
+    matches: bool
+    diagnostic: dict[str, object]
+    persisted_source_failure: OrchestrateError | None = None
+
+
 Runner = Callable[..., subprocess.CompletedProcess[object]]
 Resolver = Callable[[str, str], str | None]
 
@@ -3408,6 +3417,20 @@ def _persisted_source_access_failure(exc: BaseException) -> OrchestrateError:
     )
 
 
+def _persisted_source_receipt_mismatch(
+    diagnostic: dict[str, object],
+) -> OrchestrateError:
+    return OrchestrateError(
+        "The recorded reviewed checkout changed after installation; rerun from that checkout's bootstrap.py first-entry path after the documented recovery",
+        code="machine_bootstrap_persisted_source_changed",
+        data={
+            **diagnostic,
+            "disposition": "definitive",
+            "recovery": "Review the checkout move or change, move aside the documented receipt, archive, command, and anchor files, then rerun that checkout's bootstrap.py first-entry path",
+        },
+    )
+
+
 def _read_required_source_record(path: Path, *, component: str) -> object:
     try:
         raw = _read_bounded_regular(path, MAX_INSTALL_RECEIPT_BYTES)
@@ -3557,10 +3580,10 @@ def _receipt_match_diagnostic(
     binding: _VenvBinding,
     source: _SourceBinding,
     archive: _ArchiveBinding,
-) -> tuple[bool, dict[str, object]]:
-    def mismatch(data: dict[str, object]) -> tuple[bool, dict[str, object]]:
+) -> _ReceiptMatchResult:
+    def mismatch(data: dict[str, object]) -> _ReceiptMatchResult:
         archive_data = archive.diagnostic_data()
-        return False, {
+        diagnostic = {
             **data,
             "operations": [
                 *source.diagnostic_data()["operations"],  # type: ignore[misc]
@@ -3569,6 +3592,17 @@ def _receipt_match_diagnostic(
             "archiveStages": archive_data["archiveStages"],
             "anchorAncestry": _anchor_ancestry_diagnostic(layout.install_anchor),
         }
+        persisted_source_failure = None
+        if layout.source_from_install_record and diagnostic.get("component") in {
+            "receipt.sourceRoot",
+            "receipt.sourceTreeSha256",
+        }:
+            persisted_source_failure = _persisted_source_receipt_mismatch(diagnostic)
+        return _ReceiptMatchResult(
+            False,
+            diagnostic,
+            persisted_source_failure,
+        )
 
     value, receipt_form = _read_canonical_json_diagnostic(
         layout.install_receipt,
@@ -3623,7 +3657,14 @@ def _receipt_match_diagnostic(
                     "observed": anchor.get(key),
                 }
             )
-    return True, {"component": "receipt-and-anchor", "expected": "matching", "observed": "matching"}
+    return _ReceiptMatchResult(
+        True,
+        {
+            "component": "receipt-and-anchor",
+            "expected": "matching",
+            "observed": "matching",
+        },
+    )
 
 
 def _install_receipt_matches(
@@ -3631,14 +3672,34 @@ def _install_receipt_matches(
     binding: _VenvBinding,
     source: _SourceBinding,
     archive: _ArchiveBinding | None = None,
-) -> bool:
+) -> _ReceiptMatchResult:
     try:
         if archive is None:
             with _ArchiveBinding(layout.source_archive) as selected_archive:
-                return _receipt_match_diagnostic(layout, binding, source, selected_archive)[0]
-        return _receipt_match_diagnostic(layout, binding, source, archive)[0]
-    except OrchestrateError:
-        return False
+                return _receipt_match_diagnostic(
+                    layout,
+                    binding,
+                    source,
+                    selected_archive,
+                )
+        return _receipt_match_diagnostic(layout, binding, source, archive)
+    except OrchestrateError as exc:
+        persisted_source_failure = (
+            exc
+            if layout.source_from_install_record
+            and exc.code.startswith("machine_bootstrap_persisted_source_")
+            else None
+        )
+        return _ReceiptMatchResult(
+            False,
+            exc.data
+            or {
+                "component": "receipt-and-anchor",
+                "expected": "available-and-matching",
+                "observed": exc.code,
+            },
+            persisted_source_failure,
+        )
 
 
 def _command_proof(path: Path) -> _BoundedFile:
@@ -4731,9 +4792,18 @@ def machine_ready(
             _ArchiveBinding(layout.source_archive) as archive,
             _VenvBinding(layout) as binding,
         ):
+            if not _owned_file_exists(layout.command_path):
+                return False
+            receipt_match = _install_receipt_matches(
+                layout,
+                binding,
+                source,
+                archive,
+            )
+            if receipt_match.persisted_source_failure is not None:
+                raise receipt_match.persisted_source_failure
             return bool(
-                _owned_file_exists(layout.command_path)
-                and _install_receipt_matches(layout, binding, source, archive)
+                receipt_match.matches
                 and _shim_matches(layout.windows_shim, _windows_shim_text())
                 and _shim_matches(layout.wsl_shim, _wsl_shim_text())
             )
@@ -4781,11 +4851,11 @@ def _machine_readiness_diagnostic(
             _ArchiveBinding(layout.source_archive) as archive,
             _VenvBinding(layout) as binding,
         ):
-            matches_receipt, diagnostic = _receipt_match_diagnostic(
+            receipt_match = _receipt_match_diagnostic(
                 layout, binding, source, archive
             )
-            if not matches_receipt:
-                return diagnostic
+            if not receipt_match.matches:
+                return receipt_match.diagnostic
             if not _owned_file_exists(layout.command_path):
                 return {"component": "command.form", "expected": "owned-regular-file", "observed": "absent"}
     except OrchestrateError as exc:
@@ -5592,14 +5662,16 @@ def ensure_machine(
                 archive = _ArchiveBinding(selected_layout.source_archive)
             try:
                 if archive is None:
-                    receipt_matches = False
-                    receipt_diagnostic = {
-                        "component": "sourceArchive.form",
-                        "expected": "owned-regular-file",
-                        "observed": "absent",
-                    }
+                    receipt_match = _ReceiptMatchResult(
+                        False,
+                        {
+                            "component": "sourceArchive.form",
+                            "expected": "owned-regular-file",
+                            "observed": "absent",
+                        },
+                    )
                 else:
-                    receipt_matches, receipt_diagnostic = _receipt_match_diagnostic(
+                    receipt_match = _receipt_match_diagnostic(
                         selected_layout, binding, source, archive
                     )
                 if receipt_target != _target_identity(selected_layout.install_receipt):
@@ -5609,24 +5681,14 @@ def ensure_machine(
                         data={"component": "receipt.fileIdentity", "expected": repr(receipt_target), "observed": repr(_target_identity(selected_layout.install_receipt))},
                     )
                 command_target = _target_identity(selected_layout.command_path)
-                if not receipt_matches:
+                if not receipt_match.matches:
                     if receipt_target is not None:
-                        if selected_layout.source_from_install_record and receipt_diagnostic.get(
-                            "component"
-                        ) in {"receipt.sourceRoot", "receipt.sourceTreeSha256"}:
-                            raise OrchestrateError(
-                                "The recorded reviewed checkout changed after installation; rerun from that checkout's bootstrap.py first-entry path after the documented recovery",
-                                code="machine_bootstrap_persisted_source_changed",
-                                data={
-                                    **receipt_diagnostic,
-                                    "disposition": "definitive",
-                                    "recovery": "Review the checkout move or change, move aside the documented receipt, archive, command, and anchor files, then rerun that checkout's bootstrap.py first-entry path",
-                                },
-                            )
+                        if receipt_match.persisted_source_failure is not None:
+                            raise receipt_match.persisted_source_failure
                         raise OrchestrateError(
                             "The existing machine-install receipt does not prove the current command; move it aside after inspection and rerun setup",
                             code="machine_bootstrap_receipt_identity_unproven",
-                            data=receipt_diagnostic,
+                            data=receipt_match.diagnostic,
                         )
                     if command_target is not None:
                         raise OrchestrateError(

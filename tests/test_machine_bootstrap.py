@@ -34,6 +34,7 @@ from orchestrate.machine_bootstrap import (
     _commit_staged_no_replace,
     _ensure_directory,
     _ensure_install_parent,
+    _ensure_install_root,
     _install_receipt_matches,
     _NATIVE_WIN32_PROVIDER,
     _SIMULATED_WIN32_PROVIDER,
@@ -487,6 +488,185 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(store.reads, 2)
             self.assertEqual(store.writes, [])
             self.assertEqual(runner.calls, [])
+
+    def _assert_installed_public_entry_rejects_aggregate_source_change(
+        self,
+        change: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            nested = layout.source_root / "docs" / "notes.txt"
+            nested.parent.mkdir()
+            nested.write_bytes(b"receipt-bound nested source\n")
+            install_ready_files(layout)
+            grant_records = (
+                layout.install_receipt.read_bytes(),
+                layout.install_anchor.read_bytes(),
+            )
+            archive_bytes = layout.source_archive.read_bytes()
+
+            if change == "bytes":
+                nested.write_bytes(b"changed receipt-bound nested source\n")
+            elif change == "removed":
+                nested.unlink()
+            elif change == "file-to-directory":
+                nested.unlink()
+                nested.mkdir()
+            elif change == "executable-bits":
+                nested.chmod(stat.S_IMODE(nested.stat().st_mode) | stat.S_IXUSR)
+            else:
+                self.fail(f"unsupported aggregate source change: {change}")
+
+            store = FakeUserPath(str(layout.bin_root))
+            runner = SyntheticInstaller(layout)
+            installed_module = (
+                root
+                / "wheel-env"
+                / "site-packages"
+                / "orchestrate"
+                / "machine_bootstrap.py"
+            )
+
+            with patch(
+                "orchestrate.machine_bootstrap.__file__",
+                os.fspath(installed_module),
+            ), patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": os.fspath(root / "local")},
+            ), patch(
+                "orchestrate.machine_bootstrap._ensure_install_parent"
+            ) as ensure_parent, patch(
+                "orchestrate.machine_bootstrap._ensure_install_root"
+            ) as ensure_root:
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        path_store=store,
+                        resolver=resolving(layout, store),
+                        runner=runner,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
+
+            self.assertEqual(
+                held.exception.code,
+                "machine_bootstrap_persisted_source_changed",
+            )
+            self.assertEqual(held.exception.data["disposition"], "definitive")  # type: ignore[index]
+            self.assertIn("move aside", held.exception.data["recovery"])  # type: ignore[index]
+            self.assertIn("bootstrap.py", held.exception.data["recovery"])  # type: ignore[index]
+            self.assertFalse((layout.install_root / ".machine-bootstrap.lock").exists())
+            self.assertEqual(store.reads, 1)
+            self.assertEqual(store.writes, [])
+            self.assertEqual(runner.calls, [])
+            ensure_parent.assert_not_called()
+            ensure_root.assert_not_called()
+            self.assertEqual(
+                (
+                    layout.install_receipt.read_bytes(),
+                    layout.install_anchor.read_bytes(),
+                ),
+                grant_records,
+            )
+            self.assertEqual(layout.source_archive.read_bytes(), archive_bytes)
+
+    def test_installed_public_entry_rejects_changed_aggregate_source_bytes_before_lock(
+        self,
+    ) -> None:
+        self._assert_installed_public_entry_rejects_aggregate_source_change("bytes")
+
+    def test_installed_public_entry_rejects_removed_aggregate_source_file_before_lock(
+        self,
+    ) -> None:
+        self._assert_installed_public_entry_rejects_aggregate_source_change("removed")
+
+    def test_installed_public_entry_rejects_aggregate_source_file_to_directory_before_lock(
+        self,
+    ) -> None:
+        self._assert_installed_public_entry_rejects_aggregate_source_change(
+            "file-to-directory"
+        )
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "native Windows chmod does not expose source executable-bit changes",
+    )
+    def test_installed_public_entry_rejects_changed_aggregate_source_mode_before_lock(
+        self,
+    ) -> None:
+        self._assert_installed_public_entry_rejects_aggregate_source_change(
+            "executable-bits"
+        )
+
+    def test_installed_public_entry_second_scan_keeps_persisted_source_classification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            nested = layout.source_root / "docs" / "notes.txt"
+            nested.parent.mkdir()
+            nested.write_bytes(b"receipt-bound nested source\n")
+            install_ready_files(layout)
+            layout.wsl_shim.unlink()
+            grant_records = (
+                layout.install_receipt.read_bytes(),
+                layout.install_anchor.read_bytes(),
+            )
+            store = FakeUserPath(str(layout.bin_root))
+            runner = SyntheticInstaller(layout)
+            installed_module = (
+                root
+                / "wheel-env"
+                / "site-packages"
+                / "orchestrate"
+                / "machine_bootstrap.py"
+            )
+            changes = 0
+
+            def change_source_after_initial_scan(selected_layout: MachineLayout) -> None:
+                nonlocal changes
+                changes += 1
+                nested.write_bytes(b"mid-flight changed nested source\n")
+                _ensure_install_root(selected_layout)
+
+            with patch(
+                "orchestrate.machine_bootstrap.__file__",
+                os.fspath(installed_module),
+            ), patch.dict(
+                os.environ,
+                {"LOCALAPPDATA": os.fspath(root / "local")},
+            ), patch(
+                "orchestrate.machine_bootstrap._ensure_install_root",
+                side_effect=change_source_after_initial_scan,
+            ):
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        path_store=store,
+                        resolver=resolving(layout, store),
+                        runner=runner,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
+
+            self.assertEqual(changes, 1)
+            self.assertEqual(
+                held.exception.code,
+                "machine_bootstrap_persisted_source_changed",
+            )
+            self.assertEqual(held.exception.data["disposition"], "definitive")  # type: ignore[index]
+            self.assertIn("bootstrap.py", held.exception.data["recovery"])  # type: ignore[index]
+            self.assertEqual(store.reads, 2)
+            self.assertEqual(store.writes, [])
+            self.assertEqual(runner.calls, [])
+            self.assertTrue((layout.install_root / ".machine-bootstrap.lock").exists())
+            self.assertEqual(
+                (
+                    layout.install_receipt.read_bytes(),
+                    layout.install_anchor.read_bytes(),
+                ),
+                grant_records,
+            )
 
     def test_installed_public_entry_preserves_nested_symlink_failure_after_restoration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1205,7 +1385,9 @@ class MachineBootstrapTests(unittest.TestCase):
 
             with patch("orchestrate.machine_bootstrap._before_bounded_file_open", swapping_open):
                 with _SourceBinding(layout) as source, _VenvBinding(layout) as binding:
-                    self.assertFalse(_install_receipt_matches(layout, binding, source))
+                    self.assertFalse(
+                        _install_receipt_matches(layout, binding, source).matches
+                    )
 
             self.assertEqual(fault.interceptions, 1)
 
