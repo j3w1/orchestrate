@@ -326,9 +326,10 @@ class MachineBootstrapTests(unittest.TestCase):
             write_pyvenv_config(layout)
             (layout.scripts_root / "python.exe").write_bytes(b"fixture")
 
-            with _VenvBinding(layout) as binding, patch(
-                "orchestrate.machine_bootstrap.sys.platform", "win32"
-            ):
+            with patch.dict(
+                os.environ,
+                {"ORCHESTRATE_BOOTSTRAP_PROVIDER": "simulated-win32"},
+            ), _VenvBinding(layout) as binding:
                 kwargs = binding.runner_kwargs()
 
             self.assertEqual(kwargs, {"executable": str(layout.scripts_root / "python.exe")})

@@ -38,6 +38,27 @@ MAX_COMMAND_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_FILES = 4096
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MACHINE_LOCK_NAME = ".machine-bootstrap.lock"
+SIMULATED_WIN32_PROVIDER_ENV = "ORCHESTRATE_BOOTSTRAP_PROVIDER"
+
+
+class _PlatformProvider(Protocol):
+    """One seam for every platform-dependent bootstrap operation.
+
+    ``windows_semantics`` selects command, path, share-binding, and staging
+    forms.  Only ``native_windows`` is allowed to call Win32 APIs; the
+    simulated provider implements the same contract with disposable POSIX
+    descriptors so it is safe to run on development hosts.
+    """
+
+    name: str
+    windows_semantics: bool
+    native_windows: bool
+
+    def read_bounded_file(self, path: Path, limit: int) -> _BoundedFile: ...
+
+    def open_path_pin(self, path: Path, *, directory: bool) -> object: ...
+
+    def close_path_pin(self, handle: object) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -672,9 +693,7 @@ def _read_windows_bounded_file(path: Path, limit: int) -> _BoundedFile:
 
 
 def _read_bounded_regular_file(path: Path, limit: int) -> _BoundedFile:
-    if sys.platform == "win32":
-        return _read_windows_bounded_file(path, limit)
-    return _read_posix_bounded_file(path, limit)
+    return _active_platform_provider().read_bounded_file(path, limit)
 
 
 def _read_bounded_regular(path: Path, limit: int) -> bytes:
@@ -824,6 +843,67 @@ def _close_windows_path_pin(handle: object) -> None:
     close_handle(handle)
 
 
+class _PosixPlatformProvider:
+    name = "posix"
+    windows_semantics = False
+    native_windows = False
+
+    def read_bounded_file(self, path: Path, limit: int) -> _BoundedFile:
+        return _read_posix_bounded_file(path, limit)
+
+    def open_path_pin(self, path: Path, *, directory: bool) -> object:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if directory:
+            flags |= getattr(os, "O_DIRECTORY", 0)
+        else:
+            flags |= getattr(os, "O_NONBLOCK", 0)
+        return os.open(os.fspath(path), flags)
+
+    def close_path_pin(self, handle: object) -> None:
+        os.close(int(handle))
+
+
+class _NativeWin32PlatformProvider:
+    name = "native-win32"
+    windows_semantics = True
+    native_windows = True
+
+    def read_bounded_file(self, path: Path, limit: int) -> _BoundedFile:
+        return _read_windows_bounded_file(path, limit)
+
+    def open_path_pin(self, path: Path, *, directory: bool) -> object:
+        return _open_windows_path_pin(path, directory=directory)
+
+    def close_path_pin(self, handle: object) -> None:
+        _close_windows_path_pin(handle)
+
+
+class _SimulatedWin32PlatformProvider(_PosixPlatformProvider):
+    """Win32 contract implemented with disposable host filesystem handles."""
+
+    name = "simulated-win32"
+    windows_semantics = True
+    native_windows = False
+
+
+_POSIX_PROVIDER = _PosixPlatformProvider()
+_NATIVE_WIN32_PROVIDER = _NativeWin32PlatformProvider()
+_SIMULATED_WIN32_PROVIDER = _SimulatedWin32PlatformProvider()
+
+
+def _active_platform_provider() -> _PlatformProvider:
+    selected = os.environ.get(SIMULATED_WIN32_PROVIDER_ENV, "").strip()
+    if selected:
+        if selected != _SIMULATED_WIN32_PROVIDER.name:
+            raise OrchestrateError(
+                "Machine bootstrap received an unsupported platform provider",
+                code="machine_bootstrap_platform_unsupported",
+                data={"observed": selected, "expected": _SIMULATED_WIN32_PROVIDER.name},
+            )
+        return _SIMULATED_WIN32_PROVIDER
+    return _NATIVE_WIN32_PROVIDER if sys.platform == "win32" else _POSIX_PROVIDER
+
+
 def _source_tree_digest(root: Path) -> str:
     """Hash the bounded editable-install input tree without following links."""
 
@@ -904,13 +984,14 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
     """Bind the reviewed checkout used by editable installation and receipts."""
 
     def __init__(self, layout: MachineLayout) -> None:
+        self._provider = _active_platform_provider()
         self.path = layout.source_root
         self._identity = _path_identity(self.path, directory=True)
         self._descriptor: int | None = None
         self._windows_handle: object | None = None
         try:
-            if sys.platform == "win32":
-                self._windows_handle = _open_windows_path_pin(self.path, directory=True)
+            if self._provider.windows_semantics:
+                self._windows_handle = self._provider.open_path_pin(self.path, directory=True)
                 self.effect_path = self.path
             else:
                 flags = (
@@ -978,7 +1059,7 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
                 pass
             self._descriptor = None
         if self._windows_handle is not None:
-            _close_windows_path_pin(self._windows_handle)
+            self._provider.close_path_pin(self._windows_handle)
             self._windows_handle = None
 
     def __exit__(self, *_: object) -> None:
@@ -989,6 +1070,7 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
     """Pin and repeatedly prove the dedicated interpreter before every effect."""
 
     def __init__(self, layout: MachineLayout) -> None:
+        self._provider = _active_platform_provider()
         self.layout = layout
         self.config_path = layout.venv_root / "pyvenv.cfg"
         self.python_path = layout.scripts_root / "python.exe"
@@ -1005,9 +1087,9 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
         try:
             for path, directory in nodes:
                 self._identities[path] = _path_identity(path, directory=directory)
-                if sys.platform == "win32":
+                if self._provider.windows_semantics:
                     self._windows_handles.append(
-                        _open_windows_path_pin(path, directory=directory)
+                        self._provider.open_path_pin(path, directory=directory)
                     )
                 else:
                     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -1066,7 +1148,7 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
         }
 
     def runner_kwargs(self, *, pass_fds: tuple[int, ...] = ()) -> dict[str, object]:
-        if sys.platform == "win32":
+        if self._provider.windows_semantics:
             # subprocess forwards this as CreateProcess's explicit application
             # name.  The retained GENERIC_READ handle permits image reads while
             # denying writes/deletes until the post-effect identity proof.
@@ -1088,7 +1170,7 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
                 pass
         self._descriptors.clear()
         for handle in reversed(self._windows_handles):
-            _close_windows_path_pin(handle)
+            self._provider.close_path_pin(handle)
         self._windows_handles.clear()
 
     def __exit__(self, *_: object) -> None:
@@ -1267,6 +1349,7 @@ def _atomic_write_owned(
     executable: bool,
     expected_target: _PathIdentity | None,
 ) -> None:
+    provider = _active_platform_provider()
     parent_identity = _path_identity(path.parent, directory=True)
     if expected_target is not None:
         raise OrchestrateError(
@@ -1279,9 +1362,9 @@ def _atomic_write_owned(
     temporary_name: str | None = None
     try:
         _before_staging_parent_open(path.parent)
-        if sys.platform == "win32":
+        if provider.windows_semantics:
             try:
-                parent_handle = _open_windows_path_pin(path.parent, directory=True)
+                parent_handle = provider.open_path_pin(path.parent, directory=True)
             except OrchestrateError as exc:
                 raise OrchestrateError(
                     "Machine bootstrap staging parent could not be bound",
@@ -1359,7 +1442,7 @@ def _atomic_write_owned(
             if written <= 0:
                 raise OSError("short staging write")
             view = view[written:]
-        if os.name != "nt":
+        if not provider.windows_semantics:
             os.fchmod(descriptor, 0o755 if executable else 0o600)
         else:
             os.chmod(path.parent / temporary_name, 0o755 if executable else 0o600)
@@ -1402,7 +1485,7 @@ def _atomic_write_owned(
             except OSError:
                 pass
         if parent_handle is not None:
-            _close_windows_path_pin(parent_handle)
+            provider.close_path_pin(parent_handle)
 
 
 def _write_install_receipt(
@@ -1613,7 +1696,10 @@ def ensure_machine(
 ) -> MachineBootstrapResult:
     """Repair the dedicated user installation, or return through the fast path."""
 
-    selected_platform = sys.platform if platform is None else platform
+    provider = _active_platform_provider()
+    selected_platform = (
+        "win32" if provider.windows_semantics else sys.platform
+    ) if platform is None else platform
     if selected_platform != "win32":
         return MachineBootstrapResult("not_applicable")
     selected_version = sys.version_info[:2] if version_info is None else version_info
