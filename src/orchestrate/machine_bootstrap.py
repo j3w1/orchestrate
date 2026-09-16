@@ -30,10 +30,11 @@ from .state import RunLock
 MINIMUM_PYTHON = (3, 13)
 WINDOWS_COMMAND = "orchestrate.cmd"
 WSL_COMMAND = "orchestrate"
-INSTALL_RECEIPT_SCHEMA = "orchestrate-machine-install/v2"
+INSTALL_RECEIPT_SCHEMA = "orchestrate-machine-install/v3"
 MAX_INSTALL_RECEIPT_BYTES = 4096
 MAX_PYVENV_CONFIG_BYTES = 16 * 1024
 MAX_SHIM_BYTES = 32 * 1024
+MAX_COMMAND_BYTES = 2 * 1024 * 1024
 MACHINE_LOCK_NAME = ".machine-bootstrap.lock"
 
 
@@ -56,6 +57,17 @@ class UserPathStore(Protocol):
 
 class RegistryUserPathStore:
     r"""Read and write only ``HKCU\Environment\Path``."""
+
+    def __init__(
+        self,
+        *,
+        transactional_replace: Callable[[UserPathValue, str], None] | None = None,
+    ) -> None:
+        self._transactional_replace = (
+            _replace_windows_registry_value
+            if transactional_replace is None
+            else transactional_replace
+        )
 
     @staticmethod
     def _validate(value: object, kind: int, *, winreg: object) -> UserPathValue:
@@ -93,26 +105,13 @@ class RegistryUserPathStore:
                 "Windows user PATH is available only on native Windows",
                 code="machine_bootstrap_platform_unsupported",
             )
-        import winreg
-
         try:
-            with winreg.CreateKeyEx(
-                winreg.HKEY_CURRENT_USER,
-                "Environment",
-                0,
-                winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE,
-            ) as key:
-                try:
-                    current_value, current_kind = winreg.QueryValueEx(key, "Path")
-                    current = self._validate(current_value, current_kind, winreg=winreg)
-                except FileNotFoundError:
-                    current = UserPathValue("", winreg.REG_EXPAND_SZ, exists=False)
-                if current != expected:
-                    raise OrchestrateError(
-                        "The Windows user PATH changed during bootstrap; no stale PATH value was written, so rerun setup",
-                        code="machine_bootstrap_path_changed",
-                    )
-                winreg.SetValueEx(key, "Path", 0, expected.kind, value)
+            self._transactional_replace(expected, value)
+            if self.read() != UserPathValue(value, expected.kind):
+                raise OrchestrateError(
+                    "The Windows user PATH changed while bootstrap committed its update; the interfering value was preserved, so rerun setup",
+                    code="machine_bootstrap_path_changed",
+                )
         except OrchestrateError:
             raise
         except OSError as exc:
@@ -138,6 +137,157 @@ class RegistryUserPathStore:
             )
         except (AttributeError, OSError):
             pass
+
+
+def _replace_windows_registry_value(expected: UserPathValue, value: str) -> None:
+    """Atomically compare and replace HKCU PATH with a registry transaction.
+
+    There is no safe QueryValueEx/SetValueEx compare-and-swap.  A transacted
+    key makes the comparison and write one commit; a competing writer makes
+    that commit fail instead of losing unrelated PATH bytes.
+    """
+
+    import ctypes
+    from ctypes import wintypes
+    import winreg
+
+    error_success = 0
+    error_file_not_found = 2
+    key_query_value = 0x0001
+    key_set_value = 0x0002
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    ktmw32 = ctypes.WinDLL("ktmw32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_transaction = ktmw32.CreateTransaction
+    create_transaction.argtypes = (
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPCWSTR,
+    )
+    create_transaction.restype = wintypes.HANDLE
+    commit_transaction = ktmw32.CommitTransaction
+    commit_transaction.argtypes = (wintypes.HANDLE,)
+    commit_transaction.restype = wintypes.BOOL
+    rollback_transaction = ktmw32.RollbackTransaction
+    rollback_transaction.argtypes = (wintypes.HANDLE,)
+    rollback_transaction.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    open_key = advapi32.RegOpenKeyTransactedW
+    open_key.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+    )
+    open_key.restype = wintypes.LONG
+    query_value = advapi32.RegQueryValueExW
+    query_value.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPCWSTR,
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    query_value.restype = wintypes.LONG
+    set_value = advapi32.RegSetValueExW
+    set_value.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPCVOID,
+        wintypes.DWORD,
+    )
+    set_value.restype = wintypes.LONG
+    close_key = advapi32.RegCloseKey
+    close_key.argtypes = (wintypes.HANDLE,)
+    close_key.restype = wintypes.LONG
+
+    transaction = create_transaction(None, None, 0, 0, 0, 0, None)
+    if transaction in (None, 0, invalid_handle):
+        raise OrchestrateError(
+            "The Windows user PATH transaction could not be started; no PATH value was written",
+            code="machine_bootstrap_path_write_failed",
+        )
+    key = wintypes.HANDLE()
+    committed = False
+    try:
+        status = open_key(
+            wintypes.HANDLE(ctypes.c_long(int(winreg.HKEY_CURRENT_USER)).value),
+            "Environment",
+            0,
+            key_query_value | key_set_value,
+            ctypes.byref(key),
+            transaction,
+            None,
+        )
+        if status != error_success:
+            raise OSError(status, "RegOpenKeyTransactedW")
+
+        def read_current() -> UserPathValue:
+            kind = wintypes.DWORD()
+            size = wintypes.DWORD()
+            result = query_value(key, "Path", None, ctypes.byref(kind), None, ctypes.byref(size))
+            if result == error_file_not_found:
+                return UserPathValue("", winreg.REG_EXPAND_SZ, exists=False)
+            if result != error_success:
+                raise OSError(result, "RegQueryValueExW")
+            buffer = ctypes.create_string_buffer(size.value)
+            result = query_value(
+                key,
+                "Path",
+                None,
+                ctypes.byref(kind),
+                buffer,
+                ctypes.byref(size),
+            )
+            if result != error_success:
+                raise OSError(result, "RegQueryValueExW")
+            raw = buffer.raw[: size.value]
+            text = raw.decode("utf-16-le")
+            if text.endswith("\x00"):
+                text = text[:-1]
+            return RegistryUserPathStore._validate(text, kind.value, winreg=winreg)
+
+        if read_current() != expected:
+            raise OrchestrateError(
+                "The Windows user PATH changed during bootstrap; no stale PATH value was written, so rerun setup",
+                code="machine_bootstrap_path_changed",
+            )
+        encoded = (value + "\x00").encode("utf-16-le")
+        buffer = ctypes.create_string_buffer(encoded)
+        status = set_value(key, "Path", 0, expected.kind, buffer, len(encoded))
+        if status != error_success:
+            raise OSError(status, "RegSetValueExW")
+        if read_current() != UserPathValue(value, expected.kind):
+            raise OrchestrateError(
+                "The Windows user PATH transaction could not verify its staged value",
+                code="machine_bootstrap_path_changed",
+            )
+        if not commit_transaction(transaction):
+            raise OrchestrateError(
+                "The Windows user PATH changed during bootstrap; the atomic update was not committed, so rerun setup",
+                code="machine_bootstrap_path_changed",
+            )
+        committed = True
+    finally:
+        if key.value:
+            close_key(key)
+        if not committed:
+            rollback_transaction(transaction)
+        close_handle(transaction)
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +432,26 @@ class _PathIdentity:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _BoundedFile:
+    raw: bytes
+    identity: _PathIdentity
+
+
+def _opened_file_identity_matches(opened: os.stat_result, linked: os.stat_result) -> bool:
+    """Compare Windows file identity, never the spelling used to reach it."""
+
+    return (
+        opened.st_dev,
+        opened.st_ino,
+        stat.S_IFMT(opened.st_mode),
+    ) == (
+        linked.st_dev,
+        linked.st_ino,
+        stat.S_IFMT(linked.st_mode),
+    )
+
+
 def _same_identity(left: _PathIdentity, right: _PathIdentity, *, directory: bool) -> bool:
     if directory:
         return (
@@ -314,7 +484,7 @@ def _path_identity(path: Path, *, directory: bool | None = None) -> _PathIdentit
     return _PathIdentity.from_stat(info)
 
 
-def _read_posix_bounded(path: Path, limit: int) -> bytes:
+def _read_posix_bounded_file(path: Path, limit: int) -> _BoundedFile:
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     non_blocking = getattr(os, "O_NONBLOCK", 0)
     close_on_exec = getattr(os, "O_CLOEXEC", 0)
@@ -354,7 +524,7 @@ def _read_posix_bounded(path: Path, limit: int) -> bytes:
                 f"Machine bootstrap state changed during its bounded read: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
             )
-        return raw
+        return _BoundedFile(raw, _PathIdentity.from_stat(info))
     except OrchestrateError:
         raise
     except OSError as exc:
@@ -370,7 +540,7 @@ def _read_posix_bounded(path: Path, limit: int) -> bytes:
                 pass
 
 
-def _read_windows_bounded(path: Path, limit: int) -> bytes:
+def _read_windows_bounded_file(path: Path, limit: int) -> _BoundedFile:
     """Read one exact non-reparse Windows file through its pinned handle."""
 
     import ctypes
@@ -406,9 +576,6 @@ def _read_windows_bounded(path: Path, limit: int) -> bytes:
     get_info = kernel32.GetFileInformationByHandleEx
     get_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
     get_info.restype = wintypes.BOOL
-    get_final_path = kernel32.GetFinalPathNameByHandleW
-    get_final_path.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
-    get_final_path.restype = wintypes.DWORD
     get_size = kernel32.GetFileSizeEx
     get_size.argtypes = (wintypes.HANDLE, ctypes.POINTER(ctypes.c_longlong))
     get_size.restype = wintypes.BOOL
@@ -436,9 +603,25 @@ def _read_windows_bounded(path: Path, limit: int) -> bytes:
             f"Machine bootstrap state cannot be opened safely: {path.name}",
             code="machine_bootstrap_safe_io_unavailable",
         )
+    descriptor: int | None = None
     try:
+        import msvcrt
+
+        descriptor = msvcrt.open_osfhandle(
+            handle,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+        handle = None
+        opened_info = os.stat(descriptor)
+        linked_info = os.stat(path, follow_symlinks=False)
+        if not _opened_file_identity_matches(opened_info, linked_info):
+            raise OrchestrateError(
+                f"Machine bootstrap state changed while its handle identity was proved: {path.name}",
+                code="machine_bootstrap_safe_io_unavailable",
+            )
         tag = FileAttributeTagInfo()
-        if not get_info(handle, file_attribute_tag_info_class, ctypes.byref(tag), ctypes.sizeof(tag)):
+        raw_handle = msvcrt.get_osfhandle(descriptor)
+        if not get_info(raw_handle, file_attribute_tag_info_class, ctypes.byref(tag), ctypes.sizeof(tag)):
             raise OrchestrateError(
                 f"Machine bootstrap state identity is unavailable: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
@@ -448,31 +631,8 @@ def _read_windows_bounded(path: Path, limit: int) -> bytes:
                 f"Machine bootstrap refuses a redirected or non-file state entry: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
             )
-        needed = get_final_path(handle, None, 0, 0)
-        if not needed:
-            raise OrchestrateError(
-                f"Machine bootstrap state identity is unavailable: {path.name}",
-                code="machine_bootstrap_safe_io_unavailable",
-            )
-        buffer = ctypes.create_unicode_buffer(needed + 1)
-        written = get_final_path(handle, buffer, len(buffer), 0)
-        if not written or written >= len(buffer):
-            raise OrchestrateError(
-                f"Machine bootstrap state identity is unavailable: {path.name}",
-                code="machine_bootstrap_safe_io_unavailable",
-            )
-        opened = buffer.value
-        if opened.startswith("\\\\?\\UNC\\"):
-            opened = "\\\\" + opened[8:]
-        elif opened.startswith("\\\\?\\"):
-            opened = opened[4:]
-        if os.path.normcase(os.path.abspath(opened)) != os.path.normcase(os.path.abspath(path)):
-            raise OrchestrateError(
-                f"Machine bootstrap state did not preserve its exact path identity: {path.name}",
-                code="machine_bootstrap_safe_io_unavailable",
-            )
         size = ctypes.c_longlong()
-        if not get_size(handle, ctypes.byref(size)) or size.value < 0 or size.value > limit:
+        if not get_size(raw_handle, ctypes.byref(size)) or size.value < 0 or size.value > limit:
             raise OrchestrateError(
                 f"Machine bootstrap state exceeds or lacks its bounded size: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
@@ -482,7 +642,7 @@ def _read_windows_bounded(path: Path, limit: int) -> bytes:
             amount = min(64 * 1024, limit + 1 - len(raw))
             chunk = ctypes.create_string_buffer(amount)
             received = wintypes.DWORD()
-            if not read_file(handle, chunk, amount, ctypes.byref(received), None):
+            if not read_file(raw_handle, chunk, amount, ctypes.byref(received), None):
                 raise OrchestrateError(
                     f"Machine bootstrap state cannot be read: {path.name}",
                     code="machine_bootstrap_safe_io_unavailable",
@@ -495,15 +655,22 @@ def _read_windows_bounded(path: Path, limit: int) -> bytes:
                 f"Machine bootstrap state changed during its bounded read: {path.name}",
                 code="machine_bootstrap_safe_io_unavailable",
             )
-        return bytes(raw)
+        return _BoundedFile(bytes(raw), _PathIdentity.from_stat(opened_info))
     finally:
-        close_handle(handle)
+        if descriptor is not None:
+            os.close(descriptor)
+        elif handle not in (None, ctypes.c_void_p(-1).value):
+            close_handle(handle)
+
+
+def _read_bounded_regular_file(path: Path, limit: int) -> _BoundedFile:
+    if sys.platform == "win32":
+        return _read_windows_bounded_file(path, limit)
+    return _read_posix_bounded_file(path, limit)
 
 
 def _read_bounded_regular(path: Path, limit: int) -> bytes:
-    if sys.platform == "win32":
-        return _read_windows_bounded(path, limit)
-    return _read_posix_bounded(path, limit)
+    return _read_bounded_regular_file(path, limit).raw
 
 
 def _shim_matches(path: Path, expected: str) -> bool:
@@ -563,6 +730,84 @@ def _decode_pyvenv_config(raw: bytes) -> tuple[str, str]:
     return home, version
 
 
+def _open_windows_path_pin(path: Path, *, directory: bool) -> object:
+    """Hold a non-reparse node without write/delete sharing until bootstrap ends."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    file_read_attributes = 0x0080
+    share_read = 0x00000001
+    open_existing = 3
+    open_reparse_point = 0x00200000
+    backup_semantics = 0x02000000
+    file_attribute_reparse_point = 0x00000400
+    file_attribute_directory = 0x00000010
+    file_attribute_tag_info_class = 9
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    get_info = kernel32.GetFileInformationByHandleEx
+    get_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    get_info.restype = wintypes.BOOL
+    flags = open_reparse_point | (backup_semantics if directory else 0)
+    handle = create_file(
+        os.fspath(path),
+        file_read_attributes,
+        share_read,
+        None,
+        open_existing,
+        flags,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise OrchestrateError(
+            "The dedicated environment could not pin its Windows path identity",
+            code="machine_bootstrap_venv_identity_unproven",
+            data={"path": path.name},
+        )
+    tag = FileAttributeTagInfo()
+    if not get_info(handle, file_attribute_tag_info_class, ctypes.byref(tag), ctypes.sizeof(tag)):
+        _close_windows_path_pin(handle)
+        raise OrchestrateError(
+            "The dedicated environment could not inspect its pinned Windows path identity",
+            code="machine_bootstrap_venv_identity_unproven",
+            data={"path": path.name},
+        )
+    actual_directory = bool(tag.FileAttributes & file_attribute_directory)
+    if tag.FileAttributes & file_attribute_reparse_point or actual_directory != directory:
+        _close_windows_path_pin(handle)
+        raise OrchestrateError(
+            "The dedicated environment contains a redirected or unexpected Windows node",
+            code="machine_bootstrap_venv_identity_unproven",
+            data={"path": path.name},
+        )
+    return handle
+
+
+def _close_windows_path_pin(handle: object) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    close_handle(handle)
+
+
 class _VenvBinding(AbstractContextManager["_VenvBinding"]):
     """Pin and repeatedly prove the dedicated interpreter before every effect."""
 
@@ -571,7 +816,8 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
         self.config_path = layout.venv_root / "pyvenv.cfg"
         self.python_path = layout.scripts_root / "python.exe"
         self._identities: dict[Path, _PathIdentity] = {}
-        self._descriptors: list[int] = []
+        self._descriptors: dict[Path, int] = {}
+        self._windows_handles: list[object] = []
         nodes = (
             (layout.install_root, True),
             (layout.venv_root, True),
@@ -582,7 +828,11 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
         try:
             for path, directory in nodes:
                 self._identities[path] = _path_identity(path, directory=directory)
-                if sys.platform != "win32":
+                if sys.platform == "win32":
+                    self._windows_handles.append(
+                        _open_windows_path_pin(path, directory=directory)
+                    )
+                else:
                     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
                     if directory:
                         flags |= getattr(os, "O_DIRECTORY", 0)
@@ -599,20 +849,12 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
                             "The dedicated environment changed while its physical identity was being pinned",
                             code="machine_bootstrap_venv_identity_unproven",
                         )
-                    self._descriptors.append(descriptor)
+                    self._descriptors[path] = descriptor
             self.config_raw = _read_bounded_regular(self.config_path, MAX_PYVENV_CONFIG_BYTES)
             self.home, self.version = _decode_pyvenv_config(self.config_raw)
             self.config_digest = hashlib.sha256(self.config_raw).hexdigest()
             self.root_resolved = os.fspath(layout.venv_root.resolve(strict=True))
             self.python_resolved = os.fspath(self.python_path.resolve(strict=True))
-            if sys.platform == "win32":
-                if not _same_path(self.root_resolved, os.path.abspath(layout.venv_root)) or not _same_path(
-                    self.python_resolved, os.path.abspath(self.python_path)
-                ):
-                    raise OrchestrateError(
-                        "The dedicated environment resolves outside its exact configured path",
-                        code="machine_bootstrap_venv_identity_unproven",
-                    )
         except BaseException:
             self.close()
             raise
@@ -630,38 +872,96 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
                 "The dedicated environment configuration changed after identity verification",
                 code="machine_bootstrap_venv_identity_changed",
             )
-        if not _same_path(self.root_resolved, self.layout.venv_root.resolve(strict=True)) or not _same_path(
-            self.python_resolved, self.python_path.resolve(strict=True)
-        ):
-            raise OrchestrateError(
-                "The dedicated environment resolved identity changed during bootstrap",
-                code="machine_bootstrap_venv_identity_changed",
-            )
+        # Path spellings are not identity evidence on Windows (short/long
+        # aliases and case can differ).  The comparisons above use file IDs,
+        # while retained Windows handles also deny write/delete replacement.
 
     def receipt_value(self) -> dict[str, object]:
+        command = _command_proof(self.layout.command_path)
         return {
             "schema": INSTALL_RECEIPT_SCHEMA,
             "sourceRoot": os.fspath(self.layout.source_root.resolve()),
             "venvRoot": self.root_resolved,
             "pythonPath": self.python_resolved,
             "pyvenvConfigSha256": f"sha256:{self.config_digest}",
+            "commandDevice": command.identity.device,
+            "commandInode": command.identity.inode,
+            "commandSize": command.identity.size,
+            "commandSha256": f"sha256:{hashlib.sha256(command.raw).hexdigest()}",
         }
 
+    def runner_kwargs(self) -> dict[str, object]:
+        if sys.platform == "win32":
+            # The retained no-write/no-delete handles on the complete parent
+            # chain make this pathname resolve to the pinned interpreter.
+            return {}
+        descriptor = self._descriptors[self.python_path]
+        executable = f"/proc/self/fd/{descriptor}"
+        if not os.path.exists(executable):
+            raise OrchestrateError(
+                "This host cannot execute the dedicated interpreter through its pinned descriptor",
+                code="machine_bootstrap_venv_identity_unproven",
+            )
+        return {"executable": executable, "pass_fds": (descriptor,)}
+
     def close(self) -> None:
-        for descriptor in reversed(self._descriptors):
+        for descriptor in reversed(tuple(self._descriptors.values())):
             try:
                 os.close(descriptor)
             except OSError:
                 pass
         self._descriptors.clear()
+        for handle in reversed(self._windows_handles):
+            _close_windows_path_pin(handle)
+        self._windows_handles.clear()
 
     def __exit__(self, *_: object) -> None:
         self.close()
 
 
 def _install_receipt_matches(layout: MachineLayout, binding: _VenvBinding) -> bool:
-    value = _read_install_receipt(layout)
-    return value == binding.receipt_value()
+    try:
+        value = _read_install_receipt(layout)
+        if not isinstance(value, dict) or set(value) != {
+            "schema",
+            "sourceRoot",
+            "venvRoot",
+            "pythonPath",
+            "pyvenvConfigSha256",
+            "commandDevice",
+            "commandInode",
+            "commandSize",
+            "commandSha256",
+        }:
+            return False
+        if any(
+            not isinstance(value.get(key), str)
+            for key in (
+                "schema",
+                "sourceRoot",
+                "venvRoot",
+                "pythonPath",
+                "pyvenvConfigSha256",
+                "commandSha256",
+            )
+        ) or any(
+            type(value.get(key)) is not int or value[key] < 0
+            for key in ("commandDevice", "commandInode", "commandSize")
+        ):
+            return False
+        return value == binding.receipt_value()
+    except OrchestrateError:
+        return False
+
+
+def _command_proof(path: Path) -> _BoundedFile:
+    opened = _read_bounded_regular_file(path, MAX_COMMAND_BYTES)
+    if opened.identity.links != 1:
+        raise OrchestrateError(
+            "The installed orchestrate command is not a single owned file",
+            code="machine_bootstrap_command_identity_unproven",
+        )
+    return opened
 
 
 def _read_install_receipt(layout: MachineLayout) -> object | None:
@@ -677,24 +977,6 @@ def _read_install_receipt(layout: MachineLayout) -> object | None:
         return None
     canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     return value if raw_bytes == canonical else None
-
-
-def _install_receipt_is_owned(layout: MachineLayout) -> bool:
-    value = _read_install_receipt(layout)
-    if not isinstance(value, dict):
-        return False
-    if value.get("schema") == "orchestrate-machine-install/v1":
-        return set(value) == {"schema", "sourceRoot"} and isinstance(value.get("sourceRoot"), str)
-    return value.get("schema") == INSTALL_RECEIPT_SCHEMA and set(value) == {
-        "schema",
-        "sourceRoot",
-        "venvRoot",
-        "pythonPath",
-        "pyvenvConfigSha256",
-    } and all(
-        isinstance(value.get(key), str)
-        for key in ("sourceRoot", "venvRoot", "pythonPath", "pyvenvConfigSha256")
-    )
 
 
 def _target_identity(path: Path) -> _PathIdentity | None:
@@ -723,6 +1005,11 @@ def _atomic_write_owned(
     expected_target: _PathIdentity | None,
 ) -> None:
     _path_identity(path.parent, directory=True)
+    if expected_target is not None:
+        raise OrchestrateError(
+            f"Machine bootstrap refuses to overwrite the existing target: {path.name}",
+            code="machine_bootstrap_target_identity_unproven",
+        )
     if _target_identity(path) != expected_target:
         raise OrchestrateError(
             f"Machine bootstrap target changed before staging: {path.name}",
@@ -767,13 +1054,9 @@ def _atomic_write_owned(
                 f"Machine bootstrap target changed before atomic replacement: {path.name}",
                 code="machine_bootstrap_target_identity_changed",
             )
-        if expected_target is None:
-            os.link(temporary_name, os.fspath(path), follow_symlinks=False)
-            os.unlink(temporary_name)
-            temporary_name = None
-        else:
-            os.replace(temporary_name, os.fspath(path))
-            temporary_name = None
+        os.link(temporary_name, os.fspath(path), follow_symlinks=False)
+        os.unlink(temporary_name)
+        temporary_name = None
     finally:
         if descriptor is not None:
             try:
@@ -838,9 +1121,21 @@ def machine_ready(
         return False
 
 
-def _run_step(runner: Runner, argv: Sequence[str], *, phase: str) -> None:
+def _run_step(
+    runner: Runner,
+    argv: Sequence[str],
+    *,
+    phase: str,
+    runner_kwargs: Mapping[str, object] | None = None,
+) -> None:
     try:
-        completed = runner(tuple(argv), check=False, capture_output=True, text=True)
+        completed = runner(
+            tuple(argv),
+            check=False,
+            capture_output=True,
+            text=True,
+            **({} if runner_kwargs is None else runner_kwargs),
+        )
     except OSError as exc:
         raise OrchestrateError(
             f"Machine bootstrap could not start its {phase} step; correct the reported OS error and rerun setup",
@@ -864,6 +1159,11 @@ def _write_shim(
 ) -> bool:
     if _shim_matches(path, text):
         return False
+    if expected_target is not None:
+        raise OrchestrateError(
+            f"Machine bootstrap refuses to overwrite the unrecognized launcher {path.name}; move it aside after inspection and rerun setup",
+            code="machine_bootstrap_shim_identity_unproven",
+        )
     try:
         _atomic_write_owned(
             path,
@@ -934,7 +1234,12 @@ def _run_bound_step(
     phase: str,
 ) -> None:
     binding.verify()
-    _run_step(runner, argv, phase=phase)
+    _run_step(
+        runner,
+        argv,
+        phase=phase,
+        runner_kwargs=binding.runner_kwargs(),
+    )
     binding.verify()
 
 
@@ -1018,17 +1323,22 @@ def ensure_machine(
         with _VenvBinding(selected_layout) as binding:
             receipt_target = _target_identity(selected_layout.install_receipt)
             receipt_matches = _install_receipt_matches(selected_layout, binding)
-            receipt_owned = receipt_target is None or _install_receipt_is_owned(selected_layout)
             if receipt_target != _target_identity(selected_layout.install_receipt):
                 raise OrchestrateError(
                     "The machine-install receipt changed during ownership verification",
                     code="machine_bootstrap_receipt_identity_changed",
                 )
-            if not _owned_file_exists(selected_layout.command_path) or not receipt_matches:
-                if not receipt_owned:
+            command_target = _target_identity(selected_layout.command_path)
+            if not receipt_matches:
+                if receipt_target is not None:
                     raise OrchestrateError(
-                        "The existing machine-install receipt is not a proven orchestrate entry; move it aside after inspection and rerun setup",
+                        "The existing machine-install receipt does not prove the current command; move it aside after inspection and rerun setup",
                         code="machine_bootstrap_receipt_identity_unproven",
+                    )
+                if command_target is not None:
+                    raise OrchestrateError(
+                        "The existing command has no matching machine-install receipt; move it aside after inspection and rerun setup",
+                        code="machine_bootstrap_command_identity_unproven",
                     )
                 _require_source_checkout(selected_layout)
                 _run_bound_step(

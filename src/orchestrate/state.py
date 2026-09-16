@@ -328,7 +328,13 @@ class RunLock(AbstractContextManager["RunLock"]):
 
     def __enter__(self) -> "RunLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_APPEND
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         descriptor: int | None = None
         try:
             descriptor = os.open(os.fspath(self.path), flags, 0o600)
@@ -347,18 +353,21 @@ class RunLock(AbstractContextManager["RunLock"]):
                     code=self.contention_code,
                     data={"lock": self.path.name},
                 )
-            self._file = os.fdopen(descriptor, "r+b", buffering=0)
+            # Preserve the original append-mode initialization discipline.  On
+            # Windows a contender must never write through the byte-zero lock
+            # before msvcrt.locking has had a chance to report contention.
+            self._file = os.fdopen(descriptor, "a+b", buffering=0)
             descriptor = None
         except BaseException:
             if descriptor is not None:
                 os.close(descriptor)
             raise
-        self._file.seek(0)
-        if self._file.tell() == 0:
-            self._file.write(b"0")
-            self._file.flush()
         deadline = time.monotonic() + self.timeout_seconds
         try:
+            self._file.seek(0)
+            if self._file.tell() == 0:
+                self._file.write(b"0")
+                self._file.flush()
             while True:
                 try:
                     self._acquire()

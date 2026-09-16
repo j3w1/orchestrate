@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,7 +23,11 @@ from orchestrate.machine_bootstrap import (
     MachineBootstrapResult,
     RegistryUserPathStore,
     UserPathValue,
+    _atomic_write_owned,
     _install_receipt_matches,
+    _opened_file_identity_matches,
+    _run_bound_step,
+    _target_identity,
     _VenvBinding,
     _windows_shim_text,
     _wsl_shim_text,
@@ -97,14 +102,19 @@ def install_ready_files(layout: MachineLayout) -> None:
     config = write_pyvenv_config(layout)
     (layout.scripts_root / "python.exe").write_bytes(b"fixture")
     layout.command_path.write_bytes(b"fixture")
+    command_info = layout.command_path.stat()
     layout.install_receipt.write_text(
         json.dumps(
             {
-                "schema": "orchestrate-machine-install/v2",
+                "schema": "orchestrate-machine-install/v3",
                 "sourceRoot": str(layout.source_root.resolve()),
                 "venvRoot": str(layout.venv_root.resolve()),
                 "pythonPath": str((layout.scripts_root / "python.exe").resolve()),
                 "pyvenvConfigSha256": f"sha256:{hashlib.sha256(config).hexdigest()}",
+                "commandDevice": command_info.st_dev,
+                "commandInode": command_info.st_ino,
+                "commandSize": command_info.st_size,
+                "commandSha256": f"sha256:{hashlib.sha256(b'fixture').hexdigest()}",
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -149,6 +159,14 @@ def resolving(layout: MachineLayout, store: FakeUserPath):
 
 
 class MachineBootstrapTests(unittest.TestCase):
+    def test_windows_alias_identity_is_handle_based_not_spelling_based(self) -> None:
+        opened = SimpleNamespace(st_dev=7, st_ino=99, st_mode=0o100600)
+        same_file_through_alias = SimpleNamespace(st_dev=7, st_ino=99, st_mode=0o100444)
+        different_file = SimpleNamespace(st_dev=7, st_ino=100, st_mode=0o100600)
+
+        self.assertTrue(_opened_file_identity_matches(opened, same_file_through_alias))
+        self.assertFalse(_opened_file_identity_matches(opened, different_file))
+
     def test_healthy_fast_path_is_one_read_silent_and_effect_free(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             layout = fixture_layout(Path(directory))
@@ -279,6 +297,56 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(held.exception.code, "machine_bootstrap_venv_identity_changed")
             self.assertEqual(len(calls), 1)
 
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "requires descriptor execution")
+    def test_bound_step_executes_the_pinned_interpreter_across_path_substitution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            layout.scripts_root.mkdir(parents=True)
+            write_pyvenv_config(layout)
+            shutil.copy2(sys.executable, layout.scripts_root / "python.exe")
+            backup = layout.scripts_root / "python.original"
+            marker = layout.install_root / "external-ran"
+
+            def swapping_runner(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[object]:
+                os.replace(layout.scripts_root / "python.exe", backup)
+                (layout.scripts_root / "python.exe").write_text(
+                    f"#!/bin/sh\nprintf external > '{marker}'\n",
+                    encoding="utf-8",
+                )
+                os.chmod(layout.scripts_root / "python.exe", 0o755)
+                try:
+                    return subprocess.run(argv, **kwargs)
+                finally:
+                    (layout.scripts_root / "python.exe").unlink()
+                    os.replace(backup, layout.scripts_root / "python.exe")
+
+            with _VenvBinding(layout) as binding:
+                _run_bound_step(
+                    binding,
+                    swapping_runner,
+                    (os.fspath(binding.python_path), "-c", "raise SystemExit(0)"),
+                    phase="pinned interpreter probe",
+                )
+
+            self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows sharing semantics")
+    def test_windows_binding_denies_interpreter_replacement_while_effects_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            layout.scripts_root.mkdir(parents=True)
+            write_pyvenv_config(layout)
+            shutil.copy2(sys.executable, layout.scripts_root / "python.exe")
+
+            with _VenvBinding(layout):
+                with self.assertRaises(OSError):
+                    os.replace(
+                        layout.scripts_root / "python.exe",
+                        layout.scripts_root / "python.replaced",
+                    )
+
+            self.assertTrue((layout.scripts_root / "python.exe").is_file())
+
     @unittest.skipIf(
         sys.platform == "win32",
         "POSIX symlink victim probe; Windows staging uses the same exclusive random-name path",
@@ -301,18 +369,71 @@ class MachineBootstrapTests(unittest.TestCase):
             (layout.bin_root / "orchestrate.cmd.tmp").symlink_to(shim_victim)
             store = FakeUserPath()
 
-            result = ensure_machine(
-                layout=layout,
-                path_store=store,
-                resolver=resolving(layout, store),
-                runner=SyntheticInstaller(layout),
-                platform="win32",
-                version_info=(3, 13),
-            )
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=store,
+                    resolver=resolving(layout, store),
+                    runner=SyntheticInstaller(layout),
+                    platform="win32",
+                    version_info=(3, 13),
+                )
 
-            self.assertEqual(result.state, "repaired")
+            self.assertEqual(held.exception.code, "machine_bootstrap_receipt_identity_unproven")
             self.assertEqual(receipt_victim.read_text(encoding="utf-8"), "receipt-safe")
             self.assertEqual(shim_victim.read_text(encoding="utf-8"), "shim-safe")
+
+    def test_missing_target_commit_preserves_an_interfering_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "install.json"
+            fault = ResolvedPathFault(target)
+            real_link = os.link
+
+            def interfering_link(source: str, destination: str, *, follow_symlinks: bool = True) -> None:
+                if fault.matches(destination):
+                    target.write_bytes(b"unrelated-owner-data")
+                real_link(source, destination, follow_symlinks=follow_symlinks)
+
+            with patch("orchestrate.machine_bootstrap.os.link", interfering_link):
+                with self.assertRaises(FileExistsError):
+                    _atomic_write_owned(
+                        target,
+                        b"receipt",
+                        executable=False,
+                        expected_target=None,
+                    )
+
+            self.assertEqual(fault.interceptions, 1)
+            self.assertEqual(target.read_bytes(), b"unrelated-owner-data")
+
+    def test_existing_target_is_refused_before_replace_can_displace_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "install.json"
+            target.write_bytes(b"recognized-old-receipt")
+            expected = _target_identity(target)
+            fault = ResolvedPathFault(target)
+            replace_calls: list[tuple[str, str]] = []
+            real_replace = os.replace
+
+            def racing_replace(source: str, destination: str) -> None:
+                replace_calls.append((source, destination))
+                if fault.matches(destination):
+                    target.write_bytes(b"unrelated-owner-data")
+                real_replace(source, destination)
+
+            with patch("orchestrate.machine_bootstrap.os.replace", racing_replace):
+                with self.assertRaises(OrchestrateError) as held:
+                    _atomic_write_owned(
+                        target,
+                        b"new-receipt",
+                        executable=False,
+                        expected_target=expected,
+                    )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_target_identity_unproven")
+            self.assertEqual(replace_calls, [])
+            self.assertEqual(fault.interceptions, 0)
+            self.assertEqual(target.read_bytes(), b"recognized-old-receipt")
 
     def test_receipt_replacement_is_bounded_on_the_opened_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -437,16 +558,22 @@ class MachineBootstrapTests(unittest.TestCase):
         winreg.CreateKeyEx = lambda *_: Key()  # type: ignore[attr-defined]
         winreg.QueryValueEx = lambda *_: (state["value"], state["kind"])  # type: ignore[attr-defined]
 
-        def set_value(*args: object) -> None:
-            state["kind"] = args[-2]
-            state["value"] = args[-1]
-
-        winreg.SetValueEx = set_value  # type: ignore[attr-defined]
         entry = Path(r"C:\orchestrate\bin")
+
+        def transactional_replace(expected: UserPathValue, value: str) -> None:
+            self.assertEqual(UserPathValue(state["value"], state["kind"]), expected)
+            state["kind"] = expected.kind
+            state["value"] = value
+
         with patch.dict(sys.modules, {"winreg": winreg}), patch(
             "orchestrate.machine_bootstrap.sys.platform", "win32"
         ), patch("ctypes.windll", create=True):
-            self.assertTrue(register_user_path(RegistryUserPathStore(), entry))
+            self.assertTrue(
+                register_user_path(
+                    RegistryUserPathStore(transactional_replace=transactional_replace),
+                    entry,
+                )
+            )
 
         self.assertEqual(state["kind"], winreg.REG_SZ)  # type: ignore[attr-defined]
         self.assertEqual(state["value"], f"{entry};;%UNCHANGED%;C:\\odd spelling\\;")
@@ -465,6 +592,37 @@ class MachineBootstrapTests(unittest.TestCase):
         self.assertEqual(held.exception.code, "machine_bootstrap_path_changed")
         self.assertEqual(store.value, r"C:\\one;C:\\new-unrelated")
         self.assertEqual(store.writes, [])
+
+    def test_registry_transaction_interference_preserves_unrelated_bytes(self) -> None:
+        winreg = ModuleType("winreg")
+        winreg.HKEY_CURRENT_USER = object()  # type: ignore[attr-defined]
+        winreg.REG_SZ = 1  # type: ignore[attr-defined]
+        winreg.REG_EXPAND_SZ = 2  # type: ignore[attr-defined]
+        state = {"value": r"C:\one", "kind": 1}
+
+        class Key:
+            def __enter__(self) -> Key:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+        winreg.OpenKey = lambda *_: Key()  # type: ignore[attr-defined]
+        winreg.QueryValueEx = lambda *_: (state["value"], state["kind"])  # type: ignore[attr-defined]
+
+        def conflicted(_: UserPathValue, __: str) -> None:
+            state["value"] += r";C:\external"
+            raise OrchestrateError("synthetic transaction conflict", code="machine_bootstrap_path_changed")
+
+        store = RegistryUserPathStore(transactional_replace=conflicted)
+        with patch.dict(sys.modules, {"winreg": winreg}), patch(
+            "orchestrate.machine_bootstrap.sys.platform", "win32"
+        ):
+            with self.assertRaises(OrchestrateError) as held:
+                register_user_path(store, Path(r"C:\orchestrate\bin"))
+
+        self.assertEqual(held.exception.code, "machine_bootstrap_path_changed")
+        self.assertEqual(state["value"], r"C:\one;C:\external")
 
     def test_existing_environment_repairs_launchers_without_reinstall(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -540,6 +698,17 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertFalse(layout.install_receipt.exists())
 
             runner = SyntheticInstaller(layout)
+            with self.assertRaises(OrchestrateError) as blocked:
+                ensure_machine(
+                    layout=layout,
+                    path_store=store,
+                    resolver=resolving(layout, store),
+                    runner=runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+            self.assertEqual(blocked.exception.code, "machine_bootstrap_command_identity_unproven")
+            layout.command_path.unlink()
             result = ensure_machine(
                 layout=layout,
                 path_store=store,
@@ -551,6 +720,46 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(result.state, "repaired")
             self.assertTrue(any("--editable" in call for call in runner.calls))
             self.assertTrue(layout.install_receipt.exists())
+
+    def test_fast_path_rejects_a_poisoned_installed_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            install_ready_files(layout)
+            layout.command_path.write_bytes(b"poisoned-command")
+            store = FakeUserPath(str(layout.bin_root))
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=store,
+                    resolver=resolving(layout, store),
+                    runner=SyntheticInstaller(layout),
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_receipt_identity_unproven")
+            self.assertEqual(layout.command_path.read_bytes(), b"poisoned-command")
+
+    def test_unrecognized_launcher_is_refused_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            install_ready_files(layout)
+            layout.windows_shim.write_bytes(b"unrelated-owner-data")
+            store = FakeUserPath()
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=store,
+                    resolver=resolving(layout, store),
+                    runner=SyntheticInstaller(layout),
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_shim_identity_unproven")
+            self.assertEqual(layout.windows_shim.read_bytes(), b"unrelated-owner-data")
 
     def test_duplicate_key_install_receipt_cannot_skip_reinstallation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
