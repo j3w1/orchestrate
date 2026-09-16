@@ -6,6 +6,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import sys
@@ -29,8 +30,10 @@ from orchestrate.machine_bootstrap import (
     _atomic_write_owned,
     _build_source_archive,
     _commit_staged_no_replace,
+    _ensure_install_parent,
     _install_receipt_matches,
     _NATIVE_WIN32_PROVIDER,
+    _SIMULATED_WIN32_PROVIDER,
     _opened_file_identity_matches,
     _read_bounded_regular_file,
     _receipt_value,
@@ -814,6 +817,112 @@ class MachineBootstrapTests(unittest.TestCase):
                 any(call[1:4] == ("-m", "pip", "install") and "--upgrade" not in call for call in runner.calls)
             )
 
+    def test_retained_archive_writer_models_windows_share_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "stage.zip"
+            descriptor = _SIMULATED_WIN32_PROVIDER.open_staging_file(
+                target,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            try:
+                with self.assertRaises(PermissionError):
+                    _SIMULATED_WIN32_PROVIDER.open_path_pin(
+                        target,
+                        directory=False,
+                    )
+                bridge = _SIMULATED_WIN32_PROVIDER.open_path_pin(
+                    target,
+                    directory=False,
+                    allow_write_share=True,
+                )
+                _SIMULATED_WIN32_PROVIDER.close_path_pin(bridge)
+            finally:
+                _SIMULATED_WIN32_PROVIDER.close_staging_file(descriptor)
+
+    def test_same_inode_archive_change_between_commit_and_binding_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            runner = SyntheticInstaller(layout)
+            real_write = _atomic_write_owned
+            changed = False
+
+            def change_after_commit(path: Path, raw: bytes, **kwargs: object):
+                nonlocal changed
+                retained = real_write(path, raw, **kwargs)
+                if kwargs.get("retain_descriptor") and path == layout.source_archive:
+                    changed = True
+                    with path.open("r+b") as stream:
+                        stream.seek(0)
+                        stream.write(b"not-the-reviewed-archive")
+                        stream.truncate()
+                return retained
+
+            with patch(
+                "orchestrate.machine_bootstrap._atomic_write_owned",
+                side_effect=change_after_commit,
+            ):
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        layout=layout,
+                        path_store=FakeUserPath(),
+                        resolver=lambda *_: None,
+                        runner=runner,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
+
+            self.assertTrue(changed)
+            self.assertEqual(held.exception.code, "machine_bootstrap_source_identity_changed")
+            self.assertEqual(
+                held.exception.data["component"],
+                "sourceArchive.stageToBindingSha256",
+            )
+            self.assertFalse(layout.install_receipt.exists())
+
+    def test_same_inode_archive_change_during_effect_is_detected_and_not_consumed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            delegate = SyntheticInstaller(layout)
+            original_call = delegate.__call__
+            observed: list[bytes] = []
+
+            def transient_archive(
+                argv: tuple[str, ...], **kwargs: object
+            ) -> subprocess.CompletedProcess[object]:
+                if argv[1:4] == ("-m", "pip", "install") and "--upgrade" not in argv:
+                    original = layout.source_archive.read_bytes()
+                    timestamps = layout.source_archive.stat()
+                    attacker = io.BytesIO()
+                    with zipfile.ZipFile(attacker, "w") as archive:
+                        archive.writestr(
+                            "pyproject.toml",
+                            b"[project]\nname='attacker'\n",
+                        )
+                    layout.source_archive.write_bytes(attacker.getvalue())
+                    with zipfile.ZipFile(argv[-1]) as archive:
+                        observed.append(archive.read("pyproject.toml"))
+                    layout.source_archive.write_bytes(original)
+                    os.utime(
+                        layout.source_archive,
+                        ns=(timestamps.st_atime_ns, timestamps.st_mtime_ns),
+                    )
+                return original_call(argv, **kwargs)
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=FakeUserPath(),
+                    resolver=lambda *_: None,
+                    runner=transient_archive,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(observed, [b"[project]\nname='fixture'\n"])
+            self.assertEqual(held.exception.code, "machine_bootstrap_source_identity_changed")
+            self.assertFalse(layout.install_receipt.exists())
+
     def test_archive_rejects_bytes_not_causally_bound_to_reviewed_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             layout = fixture_layout(Path(directory))
@@ -939,6 +1048,75 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(held.exception.code, "machine_bootstrap_venv_identity_changed")
             self.assertEqual(held.exception.data["component"], "venvDescendant.deniedRedirect")
             self.assertEqual(list(unrelated.iterdir()), [])
+
+    def test_venv_creation_refuses_redirects_at_randomized_arbitrary_depths(self) -> None:
+        generator = random.Random(761338)
+        for iteration in range(3):
+            with self.subTest(iteration=iteration), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                layout = fixture_layout(root)
+                unrelated = root / "unrelated"
+                unrelated.mkdir()
+                depth = generator.randint(3, 9)
+                relative = Path("Lib") / "site-packages" / "pip"
+                for index in range(depth):
+                    relative /= f"layer-{iteration}-{index}"
+                redirect = layout.venv_root / relative
+
+                def redirecting_runner(
+                    argv: tuple[str, ...], **_: object
+                ) -> subprocess.CompletedProcess[object]:
+                    if argv[1:3] == ("-m", "venv"):
+                        redirect.parent.mkdir(parents=True, exist_ok=True)
+                        redirect.symlink_to(unrelated, target_is_directory=True)
+                        (redirect / "escaped.py").write_bytes(b"outside")
+                    return subprocess.CompletedProcess(argv, 0)
+
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        layout=layout,
+                        path_store=FakeUserPath(),
+                        resolver=lambda *_: None,
+                        runner=redirecting_runner,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
+
+                self.assertEqual(held.exception.code, "machine_bootstrap_venv_identity_changed")
+                self.assertEqual(held.exception.data["component"], "venvTree.deniedRedirect")
+                self.assertEqual(list(unrelated.iterdir()), [])
+
+    def test_ancestry_creation_never_follows_a_replaced_earlier_component(self) -> None:
+        generator = random.Random(771339)
+        for iteration in range(3):
+            with self.subTest(iteration=iteration), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                retained = root / "retained"
+                retained.mkdir()
+                outside = root / "outside"
+                outside.mkdir()
+                components = [f"level-{iteration}-{index}" for index in range(generator.randint(3, 8))]
+                target = retained.joinpath(*components)
+                displaced = root / f"displaced-{iteration}"
+                intercepted = False
+
+                def replace_ancestor(parent: Path, child: Path) -> None:
+                    nonlocal intercepted
+                    if intercepted or child.name != components[1]:
+                        return
+                    intercepted = True
+                    os.replace(retained, displaced)
+                    retained.symlink_to(outside, target_is_directory=True)
+
+                with patch(
+                    "orchestrate.machine_bootstrap._before_directory_component_create",
+                    side_effect=replace_ancestor,
+                ):
+                    with self.assertRaises(OrchestrateError):
+                        _ensure_install_parent(target)
+
+                self.assertTrue(intercepted)
+                self.assertEqual(list(outside.iterdir()), [])
 
     def test_redirected_install_ancestry_is_refused_before_any_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

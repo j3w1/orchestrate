@@ -9,7 +9,7 @@ PATH, registry, or Python installation.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 import errno
 import hashlib
@@ -22,6 +22,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import threading
 import zipfile
 import io
 from typing import Protocol
@@ -44,6 +46,7 @@ MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_ARCHIVE_BYTES = 72 * 1024 * 1024
 MACHINE_LOCK_NAME = ".machine-bootstrap.lock"
 SIMULATED_WIN32_PROVIDER_ENV = "ORCHESTRATE_BOOTSTRAP_PROVIDER"
+_SIMULATED_EFFECT_GUARD = threading.RLock()
 
 
 def _binary_open_flag() -> int:
@@ -76,6 +79,10 @@ class _PlatformProvider(Protocol):
     ) -> object: ...
 
     def close_path_pin(self, handle: object) -> None: ...
+
+    def open_staging_file(self, path: Path, flags: int, mode: int) -> int: ...
+
+    def close_staging_file(self, descriptor: int) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,6 +488,15 @@ class _PathIdentity:
 class _BoundedFile:
     raw: bytes
     identity: _PathIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedStage:
+    descriptor: int
+    identity: _PathIdentity
+    digest: str
+    size: int
+    changed_ns: int
 
 
 def _operation_diagnostic(
@@ -1171,6 +1187,63 @@ def _close_windows_path_pin(handle: object) -> None:
     close_handle(handle)
 
 
+def _open_windows_staging_file(path: Path, flags: int, mode: int) -> int:
+    """Create one binary stage whose writer admits the read-handoff handle.
+
+    ``os.open`` does not let the caller select Windows sharing.  The bootstrap
+    must retain write access across the no-replace link, while a later
+    read-only bridge is opened before that writer is released.  CreateFileW is
+    therefore used explicitly with FILE_SHARE_READ and without write/delete
+    sharing; ownership of the resulting handle is transferred to the CRT fd.
+    """
+
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    generic_read = 0x80000000
+    generic_write = 0x40000000
+    share_read = 0x00000001
+    create_new = 1
+    file_attribute_normal = 0x00000080
+    open_reparse_point = 0x00200000
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        os.fspath(path),
+        generic_read | generic_write,
+        share_read,
+        None,
+        create_new,
+        file_attribute_normal | open_reparse_point,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        winerror = ctypes.get_last_error()
+        if winerror in {80, 183}:  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
+            raise FileExistsError(winerror, "exclusive staging file exists", path)
+        raise OSError(winerror, "CreateFileW staging failed", path)
+    try:
+        return msvcrt.open_osfhandle(
+            int(handle),
+            (flags & (os.O_RDWR | os.O_WRONLY | os.O_APPEND)) | _binary_open_flag(),
+        )
+    except BaseException:
+        _close_windows_path_pin(handle)
+        raise
+
+
 class _PosixPlatformProvider:
     name = "posix"
     windows_semantics = False
@@ -1201,6 +1274,12 @@ class _PosixPlatformProvider:
     def close_path_pin(self, handle: object) -> None:
         os.close(int(handle))
 
+    def open_staging_file(self, path: Path, flags: int, mode: int) -> int:
+        return os.open(os.fspath(path), flags, mode)
+
+    def close_staging_file(self, descriptor: int) -> None:
+        os.close(descriptor)
+
 
 class _NativeWin32PlatformProvider:
     name = "native-win32"
@@ -1226,6 +1305,12 @@ class _NativeWin32PlatformProvider:
     def close_path_pin(self, handle: object) -> None:
         _close_windows_path_pin(handle)
 
+    def open_staging_file(self, path: Path, flags: int, mode: int) -> int:
+        return _open_windows_staging_file(path, flags, mode)
+
+    def close_staging_file(self, descriptor: int) -> None:
+        os.close(descriptor)
+
 
 class _SimulatedWin32PlatformProvider(_PosixPlatformProvider):
     """Win32 contract implemented with disposable host filesystem handles."""
@@ -1233,6 +1318,78 @@ class _SimulatedWin32PlatformProvider(_PosixPlatformProvider):
     name = "simulated-win32"
     windows_semantics = True
     native_windows = False
+
+    def __init__(self) -> None:
+        self._shares: dict[int, tuple[_PathIdentity, bool, bool]] = {}
+
+    def _prune(self) -> None:
+        for descriptor in tuple(self._shares):
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                self._shares.pop(descriptor, None)
+
+    def _admit(self, identity: _PathIdentity, *, wants_write: bool, shares_write: bool) -> None:
+        """Apply Windows' symmetric desired-access/share-mode admission rule."""
+
+        self._prune()
+        for existing_identity, existing_wants_write, existing_shares_write in self._shares.values():
+            if (
+                existing_identity.device,
+                existing_identity.inode,
+                stat.S_IFMT(existing_identity.mode),
+            ) != (
+                identity.device,
+                identity.inode,
+                stat.S_IFMT(identity.mode),
+            ):
+                continue
+            if wants_write and not existing_shares_write:
+                raise PermissionError(errno.EACCES, "simulated Windows share-mode conflict")
+            if existing_wants_write and not shares_write:
+                raise PermissionError(errno.EACCES, "simulated Windows share-mode conflict")
+
+    def open_path_pin(
+        self,
+        path: Path,
+        *,
+        directory: bool,
+        allow_write_share: bool = False,
+    ) -> object:
+        identity = _path_identity(path, directory=directory)
+        if not directory:
+            self._admit(identity, wants_write=False, shares_write=allow_write_share)
+        descriptor = int(
+            super().open_path_pin(
+                path,
+                directory=directory,
+                allow_write_share=allow_write_share,
+            )
+        )
+        if not directory:
+            self._shares[descriptor] = (identity, False, allow_write_share)
+        return descriptor
+
+    def close_path_pin(self, handle: object) -> None:
+        descriptor = int(handle)
+        self._shares.pop(descriptor, None)
+        super().close_path_pin(handle)
+
+    def open_staging_file(self, path: Path, flags: int, mode: int) -> int:
+        descriptor = super().open_staging_file(path, flags, mode)
+        try:
+            identity = _PathIdentity.from_stat(os.fstat(descriptor))
+            self._admit(identity, wants_write=True, shares_write=False)
+            # The retained writer admits readers, but neither writers nor delete.
+            self._shares[descriptor] = (identity, True, False)
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def close_staging_file(self, descriptor: int) -> None:
+        self._shares.pop(descriptor, None)
+        super().close_staging_file(descriptor)
 
 
 _POSIX_PROVIDER = _PosixPlatformProvider()
@@ -1272,6 +1429,144 @@ def _physical_ancestry(path: Path) -> list[Path]:
                 },
             )
     return list(reversed(ancestry))
+
+
+def _before_directory_component_create(parent: Path, child: Path) -> None:
+    """Fault seam while the verified parent chain is still retained."""
+
+
+class _DirectoryDescent(AbstractContextManager["_DirectoryDescent"]):
+    """Retain one no-follow component chain, optionally creating missing nodes.
+
+    POSIX descends with ``openat``/``mkdirat`` from the previously verified
+    directory descriptor.  Native Windows retains a no-delete-shared handle
+    for every existing component before it creates or opens the next spelling,
+    which is the Win32 equivalent available through the provider seam.
+    """
+
+    def __init__(self, path: Path, *, create: bool, code: str) -> None:
+        self.path = Path(os.path.abspath(path))
+        self._provider = _active_platform_provider()
+        self._pins: list[object] = []
+        self._entries: list[tuple[Path, _PathIdentity]] = []
+        try:
+            for index, directory in enumerate(_physical_ancestry(self.path)):
+                if index == 0 or self._provider.native_windows:
+                    try:
+                        identity = _path_identity(directory, directory=True)
+                    except OrchestrateError as exc:
+                        if not create or index == 0 or directory.exists():
+                            raise
+                        try:
+                            _before_directory_component_create(directory.parent, directory)
+                            os.mkdir(directory)
+                        except OSError as mkdir_exc:
+                            raise OrchestrateError(
+                                "Machine bootstrap could not create a retained directory component",
+                                code=code,
+                                data={
+                                    "component": "directoryDescent.create",
+                                    "expected": "new-directory-under-retained-parent",
+                                    "observed": type(mkdir_exc).__name__,
+                                    "path": os.fspath(directory),
+                                },
+                            ) from mkdir_exc
+                        identity = _path_identity(directory, directory=True)
+                    pin = self._provider.open_path_pin(directory, directory=True)
+                else:
+                    parent_fd = int(self._pins[-1])
+                    try:
+                        info = os.stat(
+                            directory.name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        if not create:
+                            raise OrchestrateError(
+                                "Machine bootstrap directory ancestry is incomplete",
+                                code=code,
+                                data={
+                                    "component": "directoryDescent.component",
+                                    "expected": "existing-directory",
+                                    "observed": "absent",
+                                    "path": os.fspath(directory),
+                                },
+                            )
+                        _before_directory_component_create(directory.parent, directory)
+                        os.mkdir(directory.name, dir_fd=parent_fd)
+                        info = os.stat(
+                            directory.name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                    if _is_reparse(info) or stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                        raise OrchestrateError(
+                            "Machine bootstrap refuses a redirected directory component",
+                            code=code,
+                            data={
+                                "component": "installNode.nodeType",
+                                "expected": "directory",
+                                "observed": (
+                                    "redirected"
+                                    if _is_reparse(info) or stat.S_ISLNK(info.st_mode)
+                                    else "unexpected-node"
+                                ),
+                                "path": os.fspath(directory),
+                            },
+                        )
+                    flags = (
+                        os.O_RDONLY
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_DIRECTORY", 0)
+                    )
+                    pin = os.open(directory.name, flags, dir_fd=parent_fd)
+                    identity = _PathIdentity.from_stat(os.fstat(int(pin)))
+                self._pins.append(pin)
+                self._entries.append((directory, identity))
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def leaf_fd(self) -> int | None:
+        if self._provider.native_windows or not self._pins:
+            return None
+        return int(self._pins[-1])
+
+    def verify(self) -> None:
+        for index, (directory, identity) in enumerate(self._entries):
+            if self._provider.native_windows or index == 0:
+                observed = _path_identity(directory, directory=True)
+            else:
+                retained = _PathIdentity.from_stat(os.fstat(int(self._pins[index])))
+                observed = _path_identity(directory, directory=True)
+                if not _same_identity(retained, identity, directory=True):
+                    observed = retained
+            if not _same_identity(observed, identity, directory=True):
+                raise OrchestrateError(
+                    "Machine bootstrap directory ancestry changed during retained descent",
+                    code="machine_bootstrap_install_identity_changed",
+                    data={
+                        "component": "directoryDescent.fileIdentity",
+                        "expected": repr(identity),
+                        "observed": repr(observed),
+                        "path": os.fspath(directory),
+                    },
+                )
+
+    def close(self) -> None:
+        for pin in reversed(self._pins):
+            if self._provider.native_windows:
+                self._provider.close_path_pin(pin)
+            else:
+                os.close(int(pin))
+        self._pins.clear()
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 class _AnchorAncestryBinding(AbstractContextManager["_AnchorAncestryBinding"]):
@@ -1351,7 +1646,7 @@ class _InstallAncestryBinding(AbstractContextManager["_InstallAncestryBinding"])
         self._pins: list[object] = []
         self._identities: list[tuple[Path, _PathIdentity]] = []
         try:
-            for directory in _physical_ancestry(install_root.parent):
+            for directory in _physical_ancestry(install_root):
                 identity = _path_identity(directory, directory=True)
                 pin = self._provider.open_path_pin(directory, directory=True)
                 observed = _path_identity(directory, directory=True)
@@ -1369,6 +1664,31 @@ class _InstallAncestryBinding(AbstractContextManager["_InstallAncestryBinding"])
                     )
                 self._pins.append(pin)
                 self._identities.append((directory, identity))
+            if self._provider.native_windows:
+                self.effect_root = install_root
+            else:
+                descriptor = int(self._pins[-1])
+                expected = _PathIdentity.from_stat(os.fstat(descriptor))
+                self.effect_root = install_root
+                for namespace in (Path("/proc/self/fd"), Path("/dev/fd")):
+                    candidate = namespace / str(descriptor)
+                    try:
+                        observed = _PathIdentity.from_stat(candidate.stat())
+                    except OSError:
+                        continue
+                    if _same_identity(expected, observed, directory=True):
+                        self.effect_root = candidate
+                        break
+                if self.effect_root == install_root:
+                    raise OrchestrateError(
+                        "This host cannot address the retained installation root",
+                        code="machine_bootstrap_install_identity_unproven",
+                        data={
+                            "component": "installRoot.effectPath",
+                            "expected": "matching-/proc/self/fd-or-/dev/fd-entry",
+                            "observed": "unavailable",
+                        },
+                    )
             self.verify()
         except BaseException:
             self.close()
@@ -1679,6 +1999,142 @@ class _SourceBinding(AbstractContextManager["_SourceBinding"]):
         self.close()
 
 
+def _read_bounded_descriptor(descriptor: int, limit: int) -> _BoundedFile:
+    """Read and classify exact bytes through one already retained descriptor."""
+
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or _is_reparse(info) or info.st_size > limit:
+        raise OrchestrateError(
+            "The retained machine-bootstrap file is not a bounded regular file",
+            code="machine_bootstrap_source_identity_unproven",
+            data={
+                "component": "retainedFile.formAndSize",
+                "expected": f"regular-file;size:0..{limit}",
+                "observed": f"mode:{stat.S_IFMT(info.st_mode):#x};size:{info.st_size}",
+            },
+        )
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    raw = bytearray()
+    while len(raw) <= limit:
+        chunk = os.read(descriptor, min(64 * 1024, limit + 1 - len(raw)))
+        if not chunk:
+            break
+        raw.extend(chunk)
+    after = os.fstat(descriptor)
+    if len(raw) != info.st_size or not _opened_file_identity_matches(info, after):
+        raise OrchestrateError(
+            "The retained machine-bootstrap file changed during its bounded read",
+            code="machine_bootstrap_source_identity_changed",
+            data={
+                "component": "retainedFile.bytes",
+                "expected": info.st_size,
+                "observed": len(raw),
+            },
+        )
+    return _BoundedFile(bytes(raw), _PathIdentity.from_stat(info))
+
+
+def _descriptor_effect_path(descriptor: int, *, component: str) -> Path:
+    """Select a verified descriptor namespace for a non-native effect."""
+
+    expected = _PathIdentity.from_stat(os.fstat(descriptor))
+    for root in (Path("/proc/self/fd"), Path("/dev/fd")):
+        candidate = root / str(descriptor)
+        try:
+            observed = _PathIdentity.from_stat(candidate.stat())
+        except OSError:
+            continue
+        if _same_identity(expected, observed, directory=False):
+            return candidate
+    raise OrchestrateError(
+        "This host has no verified descriptor path for the bound bootstrap effect",
+        code="machine_bootstrap_source_identity_unproven",
+        data={
+            "component": component,
+            "expected": "matching-/proc/self/fd-or-/dev/fd-entry",
+            "observed": "unavailable",
+        },
+    )
+
+
+def _immutable_effect_snapshot(raw: bytes) -> int:
+    """Return an immutable/unlinked descriptor containing the exact effect bytes."""
+
+    memfd_create = getattr(os, "memfd_create", None)
+    if callable(memfd_create):
+        descriptor = memfd_create(
+            "orchestrate-installed-source",
+            getattr(os, "MFD_CLOEXEC", 0) | getattr(os, "MFD_ALLOW_SEALING", 0),
+        )
+        try:
+            view = memoryview(raw)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short archive snapshot write")
+                view = view[written:]
+            os.fsync(descriptor)
+            import fcntl
+
+            seals = (
+                getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+                | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+                | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+                | getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+            )
+            fcntl.fcntl(descriptor, getattr(fcntl, "F_ADD_SEALS", 1033), seals)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if _read_bounded_descriptor(descriptor, len(raw)).raw != raw:
+                raise OSError("archive snapshot readback differs")
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    # Portable fallback: an exclusive temporary is written, reopened read-only,
+    # identity-checked, and immediately unlinked before its descriptor escapes.
+    writer, spelling = tempfile.mkstemp(prefix="orchestrate-effect-", suffix=".zip")
+    selected = Path(spelling)
+    reader: int | None = None
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(writer, view)
+            if written <= 0:
+                raise OSError("short archive snapshot write")
+            view = view[written:]
+        os.fchmod(writer, 0o400)
+        os.fsync(writer)
+        written_identity = _PathIdentity.from_stat(os.fstat(writer))
+        os.close(writer)
+        writer = -1
+        reader = os.open(
+            spelling,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | _binary_open_flag(),
+        )
+        opened_identity = _PathIdentity.from_stat(os.fstat(reader))
+        if not _same_identity(written_identity, opened_identity, directory=False):
+            raise OSError("archive snapshot identity changed")
+        selected.unlink()
+        if _read_bounded_descriptor(reader, len(raw)).raw != raw:
+            raise OSError("archive snapshot readback differs")
+        return reader
+    except BaseException:
+        if reader is not None:
+            os.close(reader)
+        raise
+    finally:
+        if writer >= 0:
+            os.close(writer)
+        try:
+            selected.unlink()
+        except FileNotFoundError:
+            pass
+
+
 class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
     """Pin the exact immutable archive consumed by pip."""
 
@@ -1687,7 +2143,9 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
         path: Path,
         *,
         stage_diagnostics: Sequence[Mapping[str, object]] = (),
-        staged_descriptor: int | None = None,
+        staged_descriptor: _RetainedStage | int | None = None,
+        expected_digest: str | None = None,
+        expected_size: int | None = None,
     ) -> None:
         self.path = path
         self._provider = _active_platform_provider()
@@ -1703,10 +2161,19 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
         )
         self.stage_diagnostics = [dict(item) for item in stage_diagnostics]
         self._handle: object | None = None
-        self._descriptor: int | None = staged_descriptor
+        retained_stage = (
+            staged_descriptor if isinstance(staged_descriptor, _RetainedStage) else None
+        )
+        selected_descriptor = (
+            retained_stage.descriptor
+            if retained_stage is not None
+            else staged_descriptor
+        )
+        self._descriptor: int | None = selected_descriptor
+        self._effect_descriptor: int | None = None
         try:
-            if staged_descriptor is not None:
-                info = os.fstat(staged_descriptor)
+            if selected_descriptor is not None:
+                info = os.fstat(selected_descriptor)
                 if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_ARCHIVE_BYTES:
                     raise OrchestrateError(
                         "The committed installed-source archive identity is unavailable",
@@ -1718,18 +2185,55 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
                             "path": os.fspath(path),
                         },
                     )
-                os.lseek(staged_descriptor, 0, os.SEEK_SET)
+                os.lseek(selected_descriptor, 0, os.SEEK_SET)
                 raw = bytearray()
                 while len(raw) <= MAX_SOURCE_ARCHIVE_BYTES:
                     chunk = os.read(
-                        staged_descriptor,
+                        selected_descriptor,
                         min(64 * 1024, MAX_SOURCE_ARCHIVE_BYTES + 1 - len(raw)),
                     )
                     if not chunk:
                         break
                     raw.extend(chunk)
                 opened = _BoundedFile(bytes(raw), _PathIdentity.from_stat(info))
-                if self._provider.native_windows:
+                opened_digest = hashlib.sha256(opened.raw).hexdigest()
+                if (
+                    (
+                        retained_stage is not None
+                        and opened.identity != retained_stage.identity
+                    )
+                    or (
+                        retained_stage is not None
+                        and info.st_ctime_ns != retained_stage.changed_ns
+                    )
+                    or (
+                        retained_stage is not None
+                        and (
+                            opened_digest != retained_stage.digest
+                            or len(opened.raw) != retained_stage.size
+                        )
+                    )
+                    or
+                    (expected_digest is not None and opened_digest != expected_digest)
+                    or (expected_size is not None and len(opened.raw) != expected_size)
+                ):
+                    raise OrchestrateError(
+                        "The retained archive bytes diverged before their effect binding",
+                        code="machine_bootstrap_source_identity_changed",
+                        data={
+                            "component": "sourceArchive.stageToBindingSha256",
+                            "expected": (
+                                f"sha256:{expected_digest}"
+                                if expected_digest is not None
+                                else expected_size
+                            ),
+                            "observed": f"sha256:{opened_digest}",
+                            "expectedSize": expected_size,
+                            "observedSize": len(opened.raw),
+                            "path": os.fspath(path),
+                        },
+                    )
+                if self._provider.windows_semantics:
                     # Hand the no-delete pin from the read/write staging
                     # descriptor to a write-sharing read handle, then to the
                     # strict read-only archive pin.  This keeps one continuous
@@ -1740,7 +2244,7 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
                         directory=False,
                         allow_write_share=True,
                     )
-                    os.close(staged_descriptor)
+                    self._provider.close_staging_file(selected_descriptor)
                     self._descriptor = None
                     try:
                         self._handle = self._provider.open_path_pin(
@@ -1748,26 +2252,50 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
                         )
                     finally:
                         self._provider.close_path_pin(handoff)
-                    committed = self._provider.read_bounded_file(
-                        path, MAX_SOURCE_ARCHIVE_BYTES
-                    )
-                    self.effect_path = path
+                    if self._provider.native_windows:
+                        committed = self._provider.read_bounded_file(
+                            path, MAX_SOURCE_ARCHIVE_BYTES
+                        )
+                        self.effect_path = path
+                    else:
+                        strict_descriptor = int(self._handle)
+                        committed = _read_bounded_descriptor(
+                            strict_descriptor, MAX_SOURCE_ARCHIVE_BYTES
+                        )
+                        self._effect_descriptor = _immutable_effect_snapshot(opened.raw)
+                        self.effect_path = _descriptor_effect_path(
+                            self._effect_descriptor,
+                            component="sourceArchive.effectPath",
+                        )
                     self.operation = _operation_diagnostic(
                         "archive-binding",
-                        "retained-staging-descriptor+Windows-file-handle+public-path",
-                        path,
-                        path_form="native-path",
+                        (
+                            "retained-staging-descriptor+Windows-file-handle+public-path"
+                            if self._provider.native_windows
+                            else "simulated-Windows-share-handoff+sealed-effect-snapshot"
+                        ),
+                        self.effect_path,
+                        path_form=("native-path" if self._provider.native_windows else "descriptor-path"),
                     )
                 else:
-                    committed = self._provider.read_bounded_file(
-                        path, MAX_SOURCE_ARCHIVE_BYTES
+                    strict_descriptor = int(
+                        self._provider.open_path_pin(path, directory=False)
                     )
-                    self.effect_path = Path(f"/proc/self/fd/{staged_descriptor}")
+                    committed = _read_bounded_descriptor(
+                        strict_descriptor, MAX_SOURCE_ARCHIVE_BYTES
+                    )
+                    self._provider.close_staging_file(selected_descriptor)
+                    self._descriptor = strict_descriptor
+                    self._effect_descriptor = _immutable_effect_snapshot(opened.raw)
+                    self.effect_path = _descriptor_effect_path(
+                        self._effect_descriptor,
+                        component="sourceArchive.effectPath",
+                    )
                     self.operation = _operation_diagnostic(
                         "archive-binding",
-                        "retained-commit-descriptor+proc-fd-path",
+                        "retained-public-descriptor+sealed-effect-snapshot",
                         self.effect_path,
-                        path_form="proc-self-fd",
+                        path_form="descriptor-path",
                     )
                 if (
                     committed.raw != opened.raw
@@ -1824,16 +2352,21 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
                         },
                     )
                 opened = _BoundedFile(bytes(raw), _PathIdentity.from_stat(info))
-                self.effect_path = Path(f"/proc/self/fd/{self._descriptor}")
+                self._effect_descriptor = _immutable_effect_snapshot(opened.raw)
+                self.effect_path = _descriptor_effect_path(
+                    self._effect_descriptor,
+                    component="sourceArchive.effectPath",
+                )
                 self.operation = _operation_diagnostic(
                     "archive-binding",
-                    "retained-file-descriptor+proc-fd-path",
+                    "retained-public-descriptor+sealed-effect-snapshot",
                     self.effect_path,
-                    path_form="proc-self-fd",
+                    path_form="descriptor-path",
                 )
             self.digest = hashlib.sha256(opened.raw).hexdigest()
             self.size = len(opened.raw)
             self.identity = opened.identity
+            self._changed_ns = info.st_ctime_ns if selected_descriptor is not None else path.stat().st_ctime_ns
             self.stage_diagnostics.append(
                 _archive_stage_diagnostic(
                     "bound-handle",
@@ -1850,21 +2383,38 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
 
     def verify(self, *, stage: str | None = None) -> None:
         if self._descriptor is not None:
-            os.lseek(self._descriptor, 0, os.SEEK_SET)
-            raw = bytearray()
-            while len(raw) <= MAX_SOURCE_ARCHIVE_BYTES:
-                chunk = os.read(
-                    self._descriptor,
-                    min(64 * 1024, MAX_SOURCE_ARCHIVE_BYTES + 1 - len(raw)),
-                )
-                if not chunk:
-                    break
-                raw.extend(chunk)
-            current_raw = bytes(raw)
+            current_raw = _read_bounded_descriptor(
+                self._descriptor, MAX_SOURCE_ARCHIVE_BYTES
+            ).raw
+        elif self._handle is not None and not self._provider.native_windows:
+            current_raw = _read_bounded_descriptor(
+                int(self._handle), MAX_SOURCE_ARCHIVE_BYTES
+            ).raw
         else:
             current_raw = _read_bounded_regular_file(
                 self.effect_path, MAX_SOURCE_ARCHIVE_BYTES
             ).raw
+        if self._effect_descriptor is not None:
+            effect_raw = _read_bounded_descriptor(
+                self._effect_descriptor, MAX_SOURCE_ARCHIVE_BYTES
+            ).raw
+            if effect_raw != current_raw:
+                raise OrchestrateError(
+                    "The immutable archive effect snapshot diverged from its public binding",
+                    code="machine_bootstrap_source_identity_changed",
+                    data={
+                        "component": "sourceArchive.pinToEffectSha256",
+                        "expected": f"sha256:{hashlib.sha256(current_raw).hexdigest()}",
+                        "observed": f"sha256:{hashlib.sha256(effect_raw).hexdigest()}",
+                        **self.diagnostic_data(),
+                    },
+                )
+        if self._descriptor is not None:
+            current_changed_ns = os.fstat(self._descriptor).st_ctime_ns
+        elif self._handle is not None and not self._provider.native_windows:
+            current_changed_ns = os.fstat(int(self._handle)).st_ctime_ns
+        else:
+            current_changed_ns = self.path.stat().st_ctime_ns
         observed = f"sha256:{hashlib.sha256(current_raw).hexdigest()}"
         expected = f"sha256:{self.digest}"
         if stage is not None:
@@ -1892,6 +2442,7 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
         if (
             len(current_raw) != self.size
             or observed != expected
+            or current_changed_ns != self._changed_ns
             or public_identity is None
             or not _same_identity(public_identity, self.identity, directory=False)
         ):
@@ -1900,15 +2451,25 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
                 code="machine_bootstrap_source_identity_changed",
                 data={
                     "component": (
-                        "sourceArchive.sha256"
-                        if len(current_raw) != self.size or observed != expected
-                        else "sourceArchive.publicIdentity"
+                        "sourceArchive.publicIdentity"
+                        if (
+                            public_identity is None
+                            or not _same_identity(
+                                public_identity, self.identity, directory=False
+                            )
+                        )
+                        else "sourceArchive.sha256"
                     ),
                     "expected": expected,
                     "observed": (
-                        observed
-                        if len(current_raw) != self.size or observed != expected
-                        else repr(public_identity)
+                        repr(public_identity)
+                        if (
+                            public_identity is None
+                            or not _same_identity(
+                                public_identity, self.identity, directory=False
+                            )
+                        )
+                        else observed
                     ),
                     **self.diagnostic_data(),
                 },
@@ -1927,12 +2488,15 @@ class _ArchiveBinding(AbstractContextManager["_ArchiveBinding"]):
         }
 
     def pass_fds(self) -> tuple[int, ...]:
-        return () if self._descriptor is None else (self._descriptor,)
+        return () if self._effect_descriptor is None else (self._effect_descriptor,)
 
     def close(self) -> None:
         if self._descriptor is not None:
             os.close(self._descriptor)
             self._descriptor = None
+        if self._effect_descriptor is not None:
+            os.close(self._effect_descriptor)
+            self._effect_descriptor = None
         if self._handle is not None:
             self._provider.close_path_pin(self._handle)
             self._handle = None
@@ -2024,6 +2588,8 @@ def _build_source_archive(
         layout.source_archive,
         stage_diagnostics=stages,
         staged_descriptor=descriptor,
+        expected_digest=hashlib.sha256(raw).hexdigest(),
+        expected_size=len(raw),
     )
 
 
@@ -2183,6 +2749,19 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
                             "winerror": getattr(cause, "winerror", None),
                         },
                     ) from failure
+            if _within_owned_root(candidate, self.layout.venv_root):
+                raise OrchestrateError(
+                    "A machine-bootstrap effect attempted a redirect below the dedicated environment",
+                    code="machine_bootstrap_venv_identity_changed",
+                    data={
+                        "component": "venvTree.deniedRedirect",
+                        "expected": "no-follow-descent-at-every-depth",
+                        "observed": "redirect-denied",
+                        "path": os.fspath(candidate),
+                        "errno": cause.errno,
+                        "winerror": getattr(cause, "winerror", None),
+                    },
+                ) from failure
 
     def close(self) -> None:
         for descriptor in reversed(tuple(self._descriptors.values())):
@@ -2623,7 +3202,7 @@ def _atomic_write_owned(
     expected_target: _PathIdentity | None,
     archive_stages: list[dict[str, object]] | None = None,
     retain_descriptor: bool = False,
-) -> int | None:
+) -> _RetainedStage | None:
     provider = _active_platform_provider()
     staging_operation = _operation_diagnostic(
         "atomic-staging",
@@ -2639,7 +3218,6 @@ def _atomic_write_owned(
         path,
         path_form="native-path" if provider.windows_semantics else "directory-fd-relative",
     )
-    parent_identity = _path_identity(path.parent, directory=True)
     if expected_target is not None:
         raise OrchestrateError(
             f"Machine bootstrap refuses to overwrite the existing target: {path.name}",
@@ -2654,28 +3232,23 @@ def _atomic_write_owned(
         )
     parent_fd: int | None = None
     parent_handle: object | None = None
+    parent_descent: _DirectoryDescent | None = None
     descriptor: int | None = None
     temporary_name: str | None = None
     anonymous = False
     try:
         _before_staging_parent_open(path.parent)
+        parent_descent = _DirectoryDescent(
+            path.parent,
+            create=False,
+            code="machine_bootstrap_parent_identity_changed",
+        )
+        parent_identity = (
+            _path_identity(path.parent, directory=True)
+            if provider.native_windows
+            else _PathIdentity.from_stat(os.fstat(int(parent_descent.leaf_fd)))
+        )
         if provider.native_windows:
-            try:
-                parent_handle = provider.open_path_pin(path.parent, directory=True)
-            except (OSError, OrchestrateError) as exc:
-                raise OrchestrateError(
-                    "Machine bootstrap staging parent could not be bound",
-                    code="machine_bootstrap_parent_identity_changed",
-                    data={
-                        "component": "stagingParent.fileIdentity",
-                        "expected": repr(parent_identity),
-                        "observed": getattr(exc, "code", type(exc).__name__),
-                        "path": os.fspath(path.parent),
-                        "errno": getattr(exc, "errno", None),
-                        "winerror": getattr(exc, "winerror", None),
-                        "operations": [staging_operation],
-                    },
-                ) from exc
             observed_parent = _path_identity(path.parent, directory=True)
             if not _same_identity(observed_parent, parent_identity, directory=True):
                 raise OrchestrateError(
@@ -2690,27 +3263,7 @@ def _atomic_write_owned(
                     },
                 )
         else:
-            flags = (
-                os.O_RDONLY
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_DIRECTORY", 0)
-            )
-            try:
-                parent_fd = os.open(os.fspath(path.parent), flags)
-            except OSError as exc:
-                raise OrchestrateError(
-                    "Machine bootstrap staging parent could not be bound",
-                    code="machine_bootstrap_parent_identity_changed",
-                    data={
-                        "component": "stagingParent.fileIdentity",
-                        "expected": repr(parent_identity),
-                        "observed": "unavailable",
-                        "path": os.fspath(path.parent),
-                        "errno": exc.errno,
-                        "operations": [staging_operation],
-                    },
-                ) from exc
+            parent_fd = os.dup(int(parent_descent.leaf_fd))
             observed_parent = _PathIdentity.from_stat(os.fstat(parent_fd))
             if not _same_identity(observed_parent, parent_identity, directory=True):
                 raise OrchestrateError(
@@ -2739,7 +3292,11 @@ def _atomic_write_owned(
             )
         temporary_name = f".{path.name}.{secrets.token_hex(16)}.tmp"
         temporary_flag = getattr(os, "O_TMPFILE", 0)
-        if parent_fd is not None and temporary_flag:
+        if (
+            parent_fd is not None
+            and temporary_flag
+            and (not provider.windows_semantics or not retain_descriptor)
+        ):
             try:
                 descriptor = os.open(
                     ".",
@@ -2765,17 +3322,27 @@ def _atomic_write_owned(
             for _ in range(32):
                 temporary_name = f".{path.name}.{secrets.token_hex(16)}.tmp"
                 try:
-                    descriptor = os.open(
-                        temporary_name if parent_fd is not None else os.fspath(path.parent / temporary_name),
+                    stage_flags = (
                         os.O_RDWR
                         | os.O_CREAT
                         | os.O_EXCL
                         | getattr(os, "O_CLOEXEC", 0)
                         | getattr(os, "O_NOFOLLOW", 0)
-                        | _binary_open_flag(),
-                        0o600,
-                        **({} if parent_fd is None else {"dir_fd": parent_fd}),
+                        | _binary_open_flag()
                     )
+                    if provider.windows_semantics and retain_descriptor:
+                        descriptor = provider.open_staging_file(
+                            path.parent / temporary_name,
+                            stage_flags,
+                            0o600,
+                        )
+                    else:
+                        descriptor = os.open(
+                            temporary_name,
+                            stage_flags,
+                            0o600,
+                            dir_fd=parent_fd,
+                        )
                     break
                 except FileExistsError:
                     temporary_name = None
@@ -3024,7 +3591,7 @@ def _atomic_write_owned(
                 os.close(fallback_descriptor)
                 os.unlink(fallback_name, dir_fd=parent_fd)
                 raise
-            os.close(descriptor)
+            provider.close_staging_file(descriptor)
             descriptor = fallback_descriptor
             temporary_name = fallback_name
             anonymous = False
@@ -3037,20 +3604,33 @@ def _atomic_write_owned(
                 native_windows=False,
                 anonymous=False,
             )
-        committed_file = provider.read_bounded_file(path, max(len(raw), 1))
-        committed = committed_file.raw
+        # Do not reopen the public path while the retained Windows writer is
+        # live: a strict reader would conflict with that writer's access.  The
+        # no-replace hard link and metadata-only identity check prove that the
+        # public entry names this exact retained inode; bytes are re-read from
+        # the retained writer itself before ownership can transfer.
+        linked_info = (
+            path.lstat()
+            if parent_fd is None
+            else os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        committed_buffer = bytearray()
+        while len(committed_buffer) <= len(raw):
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, len(raw) + 1 - len(committed_buffer)),
+            )
+            if not chunk:
+                break
+            committed_buffer.extend(chunk)
+        committed = bytes(committed_buffer)
         staged_identity = _PathIdentity.from_stat(os.fstat(descriptor))
+        linked_identity = _PathIdentity.from_stat(linked_info)
         if (
-            (
-                staged_identity.device,
-                staged_identity.inode,
-                stat.S_IFMT(staged_identity.mode),
-            )
-            != (
-                committed_file.identity.device,
-                committed_file.identity.inode,
-                stat.S_IFMT(committed_file.identity.mode),
-            )
+            _is_reparse(linked_info)
+            or not stat.S_ISREG(linked_info.st_mode)
+            or not _same_identity(staged_identity, linked_identity, directory=False)
             or committed != raw
         ):
             if archive_stages is not None:
@@ -3089,9 +3669,19 @@ def _atomic_write_owned(
                 **({} if parent_fd is None else {"dir_fd": parent_fd}),
             )
         temporary_name = None
-        retained = descriptor if retain_descriptor else None
+        retained = (
+            _RetainedStage(
+                descriptor=descriptor,
+                identity=_PathIdentity.from_stat(os.fstat(descriptor)),
+                digest=hashlib.sha256(committed).hexdigest(),
+                size=len(committed),
+                changed_ns=os.fstat(descriptor).st_ctime_ns,
+            )
+            if retain_descriptor
+            else None
+        )
         if not retain_descriptor:
-            os.close(descriptor)
+            provider.close_staging_file(descriptor)
         descriptor = None
         return retained
     except BaseException as exc:
@@ -3106,7 +3696,7 @@ def _atomic_write_owned(
     finally:
         if descriptor is not None:
             try:
-                os.close(descriptor)
+                provider.close_staging_file(descriptor)
             except OSError:
                 pass
         if temporary_name is not None and not anonymous:
@@ -3124,6 +3714,8 @@ def _atomic_write_owned(
                 pass
         if parent_handle is not None:
             provider.close_path_pin(parent_handle)
+        if parent_descent is not None:
+            parent_descent.close()
 
 
 def _write_install_receipt(
@@ -3140,7 +3732,10 @@ def _write_install_receipt(
     raw = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     anchor_raw = (json.dumps(anchor, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     try:
-        layout.install_anchor.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_directory(
+            layout.install_anchor.parent,
+            code="machine_bootstrap_install_identity_unproven",
+        )
         with _AnchorAncestryBinding(layout.install_anchor) as anchor_ancestry:
             _atomic_write_owned(
                 layout.install_anchor,
@@ -3268,6 +3863,92 @@ def _machine_readiness_diagnostic(
     return {"component": "readiness", "expected": "complete", "observed": "incomplete"}
 
 
+def _within_owned_root(candidate: object, root: Path) -> bool:
+    if not isinstance(candidate, (str, bytes, os.PathLike)):
+        return False
+    try:
+        return os.path.commonpath(
+            (os.path.abspath(os.fsdecode(candidate)), os.path.abspath(root))
+        ) == os.path.abspath(root)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+@contextmanager
+def _in_process_effect_redirect_guard(root: Path):
+    """Make injected runners obey the provider's no-redirect contract.
+
+    Production native effects execute in a child process while retained Win32
+    handles protect existing components.  Tests use synthetic runners in the
+    controller process, so this guard gives those callbacks the same admission
+    result for redirect creation/replacement at arbitrary depth instead of
+    letting direct host API calls bypass the provider seam.
+    """
+
+    with _SIMULATED_EFFECT_GUARD:
+        real_symlink = os.symlink
+        real_replace = os.replace
+        real_rename = os.rename
+
+        def replacing_directory(source: object, destination: object) -> bool:
+            if not _within_owned_root(destination, root):
+                return False
+            try:
+                source_info = os.lstat(source)  # type: ignore[arg-type]
+            except (OSError, TypeError, ValueError):
+                source_info = None
+            try:
+                destination_info = os.lstat(destination)  # type: ignore[arg-type]
+            except (OSError, TypeError, ValueError):
+                destination_info = None
+            return any(
+                info is not None
+                and (
+                    stat.S_ISDIR(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or _is_reparse(info)
+                )
+                for info in (source_info, destination_info)
+            )
+
+        def deny_symlink(source: object, destination: object, *args: object, **kwargs: object) -> None:
+            if _within_owned_root(destination, root):
+                raise PermissionError(
+                    errno.EACCES,
+                    "provider denied redirect creation below retained owned root",
+                    destination,
+                )
+            real_symlink(source, destination, *args, **kwargs)
+
+        def deny_replace(source: object, destination: object, *args: object, **kwargs: object) -> None:
+            if replacing_directory(source, destination):
+                raise PermissionError(
+                    errno.EACCES,
+                    "provider denied replacement below retained owned root",
+                    destination,
+                )
+            real_replace(source, destination, *args, **kwargs)
+
+        def deny_rename(source: object, destination: object, *args: object, **kwargs: object) -> None:
+            if replacing_directory(source, destination):
+                raise PermissionError(
+                    errno.EACCES,
+                    "provider denied rename below retained owned root",
+                    destination,
+                )
+            real_rename(source, destination, *args, **kwargs)
+
+        os.symlink = deny_symlink  # type: ignore[assignment]
+        os.replace = deny_replace  # type: ignore[assignment]
+        os.rename = deny_rename  # type: ignore[assignment]
+        try:
+            yield
+        finally:
+            os.symlink = real_symlink  # type: ignore[assignment]
+            os.replace = real_replace  # type: ignore[assignment]
+            os.rename = real_rename  # type: ignore[assignment]
+
+
 def _run_step(
     runner: Runner,
     argv: Sequence[str],
@@ -3276,6 +3957,7 @@ def _run_step(
     runner_kwargs: Mapping[str, object] | None = None,
     operation_diagnostics: Sequence[Mapping[str, object]] = (),
     extra_diagnostics: Mapping[str, object] | None = None,
+    protected_root: Path | None = None,
 ) -> None:
     diagnostic = {
         **({} if extra_diagnostics is None else extra_diagnostics),
@@ -3283,13 +3965,19 @@ def _run_step(
         "phase": phase,
     }
     try:
-        completed = runner(
-            tuple(argv),
-            check=False,
-            capture_output=True,
-            text=True,
-            **({} if runner_kwargs is None else runner_kwargs),
+        guard = (
+            _in_process_effect_redirect_guard(protected_root)
+            if protected_root is not None
+            else nullcontext()
         )
+        with guard:
+            completed = runner(
+                tuple(argv),
+                check=False,
+                capture_output=True,
+                text=True,
+                **({} if runner_kwargs is None else runner_kwargs),
+            )
     except OSError as exc:
         failure = OrchestrateError(
             f"Machine bootstrap could not start its {phase} step; correct the reported OS error and rerun setup",
@@ -3371,51 +4059,19 @@ def _write_shim(
 
 
 def _ensure_directory(path: Path, *, code: str) -> None:
-    try:
-        os.mkdir(path)
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        raise OrchestrateError(
-            f"Machine bootstrap could not create its dedicated directory: {path.name}",
-            code=code,
-        ) from exc
-    _path_identity(path, directory=True)
+    with _DirectoryDescent(path, create=True, code=code) as descent:
+        descent.verify()
 
 
 def _ensure_install_parent(path: Path) -> None:
     """Create missing installation ancestors without traversing redirects."""
 
-    provider = _active_platform_provider()
-    for directory in _physical_ancestry(path):
-        try:
-            directory.lstat()
-        except FileNotFoundError:
-            parent = directory.parent
-            parent_identity = _path_identity(parent, directory=True)
-            pin = provider.open_path_pin(parent, directory=True)
-            try:
-                if provider.native_windows:
-                    os.mkdir(directory)
-                else:
-                    os.mkdir(directory.name, dir_fd=int(pin))
-                observed_parent = _path_identity(parent, directory=True)
-                if not _same_identity(
-                    observed_parent, parent_identity, directory=True
-                ):
-                    raise OrchestrateError(
-                        "The installation parent changed while an ancestor was created",
-                        code="machine_bootstrap_install_identity_changed",
-                        data={
-                            "component": "installAncestry.fileIdentity",
-                            "expected": repr(parent_identity),
-                            "observed": repr(observed_parent),
-                            "path": os.fspath(parent),
-                        },
-                    )
-            finally:
-                provider.close_path_pin(pin)
-        _path_identity(directory, directory=True)
+    with _DirectoryDescent(
+        path,
+        create=True,
+        code="machine_bootstrap_install_identity_unproven",
+    ) as descent:
+        descent.verify()
 
 
 def _ensure_install_root(layout: MachineLayout) -> None:
@@ -3505,6 +4161,7 @@ def _run_bound_step(
             runner_kwargs=runner_kwargs,
             operation_diagnostics=operations,
             extra_diagnostics=extra_diagnostics,
+            protected_root=binding.layout.venv_root,
         )
     except OrchestrateError as exc:
         # Identity divergence is more actionable than the downstream process
@@ -3561,6 +4218,71 @@ def _before_venv_parent_open(_: Path) -> None:
     """Fault seam before the absent-venv parent is physically bound."""
 
 
+def _verify_owned_tree_no_redirects(root: Path) -> None:
+    """Reject a redirect at any depth below an owned root."""
+
+    pending: list[tuple[Path, int]] = [(root, 0)]
+    visited = 0
+    while pending:
+        directory, depth = pending.pop()
+        if depth > 64 or visited > MAX_SOURCE_FILES * 8:
+            raise OrchestrateError(
+                "The dedicated environment exceeds its bounded containment scan",
+                code="machine_bootstrap_venv_identity_unproven",
+                data={
+                    "component": "venvTree.bounds",
+                    "expected": f"depth:0..64;entries:0..{MAX_SOURCE_FILES * 8}",
+                    "observed": f"depth:{depth};entries:{visited}",
+                },
+            )
+        with _DirectoryDescent(
+            directory,
+            create=False,
+            code="machine_bootstrap_venv_identity_changed",
+        ):
+            try:
+                entries = list(os.scandir(directory))
+            except OSError as exc:
+                raise OrchestrateError(
+                    "The dedicated environment could not be scanned through its retained ancestry",
+                    code="machine_bootstrap_venv_identity_changed",
+                    data={
+                        "component": "venvTree.scan",
+                        "expected": "readable-directory",
+                        "observed": type(exc).__name__,
+                        "path": os.fspath(directory),
+                    },
+                ) from exc
+        for entry in entries:
+            visited += 1
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise OrchestrateError(
+                    "A dedicated-environment descendant changed during containment scan",
+                    code="machine_bootstrap_venv_identity_changed",
+                    data={
+                        "component": "venvTree.entry",
+                        "expected": "stable-nonredirect",
+                        "observed": type(exc).__name__,
+                        "path": entry.path,
+                    },
+                ) from exc
+            if entry.is_symlink() or _is_reparse(info):
+                raise OrchestrateError(
+                    "Machine bootstrap refuses a redirect anywhere below the dedicated environment",
+                    code="machine_bootstrap_venv_identity_changed",
+                    data={
+                        "component": "venvTree.nodeType",
+                        "expected": "nonredirect",
+                        "observed": "redirected",
+                        "path": entry.path,
+                    },
+                )
+            if stat.S_ISDIR(info.st_mode):
+                pending.append((Path(entry.path), depth + 1))
+
+
 class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
     """Create the absent venv relative to a bound parent and retain its identity."""
 
@@ -3579,16 +4301,27 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
         )
         self._parent_handle: object | None = None
         self._parent_fd: int | None = None
+        self._parent_descent: _DirectoryDescent | None = None
         self._child_handle: object | None = None
         self._child_fd: int | None = None
         self._descendant_handles: list[object] = []
         self._descendant_fds: list[int] = []
         self._descendant_identities: list[tuple[Path, _PathIdentity]] = []
-        parent_identity = _path_identity(path.parent, directory=True)
         try:
             _before_venv_parent_open(path.parent)
+            self._parent_descent = _DirectoryDescent(
+                path.parent,
+                create=False,
+                code="machine_bootstrap_parent_identity_changed",
+            )
+            parent_identity = (
+                _path_identity(path.parent, directory=True)
+                if self._provider.native_windows
+                else _PathIdentity.from_stat(
+                    os.fstat(int(self._parent_descent.leaf_fd))
+                )
+            )
             if self._provider.native_windows:
-                self._parent_handle = self._provider.open_path_pin(path.parent, directory=True)
                 observed_parent = _path_identity(path.parent, directory=True)
                 if not _same_identity(observed_parent, parent_identity, directory=True):
                     raise OrchestrateError(
@@ -3606,7 +4339,7 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
                 self._child_handle = self._provider.open_path_pin(path, directory=True)
                 self.effect_path = path
             else:
-                self._parent_fd = int(self._provider.open_path_pin(path.parent, directory=True))
+                self._parent_fd = os.dup(int(self._parent_descent.leaf_fd))
                 opened_parent = _PathIdentity.from_stat(os.fstat(self._parent_fd))
                 if not _same_identity(opened_parent, parent_identity, directory=True):
                     raise OrchestrateError(
@@ -3639,7 +4372,10 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
                 Path("Scripts"),
             ):
                 descendant = path / relative
-                descendant.mkdir(exist_ok=True)
+                _ensure_directory(
+                    descendant,
+                    code="machine_bootstrap_venv_identity_unproven",
+                )
                 identity = _path_identity(descendant, directory=True)
                 pin = self._provider.open_path_pin(descendant, directory=True)
                 if self._provider.native_windows:
@@ -3705,6 +4441,7 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
                         **self.diagnostic_data(),
                     },
                 )
+        _verify_owned_tree_no_redirects(self.path)
 
     def diagnostic_data(self) -> dict[str, object]:
         return {"operations": [self.operation]}
@@ -3736,6 +4473,20 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
                             **self.diagnostic_data(),
                         },
                     ) from failure
+            if _within_owned_root(candidate, self.path):
+                raise OrchestrateError(
+                    "Machine bootstrap refused a redirect below its retained dedicated-environment root",
+                    code="machine_bootstrap_venv_identity_changed",
+                    data={
+                        "component": "venvTree.deniedRedirect",
+                        "expected": "no-follow-descent-at-every-depth",
+                        "observed": "redirect-denied",
+                        "path": os.fspath(candidate),
+                        "errno": cause.errno,
+                        "winerror": getattr(cause, "winerror", None),
+                        **self.diagnostic_data(),
+                    },
+                ) from failure
 
     def pass_fds(self) -> tuple[int, ...]:
         return () if self._child_fd is None else (self._child_fd,)
@@ -3757,6 +4508,9 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
             if handle is not None:
                 self._provider.close_path_pin(handle)
                 setattr(self, handle_name, None)
+        if self._parent_descent is not None:
+            self._parent_descent.close()
+            self._parent_descent = None
 
     def __exit__(self, *_: object) -> None:
         self.close()
@@ -3791,14 +4545,10 @@ def ensure_machine(
         return MachineBootstrapResult("ready")
 
     _ensure_install_parent(selected_layout.install_root.parent)
+    _ensure_install_root(selected_layout)
     install_ancestry = _InstallAncestryBinding(selected_layout.install_root)
-    try:
-        _ensure_install_root(selected_layout)
-    except BaseException:
-        install_ancestry.close()
-        raise
     lock = RunLock(
-        selected_layout.install_root / MACHINE_LOCK_NAME,
+        install_ancestry.effect_root / MACHINE_LOCK_NAME,
         timeout_seconds=30.0,
         contention_code="machine_bootstrap_contention",
         contention_message="Timed out waiting for the machine-bootstrap mutation lock",
@@ -3834,6 +4584,7 @@ def ensure_machine(
                             else None
                         ),
                         operation_diagnostics=[creation.operation],
+                        protected_root=creation.path,
                     )
                 except OrchestrateError as exc:
                     creation.raise_for_denied_descendant_redirect(exc)
