@@ -45,6 +45,12 @@ MACHINE_LOCK_NAME = ".machine-bootstrap.lock"
 SIMULATED_WIN32_PROVIDER_ENV = "ORCHESTRATE_BOOTSTRAP_PROVIDER"
 
 
+def _binary_open_flag() -> int:
+    """Return the CRT binary-mode flag where the host exposes one."""
+
+    return getattr(os, "O_BINARY", 0)
+
+
 class _PlatformProvider(Protocol):
     """One seam for every platform-dependent bootstrap operation.
 
@@ -658,7 +664,7 @@ def _read_posix_bounded_file(path: Path, limit: int) -> _BoundedFile:
         _before_bounded_file_open(path)
         descriptor = os.open(
             os.fspath(path),
-            os.O_RDONLY | no_follow | non_blocking | close_on_exec,
+            os.O_RDONLY | no_follow | non_blocking | close_on_exec | _binary_open_flag(),
         )
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or _is_reparse(info):
@@ -818,7 +824,7 @@ def _read_windows_bounded_file(path: Path, limit: int) -> _BoundedFile:
 
         descriptor = msvcrt.open_osfhandle(
             handle,
-            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            os.O_RDONLY | _binary_open_flag(),
         )
         handle = None
         opened_info = os.stat(descriptor)
@@ -1160,7 +1166,12 @@ class _PosixPlatformProvider:
         return _read_posix_bounded_file(path, limit)
 
     def open_path_pin(self, path: Path, *, directory: bool) -> object:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | _binary_open_flag()
+        )
         if directory:
             flags |= getattr(os, "O_DIRECTORY", 0)
         else:
@@ -1210,6 +1221,95 @@ def _active_platform_provider() -> _PlatformProvider:
             )
         return _SIMULATED_WIN32_PROVIDER
     return _NATIVE_WIN32_PROVIDER if sys.platform == "win32" else _POSIX_PROVIDER
+
+
+def _physical_ancestry(path: Path) -> list[Path]:
+    """Return the absolute lexical directory ancestry from root to ``path``."""
+
+    current = Path(os.path.abspath(path))
+    ancestry = [current]
+    while current.parent != current:
+        current = current.parent
+        ancestry.append(current)
+        if len(ancestry) > 64:
+            raise OrchestrateError(
+                "The host-local anchor ancestry exceeds its bounded depth",
+                code="machine_bootstrap_anchor_identity_unproven",
+                data={
+                    "component": "anchorAncestry.depth",
+                    "expected": "0..64",
+                    "observed": len(ancestry),
+                },
+            )
+    return list(reversed(ancestry))
+
+
+class _AnchorAncestryBinding(AbstractContextManager["_AnchorAncestryBinding"]):
+    """Reject redirected anchor ancestors and retain their physical identities."""
+
+    def __init__(self, anchor: Path) -> None:
+        self.anchor = anchor
+        self._provider = _active_platform_provider()
+        self._pins: list[object] = []
+        self._identities: list[tuple[Path, _PathIdentity]] = []
+        try:
+            for directory in _physical_ancestry(anchor.parent):
+                identity = _path_identity(directory, directory=True)
+                pin = self._provider.open_path_pin(directory, directory=True)
+                observed = _path_identity(directory, directory=True)
+                if not _same_identity(observed, identity, directory=True):
+                    self._provider.close_path_pin(pin)
+                    raise OrchestrateError(
+                        "The host-local anchor ancestry changed while it was bound",
+                        code="machine_bootstrap_anchor_identity_changed",
+                        data={
+                            "component": "anchorAncestry.fileIdentity",
+                            "expected": repr(identity),
+                            "observed": repr(observed),
+                            "path": os.fspath(directory),
+                        },
+                    )
+                self._pins.append(pin)
+                self._identities.append((directory, identity))
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+
+    def verify(self) -> None:
+        for directory, identity in self._identities:
+            try:
+                observed = _path_identity(directory, directory=True)
+            except OrchestrateError as exc:
+                raise OrchestrateError(
+                    "The host-local anchor ancestry changed after it was bound",
+                    code="machine_bootstrap_anchor_identity_changed",
+                    data={
+                        "component": "anchorAncestry.fileIdentity",
+                        "expected": repr(identity),
+                        "observed": "unavailable-or-redirected",
+                        "path": os.fspath(directory),
+                    },
+                ) from exc
+            if not _same_identity(observed, identity, directory=True):
+                raise OrchestrateError(
+                    "The host-local anchor ancestry changed after it was bound",
+                    code="machine_bootstrap_anchor_identity_changed",
+                    data={
+                        "component": "anchorAncestry.fileIdentity",
+                        "expected": repr(identity),
+                        "observed": repr(observed),
+                        "path": os.fspath(directory),
+                    },
+                )
+
+    def close(self) -> None:
+        for pin in reversed(self._pins):
+            self._provider.close_path_pin(pin)
+        self._pins.clear()
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def _ignored_source_directory(name: str) -> bool:
@@ -1325,13 +1425,23 @@ def _source_tree_digest(root: Path) -> str:
                     "observed": consumed,
                 },
             )
-        name = relative.encode("utf-8", errors="strict")
-        digest.update(len(name).to_bytes(4, "big"))
-        digest.update(name)
-        digest.update((opened.identity.mode & 0o111).to_bytes(2, "big"))
-        digest.update(len(opened.raw).to_bytes(8, "big"))
-        digest.update(opened.raw)
+        _update_source_tree_digest(digest, relative, opened)
     return digest.hexdigest()
+
+
+def _update_source_tree_digest(
+    digest: object,
+    relative: str,
+    opened: _BoundedFile,
+) -> None:
+    """Frame one exact source record for both review and archive digests."""
+
+    name = relative.encode("utf-8", errors="strict")
+    digest.update(len(name).to_bytes(4, "big"))  # type: ignore[attr-defined]
+    digest.update(name)  # type: ignore[attr-defined]
+    digest.update((opened.identity.mode & 0o111).to_bytes(2, "big"))  # type: ignore[attr-defined]
+    digest.update(len(opened.raw).to_bytes(8, "big"))  # type: ignore[attr-defined]
+    digest.update(opened.raw)  # type: ignore[attr-defined]
 
 
 class _SourceBinding(AbstractContextManager["_SourceBinding"]):
@@ -1633,6 +1743,7 @@ def _build_source_archive(
     source.verify()
     buffer = io.BytesIO()
     consumed = 0
+    archived_source_digest = hashlib.sha256()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED, strict_timestamps=True) as archive:
         for relative, path in _source_tree_records(source.effect_path):
             opened = _read_bounded_regular_file(path, MAX_SOURCE_BYTES - consumed)
@@ -1648,10 +1759,23 @@ def _build_source_archive(
                         **source.diagnostic_data(),
                     },
                 )
+            _update_source_tree_digest(archived_source_digest, relative, opened)
             info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
             info.create_system = 3
             info.external_attr = ((0o755 if opened.identity.mode & 0o111 else 0o644) & 0xFFFF) << 16
             archive.writestr(info, opened.raw)
+    archived_digest = archived_source_digest.hexdigest()
+    if archived_digest != source.tree_digest:
+        raise OrchestrateError(
+            "The archive input bytes do not match the reviewed source snapshot",
+            code="machine_bootstrap_source_identity_changed",
+            data={
+                "component": "sourceArchive.inputTreeSha256",
+                "expected": f"sha256:{source.tree_digest}",
+                "observed": f"sha256:{archived_digest}",
+                **source.diagnostic_data(),
+            },
+        )
     source.verify()
     raw = buffer.getvalue()
     if len(raw) > MAX_SOURCE_ARCHIVE_BYTES:
@@ -1812,6 +1936,33 @@ class _VenvBinding(AbstractContextManager["_VenvBinding"]):
                 },
             )
         return {"executable": executable, "pass_fds": (descriptor, *pass_fds)}
+
+    def raise_for_denied_identity_mutation(self, failure: BaseException) -> None:
+        """Promote a denied write to a bound venv node over process failure."""
+
+        cause = failure.__cause__
+        if not isinstance(cause, OSError):
+            return
+        attempted = [
+            Path(value)
+            for value in (getattr(cause, "filename", None), getattr(cause, "filename2", None))
+            if isinstance(value, (str, bytes, os.PathLike))
+        ]
+        for candidate in attempted:
+            for bound in self._identities:
+                if _same_path(candidate, bound):
+                    raise OrchestrateError(
+                        "A machine-bootstrap effect attempted to change the bound dedicated environment",
+                        code="machine_bootstrap_venv_identity_changed",
+                        data={
+                            "component": "venvNode.deniedMutation",
+                            "expected": "unchanged-bound-node",
+                            "observed": "mutation-denied",
+                            "path": os.fspath(bound),
+                            "errno": cause.errno,
+                            "winerror": getattr(cause, "winerror", None),
+                        },
+                    ) from failure
 
     def close(self) -> None:
         for descriptor in reversed(tuple(self._descriptors.values())):
@@ -2025,10 +2176,12 @@ def _receipt_match_diagnostic(
                     "matched": False,
                 }
             return mismatch(diagnostic)
-    anchor, anchor_form = _read_canonical_json_diagnostic(
-        layout.install_anchor,
-        MAX_INSTALL_RECEIPT_BYTES,
-    )
+    with _AnchorAncestryBinding(layout.install_anchor) as anchor_ancestry:
+        anchor, anchor_form = _read_canonical_json_diagnostic(
+            layout.install_anchor,
+            MAX_INSTALL_RECEIPT_BYTES,
+        )
+        anchor_ancestry.verify()
     expected_anchor = _anchor_value(value)
     if not isinstance(anchor, dict):
         return mismatch(
@@ -2165,10 +2318,30 @@ def _commit_staged_no_replace(
     *,
     parent_fd: int | None,
     parent: Path,
+    staged_descriptor: int | None = None,
+    native_windows: bool = False,
 ) -> None:
     """One fault-injection seam around the platform's no-overwrite commit."""
 
-    if parent_fd is None:
+    if staged_descriptor is not None and not native_windows:
+        descriptor_path = f"/proc/self/fd/{staged_descriptor}"
+        if not os.path.exists(descriptor_path):
+            raise OrchestrateError(
+                "Machine bootstrap cannot bind its commit to the staged descriptor",
+                code="machine_bootstrap_commit_identity_unproven",
+                data={
+                    "component": "commit.stagedDescriptor",
+                    "expected": "available",
+                    "observed": "unavailable",
+                },
+            )
+        os.link(
+            descriptor_path,
+            target_name if parent_fd is not None else os.fspath(parent / target_name),
+            **({} if parent_fd is None else {"dst_dir_fd": parent_fd}),
+            follow_symlinks=True,
+        )
+    elif parent_fd is None:
         os.link(
             os.fspath(parent / temporary_name),
             os.fspath(parent / target_name),
@@ -2186,6 +2359,10 @@ def _commit_staged_no_replace(
 
 def _before_staging_parent_open(_: Path) -> None:
     """Host-neutral fault seam immediately before the parent is bound."""
+
+
+def _before_staged_commit(_: Path) -> None:
+    """Fault seam after fsync while the staged descriptor remains retained."""
 
 
 def _atomic_write_owned(
@@ -2313,7 +2490,11 @@ def _atomic_write_owned(
             try:
                 descriptor = os.open(
                     temporary_name if parent_fd is not None else os.fspath(path.parent / temporary_name),
-                    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | _binary_open_flag(),
                     0o600,
                     **({} if parent_fd is None else {"dir_fd": parent_fd}),
                 )
@@ -2370,41 +2551,39 @@ def _atomic_write_owned(
         else:
             os.chmod(path.parent / temporary_name, 0o755 if executable else 0o600)
         os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        staged_raw = bytearray()
+        while len(staged_raw) <= len(raw):
+            chunk = os.read(descriptor, min(64 * 1024, len(raw) + 1 - len(staged_raw)))
+            if not chunk:
+                break
+            staged_raw.extend(chunk)
+        if bytes(staged_raw) != raw:
+            raise OrchestrateError(
+                "Machine bootstrap staging changed the exact bytes before commit",
+                code="machine_bootstrap_commit_identity_changed",
+                data={
+                    "component": "commit.stagedSha256",
+                    "expected": f"sha256:{hashlib.sha256(raw).hexdigest()}",
+                    "observed": f"sha256:{hashlib.sha256(staged_raw).hexdigest()}",
+                    "expectedSize": len(raw),
+                    "observedSize": len(staged_raw),
+                    "operations": [staging_operation],
+                },
+            )
         if archive_stages is not None:
-            try:
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                staged = bytearray()
-                while len(staged) <= MAX_SOURCE_ARCHIVE_BYTES:
-                    chunk = os.read(
-                        descriptor,
-                        min(64 * 1024, MAX_SOURCE_ARCHIVE_BYTES + 1 - len(staged)),
-                    )
-                    if not chunk:
-                        break
-                    staged.extend(chunk)
-                archive_stages.append(
-                    _archive_stage_diagnostic(
-                        "staged-temp-after-fsync",
-                        bytes(staged),
-                        form=(
-                            "Windows-path-staging"
-                            if provider.windows_semantics
-                            else "directory-fd-staging"
-                        ),
-                        path=path.parent / temporary_name,
-                    )
+            archive_stages.append(
+                _archive_stage_diagnostic(
+                    "staged-temp-after-fsync",
+                    bytes(staged_raw),
+                    form=(
+                        "Windows-path-staging"
+                        if provider.windows_semantics
+                        else "directory-fd-staging"
+                    ),
+                    path=path.parent / temporary_name,
                 )
-            except OSError:
-                archive_stages.append(
-                    {
-                        "stage": "staged-temp-after-fsync",
-                        "form": "unavailable",
-                        "path": os.fspath(path.parent / temporary_name),
-                        "zipStructure": "unavailable",
-                    }
-                )
-        os.close(descriptor)
-        descriptor = None
+            )
         observed_target = _target_identity_at(parent_fd, path.parent, path.name)
         if observed_target != expected_target:
             raise OrchestrateError(
@@ -2418,15 +2597,32 @@ def _atomic_write_owned(
                     "operations": [staging_operation],
                 },
             )
+        _before_staged_commit(path.parent / temporary_name)
         _commit_staged_no_replace(
             temporary_name,
             path.name,
             parent_fd=parent_fd,
             parent=path.parent,
+            staged_descriptor=descriptor,
+            native_windows=provider.native_windows,
         )
-        if archive_stages is not None:
-            try:
-                committed = provider.read_bounded_file(path, MAX_SOURCE_ARCHIVE_BYTES).raw
+        committed_file = provider.read_bounded_file(path, max(len(raw), 1))
+        committed = committed_file.raw
+        staged_identity = _PathIdentity.from_stat(os.fstat(descriptor))
+        if (
+            (
+                staged_identity.device,
+                staged_identity.inode,
+                stat.S_IFMT(staged_identity.mode),
+            )
+            != (
+                committed_file.identity.device,
+                committed_file.identity.inode,
+                stat.S_IFMT(committed_file.identity.mode),
+            )
+            or committed != raw
+        ):
+            if archive_stages is not None:
                 archive_stages.append(
                     _archive_stage_diagnostic(
                         "committed-target",
@@ -2435,15 +2631,29 @@ def _atomic_write_owned(
                         path=path,
                     )
                 )
-            except (OSError, OrchestrateError):
-                archive_stages.append(
-                    {
-                        "stage": "committed-target",
-                        "form": "unavailable",
-                        "path": os.fspath(path),
-                        "zipStructure": "unavailable",
-                    }
+            raise OrchestrateError(
+                "Machine bootstrap committed bytes differ from the retained staging file",
+                code="machine_bootstrap_commit_identity_changed",
+                data={
+                    "component": "commit.committedSha256",
+                    "expected": f"sha256:{hashlib.sha256(raw).hexdigest()}",
+                    "observed": f"sha256:{hashlib.sha256(committed).hexdigest()}",
+                    "expectedSize": len(raw),
+                    "observedSize": len(committed),
+                    "operations": [staging_operation],
+                },
+            )
+        if archive_stages is not None:
+            archive_stages.append(
+                _archive_stage_diagnostic(
+                    "committed-target",
+                    committed,
+                    form="public-path",
+                    path=path,
                 )
+            )
+        os.close(descriptor)
+        descriptor = None
         os.unlink(
             temporary_name if parent_fd is not None else os.fspath(path.parent / temporary_name),
             **({} if parent_fd is None else {"dir_fd": parent_fd}),
@@ -2496,19 +2706,37 @@ def _write_install_receipt(
     anchor_raw = (json.dumps(anchor, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     try:
         layout.install_anchor.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_owned(
-            layout.install_anchor,
-            anchor_raw,
-            executable=False,
-            expected_target=expected_anchor,
-        )
-        _atomic_write_owned(
-            layout.install_receipt,
-            raw,
-            executable=False,
-            expected_target=expected_target,
-        )
-    except (OSError, OrchestrateError) as exc:
+        with _AnchorAncestryBinding(layout.install_anchor) as anchor_ancestry:
+            _atomic_write_owned(
+                layout.install_anchor,
+                anchor_raw,
+                executable=False,
+                expected_target=expected_anchor,
+            )
+            anchor_ancestry.verify()
+            _atomic_write_owned(
+                layout.install_receipt,
+                raw,
+                executable=False,
+                expected_target=expected_target,
+            )
+            anchor_ancestry.verify()
+    except OrchestrateError as exc:
+        if exc.code in {
+            "machine_bootstrap_commit_identity_changed",
+            "machine_bootstrap_commit_identity_unproven",
+        }:
+            raise
+        raise OrchestrateError(
+            "Machine bootstrap installed the checkout but could not record its local receipt; rerun setup to converge",
+            code="machine_bootstrap_receipt_write_failed",
+            data={
+                "component": "receipt-and-anchor.write",
+                "expected": "both-canonical-records",
+                "observed": exc.code,
+            },
+        ) from exc
+    except OSError as exc:
         raise OrchestrateError(
             "Machine bootstrap installed the checkout but could not record its local receipt; rerun setup to converge",
             code="machine_bootstrap_receipt_write_failed",
@@ -2689,7 +2917,18 @@ def _write_shim(
             executable=executable,
             expected_target=expected_target,
         )
-    except (OSError, OrchestrateError) as exc:
+    except OrchestrateError as exc:
+        if exc.code in {
+            "machine_bootstrap_commit_identity_changed",
+            "machine_bootstrap_commit_identity_unproven",
+        }:
+            raise
+        raise OrchestrateError(
+            f"Machine bootstrap could not install {path.name}; correct filesystem access and rerun setup",
+            code="machine_bootstrap_shim_write_failed",
+            data=exc.data,
+        ) from exc
+    except OSError as exc:
         raise OrchestrateError(
             f"Machine bootstrap could not install {path.name}; correct filesystem access and rerun setup",
             code="machine_bootstrap_shim_write_failed",
@@ -2744,11 +2983,17 @@ def _validate_existing_install_tree(layout: MachineLayout) -> None:
             continue
         _target_identity(candidate)
     try:
-        layout.install_anchor.lstat()
+        layout.install_anchor.parent.lstat()
     except FileNotFoundError:
         pass
     else:
-        _target_identity(layout.install_anchor)
+        with _AnchorAncestryBinding(layout.install_anchor):
+            try:
+                layout.install_anchor.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                _target_identity(layout.install_anchor)
 
 
 def _run_bound_step(
@@ -2802,6 +3047,7 @@ def _run_bound_step(
     except OrchestrateError as exc:
         # Identity divergence is more actionable than the downstream process
         # symptom and must win error precedence.
+        binding.raise_for_denied_identity_mutation(exc)
         binding.verify()
         if source is not None:
             if isinstance(source, _ArchiveBinding):
@@ -2873,6 +3119,9 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
         self._parent_fd: int | None = None
         self._child_handle: object | None = None
         self._child_fd: int | None = None
+        self._descendant_handles: list[object] = []
+        self._descendant_fds: list[int] = []
+        self._descendant_identities: list[tuple[Path, _PathIdentity]] = []
         parent_identity = _path_identity(path.parent, directory=True)
         try:
             _before_venv_parent_open(path.parent)
@@ -2920,6 +3169,16 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
                     path_form="proc-self-fd",
                 )
             self._identity = _path_identity(path, directory=True)
+            for relative in (Path("Include"), Path("Lib"), Path("Lib") / "site-packages", Path("Scripts")):
+                descendant = path / relative
+                descendant.mkdir(exist_ok=True)
+                identity = _path_identity(descendant, directory=True)
+                pin = self._provider.open_path_pin(descendant, directory=True)
+                if self._provider.native_windows:
+                    self._descendant_handles.append(pin)
+                else:
+                    self._descendant_fds.append(int(pin))
+                self._descendant_identities.append((descendant, identity))
             self.verify()
         except BaseException as exc:
             _diagnostic_exception_note(exc, self.diagnostic_data())
@@ -2951,14 +3210,75 @@ class _VenvCreationBinding(AbstractContextManager["_VenvCreationBinding"]):
                     **self.diagnostic_data(),
                 },
             )
+        for descendant, identity in self._descendant_identities:
+            try:
+                observed_descendant = _path_identity(descendant, directory=True)
+            except OrchestrateError as exc:
+                raise OrchestrateError(
+                    "A dedicated-environment descendant changed during bound creation",
+                    code="machine_bootstrap_venv_identity_changed",
+                    data={
+                        "component": "venvDescendant.fileIdentity",
+                        "expected": repr(identity),
+                        "observed": "unavailable-or-redirected",
+                        "path": os.fspath(descendant),
+                        **self.diagnostic_data(),
+                    },
+                ) from exc
+            if not _same_identity(observed_descendant, identity, directory=True):
+                raise OrchestrateError(
+                    "A dedicated-environment descendant changed during bound creation",
+                    code="machine_bootstrap_venv_identity_changed",
+                    data={
+                        "component": "venvDescendant.fileIdentity",
+                        "expected": repr(identity),
+                        "observed": repr(observed_descendant),
+                        "path": os.fspath(descendant),
+                        **self.diagnostic_data(),
+                    },
+                )
 
     def diagnostic_data(self) -> dict[str, object]:
         return {"operations": [self.operation]}
+
+    def raise_for_denied_descendant_redirect(self, failure: BaseException) -> None:
+        """Classify a refused descendant replacement as an identity failure."""
+
+        cause = failure.__cause__
+        if not isinstance(cause, OSError):
+            return
+        attempted = [
+            Path(value)
+            for value in (getattr(cause, "filename", None), getattr(cause, "filename2", None))
+            if isinstance(value, (str, bytes, os.PathLike))
+        ]
+        for candidate in attempted:
+            for descendant, identity in self._descendant_identities:
+                if _same_path(candidate, descendant):
+                    raise OrchestrateError(
+                        "Machine bootstrap refused a redirected dedicated-environment descendant",
+                        code="machine_bootstrap_venv_identity_changed",
+                        data={
+                            "component": "venvDescendant.deniedRedirect",
+                            "expected": repr(identity),
+                            "observed": "redirect-denied",
+                            "path": os.fspath(descendant),
+                            "errno": cause.errno,
+                            "winerror": getattr(cause, "winerror", None),
+                            **self.diagnostic_data(),
+                        },
+                    ) from failure
 
     def pass_fds(self) -> tuple[int, ...]:
         return () if self._child_fd is None else (self._child_fd,)
 
     def close(self) -> None:
+        for descriptor in reversed(self._descendant_fds):
+            os.close(descriptor)
+        self._descendant_fds.clear()
+        for handle in reversed(self._descendant_handles):
+            self._provider.close_path_pin(handle)
+        self._descendant_handles.clear()
         for descriptor_name in ("_child_fd", "_parent_fd"):
             descriptor = getattr(self, descriptor_name)
             if descriptor is not None:
@@ -3041,6 +3361,7 @@ def ensure_machine(
                         operation_diagnostics=[creation.operation],
                     )
                 except OrchestrateError as exc:
+                    creation.raise_for_denied_descendant_redirect(exc)
                     creation.verify()
                     _diagnostic_exception_note(
                         exc,
