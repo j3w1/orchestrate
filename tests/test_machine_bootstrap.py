@@ -378,9 +378,10 @@ class MachineBootstrapTests(unittest.TestCase):
             layout = fixture_layout(root)
             install_ready_files(layout)
             installed_module = root / "wheel-env" / "site-packages" / "orchestrate" / "machine_bootstrap.py"
+            fault = ResolvedPathFault(layout.source_root / "pyproject.toml")
 
             def unavailable(path: Path, limit: int) -> bytes:
-                if path == layout.source_root / "pyproject.toml":
+                if fault.matches(path):
                     raise OrchestrateError(
                         "synthetic access failure",
                         code="machine_bootstrap_safe_io_unavailable",
@@ -400,6 +401,7 @@ class MachineBootstrapTests(unittest.TestCase):
                 with self.assertRaises(OrchestrateError) as held:
                     default_layout()
 
+            self.assertEqual(fault.interceptions, 1)
             self.assertEqual(held.exception.code, "machine_bootstrap_persisted_source_unavailable")
             self.assertEqual(held.exception.data["disposition"], "retryable")  # type: ignore[index]
 
@@ -893,14 +895,15 @@ class MachineBootstrapTests(unittest.TestCase):
             target = Path(directory) / "orchestrate.cmd"
             raw = b"@echo off\r\n"
             real_stat = os.stat
+            fault = ResolvedPathFault(target)
 
             def path_sensitive_mode(
                 candidate: object, *args: object, **kwargs: object
             ) -> os.stat_result:
                 info = real_stat(candidate, *args, **kwargs)
                 if (
-                    os.fspath(candidate) == target.name
-                    and kwargs.get("dir_fd") is not None
+                    kwargs.get("dir_fd") is not None
+                    and fault.matches(candidate, relative_to=target.parent)  # type: ignore[arg-type]
                 ):
                     return stat_view(info, st_mode=info.st_mode | 0o111)  # type: ignore[return-value]
                 return info
@@ -913,6 +916,7 @@ class MachineBootstrapTests(unittest.TestCase):
                     expected_target=None,
                 )
 
+            self.assertEqual(fault.interceptions, 1)
             self.assertEqual(target.read_bytes(), raw)
 
     @unittest.skipIf(sys.platform == "win32", "simulated provider uses descriptor-host APIs")
@@ -1425,11 +1429,12 @@ class MachineBootstrapTests(unittest.TestCase):
             runner = SyntheticInstaller(layout)
             real_write = _atomic_write_owned
             changed = False
+            fault = ResolvedPathFault(layout.source_archive)
 
             def change_after_commit(path: Path, raw: bytes, **kwargs: object):
                 nonlocal changed
                 retained = real_write(path, raw, **kwargs)
-                if kwargs.get("retain_descriptor") and path == layout.source_archive:
+                if kwargs.get("retain_descriptor") and fault.matches(path):
                     changed = True
                     self.assertIsNotNone(retained)
                     os.lseek(retained.descriptor, 0, os.SEEK_SET)
@@ -1452,6 +1457,7 @@ class MachineBootstrapTests(unittest.TestCase):
                         version_info=(3, 13),
                     )
 
+            self.assertEqual(fault.interceptions, 1)
             self.assertTrue(changed)
             self.assertEqual(held.exception.code, "machine_bootstrap_source_identity_changed")
             self.assertEqual(
@@ -1856,10 +1862,11 @@ class MachineBootstrapTests(unittest.TestCase):
             retained = root / "retained-install"
             substitute = layout.install_root
             intercepted = False
+            fault = ResolvedPathFault(layout.install_root)
 
             def replace_root(parent: Path) -> None:
                 nonlocal intercepted
-                if intercepted or parent != layout.install_root:
+                if intercepted or not fault.matches(parent):
                     return
                 intercepted = True
                 os.replace(layout.install_root, retained)
@@ -1879,6 +1886,7 @@ class MachineBootstrapTests(unittest.TestCase):
                         version_info=(3, 13),
                     )
 
+            self.assertEqual(fault.interceptions, 1)
             self.assertTrue(intercepted)
             self.assertEqual(held.exception.code, "machine_bootstrap_install_identity_changed")
             self.assertFalse((substitute / layout.source_archive.name).exists())
@@ -1892,6 +1900,7 @@ class MachineBootstrapTests(unittest.TestCase):
             retained = root / "retained-install"
             substitute = layout.install_root
             intercepted = False
+            fault = ResolvedPathFault(layout.bin_root)
 
             def replace_before_bin(
                 path: Path,
@@ -1900,7 +1909,7 @@ class MachineBootstrapTests(unittest.TestCase):
                 root_binding: object | None = None,
             ) -> None:
                 nonlocal intercepted
-                if path == layout.bin_root and not intercepted:
+                if not intercepted and fault.matches(path):
                     intercepted = True
                     os.replace(layout.install_root, retained)
                     substitute.mkdir()
@@ -1927,6 +1936,7 @@ class MachineBootstrapTests(unittest.TestCase):
                         version_info=(3, 13),
                     )
 
+            self.assertEqual(fault.interceptions, 1)
             self.assertTrue(intercepted)
             self.assertEqual(list(substitute.iterdir()), [])
             self.assertFalse((retained / "bin").exists())
