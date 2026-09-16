@@ -3,17 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 import unittest
 
-from orchestrate.machine_bootstrap import register_user_path
+from orchestrate.machine_bootstrap import UserPathValue, register_user_path
 
 
 class MemoryUserPath:
     def __init__(self, value: str) -> None:
         self.value = value
 
-    def read(self) -> str:
-        return self.value
+    def read(self) -> UserPathValue:
+        return UserPathValue(self.value, 2)
 
-    def write(self, value: str) -> None:
+    def replace(self, expected: UserPathValue, value: str) -> None:
+        if expected != UserPathValue(self.value, 2):
+            raise AssertionError("PATH replacement did not bind the observed value")
         self.value = value
 
 

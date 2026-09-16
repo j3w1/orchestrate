@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from contextlib import nullcontext, redirect_stdout
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import threading
+from types import ModuleType
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -15,6 +20,10 @@ from orchestrate.cli import _print_human, main
 from orchestrate.machine_bootstrap import (
     MachineLayout,
     MachineBootstrapResult,
+    RegistryUserPathStore,
+    UserPathValue,
+    _install_receipt_matches,
+    _VenvBinding,
     _windows_shim_text,
     _wsl_shim_text,
     ensure_machine,
@@ -24,19 +33,37 @@ from orchestrate.machine_bootstrap import (
 from path_faults import ResolvedPathFault
 
 
+LIVENESS_TIMEOUT = 10.0
+
+
 class FakeUserPath:
-    def __init__(self, value: str = "") -> None:
+    def __init__(self, value: str = "", *, kind: int = 2, exists: bool = True) -> None:
         self.value = value
+        self.kind = kind
+        self.exists = exists
         self.reads = 0
         self.writes: list[str] = []
+        self.before_replace: object = None
+        self._mutex = threading.Lock()
 
-    def read(self) -> str:
-        self.reads += 1
-        return self.value
+    def read(self) -> UserPathValue:
+        with self._mutex:
+            self.reads += 1
+            return UserPathValue(self.value, self.kind, self.exists)
 
-    def write(self, value: str) -> None:
-        self.value = value
-        self.writes.append(value)
+    def replace(self, expected: UserPathValue, value: str) -> None:
+        hook = self.before_replace
+        if callable(hook):
+            hook()
+        with self._mutex:
+            if UserPathValue(self.value, self.kind, self.exists) != expected:
+                raise OrchestrateError(
+                    "synthetic concurrent PATH change",
+                    code="machine_bootstrap_path_changed",
+                )
+            self.value = value
+            self.exists = True
+            self.writes.append(value)
 
 
 def fixture_layout(root: Path) -> MachineLayout:
@@ -59,13 +86,26 @@ def fixture_layout(root: Path) -> MachineLayout:
     )
 
 
+def write_pyvenv_config(layout: MachineLayout) -> bytes:
+    raw = b"home = C:\\Python313\ninclude-system-site-packages = false\nversion = 3.13.9\n"
+    (layout.venv_root / "pyvenv.cfg").write_bytes(raw)
+    return raw
+
+
 def install_ready_files(layout: MachineLayout) -> None:
     layout.scripts_root.mkdir(parents=True, exist_ok=True)
+    config = write_pyvenv_config(layout)
     (layout.scripts_root / "python.exe").write_bytes(b"fixture")
     layout.command_path.write_bytes(b"fixture")
     layout.install_receipt.write_text(
         json.dumps(
-            {"schema": "orchestrate-machine-install/v1", "sourceRoot": str(layout.source_root.resolve())},
+            {
+                "schema": "orchestrate-machine-install/v2",
+                "sourceRoot": str(layout.source_root.resolve()),
+                "venvRoot": str(layout.venv_root.resolve()),
+                "pythonPath": str((layout.scripts_root / "python.exe").resolve()),
+                "pyvenvConfigSha256": f"sha256:{hashlib.sha256(config).hexdigest()}",
+            },
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -89,6 +129,7 @@ class SyntheticInstaller:
             return subprocess.CompletedProcess(argv, 31)
         if argv[1:3] == ("-m", "venv"):
             self.layout.scripts_root.mkdir(parents=True)
+            write_pyvenv_config(self.layout)
             (self.layout.scripts_root / "python.exe").write_bytes(b"fixture")
         if "--editable" in argv:
             self.layout.command_path.write_bytes(b"fixture")
@@ -177,6 +218,181 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(len(store.writes), write_count)
             self.assertEqual(store.value.split(";").count(str(layout.bin_root)), 1)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX directory-symlink analogue; native Windows uses reparse-point checks",
+    )
+    def test_redirected_venv_is_rejected_before_any_pip_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            unrelated = root / "unrelated-environment"
+            scripts = unrelated / "Scripts"
+            scripts.mkdir(parents=True)
+            (unrelated / "pyvenv.cfg").write_bytes(
+                b"home = /unrelated\ninclude-system-site-packages = false\nversion = 3.13.9\n"
+            )
+            (scripts / "python.exe").write_bytes(b"unrelated")
+            layout.install_root.mkdir(parents=True)
+            layout.venv_root.symlink_to(unrelated, target_is_directory=True)
+            runner = SyntheticInstaller(layout)
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=FakeUserPath(),
+                    resolver=lambda *_: None,
+                    runner=runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_install_identity_unproven")
+            self.assertEqual(runner.calls, [])
+            self.assertFalse((scripts / "orchestrate.exe").exists())
+
+    def test_bound_venv_change_stops_before_the_next_pip_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            layout.scripts_root.mkdir(parents=True)
+            write_pyvenv_config(layout)
+            (layout.scripts_root / "python.exe").write_bytes(b"fixture")
+            calls: list[tuple[str, ...]] = []
+
+            def mutate_after_first(argv: tuple[str, ...], **_: object) -> subprocess.CompletedProcess[object]:
+                calls.append(argv)
+                (layout.venv_root / "pyvenv.cfg").write_bytes(
+                    b"home = C:\\Changed\ninclude-system-site-packages = false\nversion = 3.13.9\n"
+                )
+                return subprocess.CompletedProcess(argv, 0)
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=FakeUserPath(),
+                    resolver=lambda *_: None,
+                    runner=mutate_after_first,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertEqual(held.exception.code, "machine_bootstrap_venv_identity_changed")
+            self.assertEqual(len(calls), 1)
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX symlink victim probe; Windows staging uses the same exclusive random-name path",
+    )
+    def test_predictable_legacy_temp_links_cannot_overwrite_unrelated_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            install_ready_files(layout)
+            layout.install_receipt.write_text(
+                '{"schema":"orchestrate-machine-install/v1","sourceRoot":"stale"}\n',
+                encoding="utf-8",
+            )
+            layout.windows_shim.write_text("wrong\n", encoding="utf-8")
+            receipt_victim = root / "receipt-victim"
+            shim_victim = root / "shim-victim"
+            receipt_victim.write_text("receipt-safe", encoding="utf-8")
+            shim_victim.write_text("shim-safe", encoding="utf-8")
+            (layout.install_root / "install.json.tmp").symlink_to(receipt_victim)
+            (layout.bin_root / "orchestrate.cmd.tmp").symlink_to(shim_victim)
+            store = FakeUserPath()
+
+            result = ensure_machine(
+                layout=layout,
+                path_store=store,
+                resolver=resolving(layout, store),
+                runner=SyntheticInstaller(layout),
+                platform="win32",
+                version_info=(3, 13),
+            )
+
+            self.assertEqual(result.state, "repaired")
+            self.assertEqual(receipt_victim.read_text(encoding="utf-8"), "receipt-safe")
+            self.assertEqual(shim_victim.read_text(encoding="utf-8"), "shim-safe")
+
+    def test_receipt_replacement_is_bounded_on_the_opened_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            install_ready_files(layout)
+            replacement = layout.install_root / "oversized-receipt"
+            replacement.write_bytes(layout.install_receipt.read_bytes() + b" " * (8 * 1024 * 1024))
+            fault = ResolvedPathFault(layout.install_receipt)
+            real_open = os.open
+
+            def swapping_open(candidate: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+                if fault.matches(candidate):
+                    os.replace(replacement, layout.install_receipt)
+                return real_open(candidate, flags, mode, dir_fd=dir_fd)
+
+            with patch("orchestrate.machine_bootstrap.os.open", swapping_open):
+                with _VenvBinding(layout) as binding:
+                    self.assertFalse(_install_receipt_matches(layout, binding))
+
+            self.assertEqual(fault.interceptions, 1)
+
+    def test_machine_bootstrap_serializes_concurrent_first_install(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            store = FakeUserPath()
+            runner = SyntheticInstaller(layout)
+            first_effect_started = threading.Event()
+            release_first_effect = threading.Event()
+            second_fast_check = threading.Event()
+            original_call = runner.__call__
+            original_read = store.read
+            results: list[MachineBootstrapResult] = []
+            errors: list[BaseException] = []
+
+            def gated_runner(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[object]:
+                if argv[1:3] == ("-m", "venv"):
+                    first_effect_started.set()
+                    if not release_first_effect.wait(LIVENESS_TIMEOUT):
+                        raise AssertionError("concurrency fixture did not release the first effect")
+                return original_call(argv, **kwargs)
+
+            def observed_read() -> UserPathValue:
+                value = original_read()
+                if store.reads >= 3:
+                    second_fast_check.set()
+                return value
+
+            store.read = observed_read  # type: ignore[method-assign]
+
+            def invoke() -> None:
+                try:
+                    results.append(
+                        ensure_machine(
+                            layout=layout,
+                            path_store=store,
+                            resolver=resolving(layout, store),
+                            runner=gated_runner,
+                            platform="win32",
+                            version_info=(3, 13),
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            first = threading.Thread(target=invoke, daemon=True)
+            first.start()
+            self.assertTrue(first_effect_started.wait(LIVENESS_TIMEOUT), "first invocation reached no effect")
+            second = threading.Thread(target=invoke, daemon=True)
+            second.start()
+            self.assertTrue(second_fast_check.wait(LIVENESS_TIMEOUT), "second invocation reached no fast check")
+            release_first_effect.set()
+            first.join(LIVENESS_TIMEOUT)
+            second.join(LIVENESS_TIMEOUT)
+
+            self.assertFalse(first.is_alive() or second.is_alive(), "concurrent bootstrap did not settle")
+            self.assertEqual(errors, [])
+            self.assertEqual(sorted(result.state for result in results), ["ready", "repaired"])
+            self.assertEqual(len(runner.calls), 4)
+            self.assertEqual(len(store.writes), 1)
+
     def test_path_repair_collapses_only_its_duplicates_and_takes_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             layout = fixture_layout(Path(directory))
@@ -198,24 +414,64 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(result.actions, ("registered_user_path",))
             self.assertEqual(store.value.split(";"), [str(layout.bin_root), foreign_one, foreign_two])
 
+    def test_registry_path_repair_preserves_reg_sz_kind_and_unrelated_text(self) -> None:
+        winreg = ModuleType("winreg")
+        winreg.HKEY_CURRENT_USER = object()  # type: ignore[attr-defined]
+        winreg.REG_SZ = 1  # type: ignore[attr-defined]
+        winreg.REG_EXPAND_SZ = 2  # type: ignore[attr-defined]
+        winreg.KEY_QUERY_VALUE = 1  # type: ignore[attr-defined]
+        winreg.KEY_SET_VALUE = 2  # type: ignore[attr-defined]
+        state: dict[str, object] = {
+            "value": r";%UNCHANGED%;C:\odd spelling\;",
+            "kind": winreg.REG_SZ,  # type: ignore[attr-defined]
+        }
+
+        class Key:
+            def __enter__(self) -> Key:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+        winreg.OpenKey = lambda *_: Key()  # type: ignore[attr-defined]
+        winreg.CreateKeyEx = lambda *_: Key()  # type: ignore[attr-defined]
+        winreg.QueryValueEx = lambda *_: (state["value"], state["kind"])  # type: ignore[attr-defined]
+
+        def set_value(*args: object) -> None:
+            state["kind"] = args[-2]
+            state["value"] = args[-1]
+
+        winreg.SetValueEx = set_value  # type: ignore[attr-defined]
+        entry = Path(r"C:\orchestrate\bin")
+        with patch.dict(sys.modules, {"winreg": winreg}), patch(
+            "orchestrate.machine_bootstrap.sys.platform", "win32"
+        ), patch("ctypes.windll", create=True):
+            self.assertTrue(register_user_path(RegistryUserPathStore(), entry))
+
+        self.assertEqual(state["kind"], winreg.REG_SZ)  # type: ignore[attr-defined]
+        self.assertEqual(state["value"], f"{entry};;%UNCHANGED%;C:\\odd spelling\\;")
+
+    def test_path_compare_and_replace_refuses_a_concurrent_unrelated_change(self) -> None:
+        store = FakeUserPath(r"C:\\one", kind=1)
+
+        def concurrent_change() -> None:
+            store.before_replace = None
+            store.value += r";C:\\new-unrelated"
+
+        store.before_replace = concurrent_change
+        with self.assertRaises(OrchestrateError) as held:
+            register_user_path(store, Path(r"C:\\orchestrate\\bin"))
+
+        self.assertEqual(held.exception.code, "machine_bootstrap_path_changed")
+        self.assertEqual(store.value, r"C:\\one;C:\\new-unrelated")
+        self.assertEqual(store.writes, [])
+
     def test_existing_environment_repairs_launchers_without_reinstall(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             layout = fixture_layout(Path(directory))
-            layout.scripts_root.mkdir(parents=True)
-            (layout.scripts_root / "python.exe").write_bytes(b"fixture")
-            layout.command_path.write_bytes(b"fixture")
-            layout.install_receipt.write_text(
-                json.dumps(
-                    {
-                        "schema": "orchestrate-machine-install/v1",
-                        "sourceRoot": str(layout.source_root.resolve()),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+            install_ready_files(layout)
+            layout.windows_shim.unlink()
+            layout.wsl_shim.unlink()
             store = FakeUserPath()
             runner = SyntheticInstaller(layout)
 
@@ -236,6 +492,7 @@ class MachineBootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             layout = fixture_layout(Path(directory))
             layout.scripts_root.mkdir(parents=True)
+            write_pyvenv_config(layout)
             (layout.scripts_root / "python.exe").write_bytes(b"fixture")
             store = FakeUserPath()
             runner = SyntheticInstaller(layout, fail_phase="ensurepip")
@@ -259,6 +516,7 @@ class MachineBootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             layout = fixture_layout(Path(directory))
             layout.scripts_root.mkdir(parents=True)
+            write_pyvenv_config(layout)
             (layout.scripts_root / "python.exe").write_bytes(b"fixture")
             store = FakeUserPath()
 
@@ -299,24 +557,25 @@ class MachineBootstrapTests(unittest.TestCase):
             layout = fixture_layout(Path(directory))
             install_ready_files(layout)
             layout.install_receipt.write_text(
-                '{"schema":"orchestrate-machine-install/v1",'
+                '{"schema":"orchestrate-machine-install/v2",'
                 '"sourceRoot":"wrong","sourceRoot":"also-wrong"}\n',
                 encoding="utf-8",
             )
             store = FakeUserPath(str(layout.bin_root))
             runner = SyntheticInstaller(layout)
 
-            result = ensure_machine(
-                layout=layout,
-                path_store=store,
-                resolver=resolving(layout, store),
-                runner=runner,
-                platform="win32",
-                version_info=(3, 13),
-            )
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=store,
+                    resolver=resolving(layout, store),
+                    runner=runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
 
-            self.assertEqual(result.actions, ("installed_editable_checkout",))
-            self.assertTrue(any("--editable" in call for call in runner.calls))
+            self.assertEqual(held.exception.code, "machine_bootstrap_receipt_identity_unproven")
+            self.assertEqual(runner.calls, [])
 
     def test_unsupported_python_and_incomplete_venv_fail_before_unrelated_effects(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -352,31 +611,18 @@ class MachineBootstrapTests(unittest.TestCase):
     def test_path_sensitive_shim_write_fault_is_explicit_and_recoverable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             layout = fixture_layout(Path(directory))
-            layout.scripts_root.mkdir(parents=True)
-            (layout.scripts_root / "python.exe").write_bytes(b"fixture")
-            layout.command_path.write_bytes(b"fixture")
-            layout.install_receipt.write_text(
-                json.dumps(
-                    {
-                        "schema": "orchestrate-machine-install/v1",
-                        "sourceRoot": str(layout.source_root.resolve()),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+            install_ready_files(layout)
+            layout.wsl_shim.unlink()
             store = FakeUserPath()
             fault = ResolvedPathFault(layout.wsl_shim)
-            real_replace = Path.replace
+            real_link = os.link
 
-            def replace(candidate: Path, target: Path) -> Path:
+            def link(candidate: str, target: str, *, follow_symlinks: bool = True) -> None:
                 if fault.matches(target):
                     raise PermissionError("synthetic launcher denial")
-                return real_replace(candidate, target)
+                real_link(candidate, target, follow_symlinks=follow_symlinks)
 
-            with patch.object(Path, "replace", replace):
+            with patch("orchestrate.machine_bootstrap.os.link", link):
                 with self.assertRaises(OrchestrateError) as held:
                     ensure_machine(
                         layout=layout,

@@ -46,7 +46,7 @@ From the reviewed orchestrate checkout, use its small first-entry script and nam
 py -3.13 .\bootstrap.py setup --project C:\path\to\your-project --json
 ```
 
-That one command verifies Python 3.13, creates the dedicated environment under `%LOCALAPPDATA%\orchestrate\venv`, prepares pip, installs the reviewed checkout in editable mode, installs the Windows and WSL-facing launchers, and puts `%LOCALAPPDATA%\orchestrate\bin` first on the **user** PATH. It then continues the requested project setup. It never edits the system PATH or another Python environment.
+That one command verifies Python 3.13, creates the dedicated environment under `%LOCALAPPDATA%\orchestrate\venv`, physically verifies that environment before every pip step, installs the reviewed checkout in editable mode, installs the Windows and WSL-facing launchers, and puts `%LOCALAPPDATA%\orchestrate\bin` first on the **user** PATH. It then continues the requested project setup. It refuses redirected or unprovable install paths, never edits the system PATH, and never falls through to another Python environment.
 
 Open a new terminal after the first run. The normal command is now available:
 
@@ -55,9 +55,9 @@ orchestrate doctor
 orchestrate setup --project C:\path\to\another-project --json
 ```
 
-Every later `setup` begins with one user-PATH lookup and fixed launcher checks. When those are healthy it performs no environment creation, pip command, install, scan, upgrade, or model call, and prints no bootstrap message. If a launcher or PATH entry needs repair, setup repairs only the dedicated installation and reports the actions. Repeating either path is idempotent: the PATH contains one canonical entry and an existing editable install is not repeated.
+Every later `setup` begins with one user-PATH lookup and bounded fixed launcher/receipt checks. When those are healthy it performs no environment creation, pip command, install, scan, upgrade, or model call, and prints no bootstrap message. If a launcher or PATH entry needs repair, setup repairs only the dedicated installation and reports the actions. Repair preserves the existing `REG_SZ` or `REG_EXPAND_SZ` PATH kind and unrelated entry text. Concurrent setup commands share one machine-bootstrap lock, so the editable install is performed once and the follower reuses it.
 
-If bootstrap stops, its error names the failed phase. Correct the reported Python, filesystem, pip/network, or user-registry problem and run the same checkout command again; completed steps are reused. An incomplete dedicated venv is never silently overwritten—move that one `%LOCALAPPDATA%\orchestrate\venv` directory aside after inspection, then rerun. `doctor` is read-only unless you explicitly select an active probe; the active compatibility probe has additional disposable-project requirements and is not needed for normal work.
+If bootstrap stops, its error names the failed phase. Correct the reported Python, filesystem, pip/network, or user-registry problem and run the same checkout command again; completed steps are reused. An incomplete, redirected, or identity-mismatched dedicated venv is never silently overwritten—move that one `%LOCALAPPDATA%\orchestrate\venv` directory aside after inspection, then rerun. Likewise, inspect and move aside an unrecognized receipt or launcher entry rather than asking bootstrap to overwrite it. `doctor` is read-only unless you explicitly select an active probe; the active compatibility probe has additional disposable-project requirements and is not needed for normal work.
 
 ### Agent skill
 
