@@ -118,6 +118,8 @@ REQUIRED_STATE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
             "record_json",
             "correction_key",
             "evidence_digest",
+            "correction_evidence_digest",
+            "diagnosis_evidence_digest",
             "correction_count",
             "diagnosis_status",
             "created_at",
@@ -639,6 +641,8 @@ class StateStore(AbstractContextManager["StateStore"]):
                 record_json TEXT NOT NULL,
                 correction_key TEXT NOT NULL,
                 evidence_digest TEXT NOT NULL,
+                correction_evidence_digest TEXT NOT NULL,
+                diagnosis_evidence_digest TEXT,
                 correction_count INTEGER NOT NULL,
                 diagnosis_status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -706,6 +710,33 @@ class StateStore(AbstractContextManager["StateStore"]):
         }
         if "returncode" not in intention_columns:
             self.connection.execute("ALTER TABLE intentions ADD COLUMN returncode INTEGER")
+        intervention_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(interventions)").fetchall()
+        }
+        if "correction_evidence_digest" not in intervention_columns:
+            self.connection.execute("ALTER TABLE interventions ADD COLUMN correction_evidence_digest TEXT")
+        if "diagnosis_evidence_digest" not in intervention_columns:
+            self.connection.execute("ALTER TABLE interventions ADD COLUMN diagnosis_evidence_digest TEXT")
+        legacy_interventions = self.connection.execute(
+            """SELECT run_local_id, task_key, record_json, evidence_digest, diagnosis_status
+               FROM interventions WHERE correction_evidence_digest IS NULL"""
+        ).fetchall()
+        for row in legacy_interventions:
+            correction_digest = row["evidence_digest"]
+            try:
+                record = json.loads(row["record_json"])
+                evidence = record.get("last_meaningful_evidence") if isinstance(record, dict) else None
+                if isinstance(evidence, str) and evidence.strip():
+                    correction_digest = "evidence_sha256_" + hashlib.sha256(evidence.encode("utf-8")).hexdigest()
+            except (TypeError, json.JSONDecodeError):
+                pass
+            diagnosis_digest = row["evidence_digest"] if row["diagnosis_status"] == "productive" else None
+            self.connection.execute(
+                """UPDATE interventions
+                   SET correction_evidence_digest = ?, diagnosis_evidence_digest = ?
+                   WHERE run_local_id = ? AND task_key = ?""",
+                (correction_digest, diagnosis_digest, row["run_local_id"], row["task_key"]),
+            )
         self.connection.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema', ?)",
             (STATE_SCHEMA,),

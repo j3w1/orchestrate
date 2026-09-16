@@ -164,7 +164,7 @@ orchestrate intervention --run <run-id> --task <task-id> --record intervention.j
 orchestrate intervention --run <run-id> --task <task-id> --diagnosis diagnosis.json --json
 ```
 
-The record contains exactly `obligation`, `failing_example`, `hypothesis`, `last_meaningful_evidence`, `next_discriminating_check`, and `correction_key`. A diagnosis file contains exactly `diagnosis_evidence`, as a string when it found new evidence or `null` when it did not. These commands update only the bounded host-local ledger: they do not create a Dispatch, clear admission, retry work, or override project governance.
+The record contains exactly `obligation`, `failing_example`, `hypothesis`, `last_meaningful_evidence`, `next_discriminating_check`, and `correction_key`. A diagnosis file contains exactly `diagnosis_evidence`, as a string when it found new evidence or `null` when it did not. Correction and diagnosis evidence identities remain distinct, so replaying either consumed identity cannot authorize another correction; only genuinely different later evidence can. These commands update only the bounded host-local ledger: they do not create a Dispatch, clear admission, retry work, or override project governance.
 
 Omitting an objective resumes only when one local Run is unambiguous. Multiple Runs always require an explicit selection. A succeeded default owner leaves verification pending by design; a planned milestone reaches `review_accepted` only after every planned verification result and the exact final review are accepted.
 

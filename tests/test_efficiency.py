@@ -240,6 +240,62 @@ class EfficiencyTests(unittest.TestCase):
             self.assertEqual(second["status"], "diagnosis_required")
             self.assertEqual(rejected.exception.code, "intervention_input_invalid")
 
+    def test_public_intervention_consumes_productive_evidence_before_genuine_change(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            project = Path(project_dir)
+            subprocess.run(("git", "init", "-q", project), check=True)
+            with patch.dict(os.environ, {"ORCHESTRATE_HOME": home_dir}):
+                with StateStore(project) as store:
+                    run = store.create_run(objective="fix", profile_digest="p", source_digest="s")
+                    run = store.update_run(run.local_id, native_run_id="run_1", task_id="task_1")
+
+                def write_record(path: Path, evidence: str) -> None:
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "obligation": "reject mixed aliases",
+                                "failing_example": "mixed payload accepted",
+                                "hypothesis": "normalization is early",
+                                "last_meaningful_evidence": evidence,
+                                "next_discriminating_check": "run the shape matrix",
+                                "correction_key": "move-check",
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+
+                original = project / "original.json"
+                productive = project / "productive.json"
+                fresh = project / "fresh.json"
+                diagnosis = project / "diagnosis.json"
+                write_record(original, "fixture 4 failed")
+                write_record(productive, "diagnosis isolated shape selection")
+                write_record(fresh, "new fixture 7 failed")
+                diagnosis.write_text(
+                    json.dumps({"diagnosis_evidence": "diagnosis isolated shape selection"}),
+                    encoding="utf-8",
+                )
+
+                decisions = [
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=original, diagnosis_path=None)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=original, diagnosis_path=None)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=None, diagnosis_path=diagnosis)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=original, diagnosis_path=None)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=productive, diagnosis_path=None)["status"],
+                    run_intervention(project, run_id=run.local_id, task="task_1", record_path=fresh, diagnosis_path=None)["status"],
+                ]
+            self.assertEqual(
+                decisions,
+                [
+                    "correction_allowed",
+                    "diagnosis_required",
+                    "correction_allowed",
+                    "unresolved",
+                    "unresolved",
+                    "correction_allowed",
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

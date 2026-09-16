@@ -23,6 +23,7 @@ from orchestrate.controller import (
     _mutation,
     _process_delivery,
     _record_input_submission_diagnostic,
+    _recover_milestone_worker_projections,
     _release_disposition,
     _request_id,
     _run_summary,
@@ -37,10 +38,11 @@ from orchestrate.controller import (
 )
 from orchestrate.cli import main as cli_main
 from orchestrate.errors import OrchestrateError
+from orchestrate.coordination import MilestonePlan, MilestoneTask, SharedContract
 from orchestrate.identity import require_plain_controller
 from orchestrate.orca import OrcaCommandError, OrcaCommandResult, OrcaJsonResponse
 from orchestrate.packets import canonical_packet_json, expected_packet_id, make_packet, packet_spec
-from orchestrate.profile import setup_project
+from orchestrate.profile import ProjectProfile, setup_project
 from orchestrate.readers import read_project
 from orchestrate.sources import build_source_index
 from orchestrate.state import AdmissionEffectFence, StateStore
@@ -2101,7 +2103,8 @@ class ControllerTests(MilestoneRepo):
                         (local_run_id,),
                     )
                 elif kind == "noncanonical_plan_json":
-                    noncanonical = json.dumps(json.loads(plan_row["plan_json"]), indent=2)
+                    noncanonical = json.dumps(json.loads(plan_row["plan_json"]), separators=(",", ":"))
+                    self.assertNotEqual(noncanonical, plan_row["plan_json"])
                     store.connection.execute(
                         "UPDATE milestone_plan_bindings SET plan_json = ? WHERE run_local_id = ?",
                         (noncanonical, local_run_id),
@@ -2600,6 +2603,151 @@ class ControllerTests(MilestoneRepo):
                 require_context=False,
             )
         self.assertEqual(resumed.exception.code, "unknown_external_effect")
+        starts_after = len([call for call in client.calls if call[:2] == ("orchestration", "worker-start")])
+        self.assertEqual(starts_after, starts_before)
+
+    def test_unresolved_milestone_launch_precedes_native_ready_validation(self) -> None:
+        contract = SharedContract.draft({"interface": "frozen-v1"}).settle()
+        candidate = "candidate_exact"
+        plan = MilestonePlan(
+            contract,
+            candidate,
+            (
+                MilestoneTask(
+                    "owner",
+                    "Owner",
+                    "Own integration",
+                    "owner",
+                    gate="integration",
+                    integration_owner=True,
+                    writes_shared_contract=True,
+                    candidate_digest=candidate,
+                    contract_digest=contract.digest,
+                ),
+                MilestoneTask(
+                    "verify",
+                    "Verify",
+                    "Verify exact candidate",
+                    "specialist",
+                    dependencies=("owner",),
+                    gate="verification",
+                    independently_useful=True,
+                    candidate_digest=candidate,
+                    contract_digest=contract.digest,
+                ),
+            ),
+        )
+        client = FakeClient([])
+        with StateStore(self.root) as store:
+            run = store.create_run(objective="recover", profile_digest="p", source_digest="s")
+            run = store.update_run(run.local_id, native_run_id="run_1", task_id="task_1")
+            intention = store.prepare_intention(
+                run.local_id,
+                "milestone-worker-start:verify",
+                ["orchestration", "worker-start"],
+            )
+            store.mark_intention(intention, "uncertain", request_id="request_unknown")
+            with self.assertRaises(OrchestrateError) as caught:
+                _recover_milestone_worker_projections(
+                    client,  # type: ignore[arg-type]
+                    store,
+                    run,
+                    ProjectProfile.load(self.root),
+                    plan,
+                    worktree_id=None,
+                )
+        self.assertEqual(caught.exception.code, "unknown_external_effect")
+        self.assertEqual(client.calls, [])
+
+    @requires_native_windows_admission
+    def test_resume_reconstructs_applied_milestone_start_before_queued_completion(self) -> None:
+        objective = "Integrate then recover the exact applied follow-up launch"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+        first = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        self.assertEqual(first["status"], "milestone_waiting")
+        starts_before = [call for call in client.calls if call[:2] == ("orchestration", "worker-start")]
+        self.assertEqual(sum(call[call.index("--task") + 1] == "task_2" for call in starts_before), 1)
+
+        queued = client._delivery()
+        delivery_id = queued["result"]["deliveryId"]  # type: ignore[index]
+        messages = queued["result"]["messages"]  # type: ignore[index]
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            store.journal_delivery(run.local_id, delivery_id, queued, messages)  # type: ignore[arg-type]
+            store.update_run(run.local_id, delivery_id=delivery_id)
+            store.connection.execute(
+                "DELETE FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            )
+            store.connection.execute(
+                """DELETE FROM evidence WHERE run_local_id = ? AND kind = 'efficiency-event'
+                   AND payload_json LIKE '%\"identity\":\"dispatch_2\"%'""",
+                (run.local_id,),
+            )
+        client.deliveries_paused = False
+
+        resumed = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        self.assertEqual(resumed["status"], "worker_succeeded")
+        self.assertEqual(resumed["verification"], "review_accepted")
+        starts_after = [call for call in client.calls if call[:2] == ("orchestration", "worker-start")]
+        self.assertEqual(sum(call[call.index("--task") + 1] == "task_2" for call in starts_after), 1)
+        releases = [call for call in client.calls if call[:2] == ("orchestration", "worker-release")]
+        self.assertEqual(sum(call[call.index("--dispatch") + 1] == "dispatch_2" for call in releases), 1)
+
+    @requires_native_windows_admission
+    def test_resume_repairs_missing_session_projection_idempotently(self) -> None:
+        objective = "Integrate then repair interrupted telemetry projection"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+        implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            store.connection.execute(
+                """DELETE FROM evidence WHERE run_local_id = ? AND kind = 'efficiency-event'
+                   AND payload_json LIKE '%\"identity\":\"dispatch_2\"%'""",
+                (run.local_id,),
+            )
+        starts_before = len([call for call in client.calls if call[:2] == ("orchestration", "worker-start")])
+        for _ in range(2):
+            report = resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=1,
+                require_context=False,
+            )
+            self.assertEqual(report["status"], "milestone_waiting")
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            events = store.connection.execute(
+                """SELECT payload_json FROM evidence WHERE run_local_id = ? AND kind = 'efficiency-event'
+                   AND payload_json LIKE '%\"identity\":\"dispatch_2\"%'""",
+                (run.local_id,),
+            ).fetchall()
+        self.assertEqual(len(events), 1)
         starts_after = len([call for call in client.calls if call[:2] == ("orchestration", "worker-start")])
         self.assertEqual(starts_after, starts_before)
 

@@ -75,12 +75,17 @@ class InterventionLedger:
             ).fetchone()
             if row is None:
                 self.store.connection.execute(
-                    "INSERT INTO interventions VALUES (?, ?, ?, ?, ?, 1, 'not_needed', ?, ?)",
+                    """INSERT INTO interventions(
+                           run_local_id, task_key, record_json, correction_key, evidence_digest,
+                           correction_evidence_digest, diagnosis_evidence_digest, correction_count,
+                           diagnosis_status, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, NULL, 1, 'not_needed', ?, ?)""",
                     (
                         self.run_local_id,
                         task_key,
                         encoded,
                         correction_key,
+                        record.evidence_digest,
                         record.evidence_digest,
                         now,
                         now,
@@ -89,18 +94,21 @@ class InterventionLedger:
                 return "correction_allowed"
             same_attempt = (
                 row["correction_key"] == correction_key
-                and row["evidence_digest"] == record.evidence_digest
+                and record.evidence_digest
+                in {row["correction_evidence_digest"], row["diagnosis_evidence_digest"]}
             )
             if not same_attempt:
                 self.store.connection.execute(
                     """UPDATE interventions
                        SET record_json = ?, correction_key = ?, evidence_digest = ?,
+                           correction_evidence_digest = ?, diagnosis_evidence_digest = NULL,
                            correction_count = correction_count + 1,
                            diagnosis_status = 'not_needed', updated_at = ?
                        WHERE run_local_id = ? AND task_key = ?""",
                     (
                         encoded,
                         correction_key,
+                        record.evidence_digest,
                         record.evidence_digest,
                         now,
                         self.run_local_id,
@@ -141,13 +149,15 @@ class InterventionLedger:
                 if isinstance(diagnosis_evidence, str) and diagnosis_evidence.strip()
                 else None
             )
-            productive = new_digest is not None and new_digest != row["evidence_digest"]
+            productive = new_digest is not None and new_digest != row["correction_evidence_digest"]
             changed = self.store.connection.execute(
                 """UPDATE interventions
                    SET evidence_digest = COALESCE(?, evidence_digest),
+                       diagnosis_evidence_digest = ?,
                        diagnosis_status = ?, updated_at = ?
                    WHERE run_local_id = ? AND task_key = ? AND diagnosis_status = 'required'""",
                 (
+                    new_digest,
                     new_digest,
                     "productive" if productive else "unresolved",
                     utc_now(),
@@ -174,6 +184,8 @@ class InterventionLedger:
             "record": json.loads(row["record_json"]),
             "correctionKey": row["correction_key"],
             "evidenceDigest": row["evidence_digest"],
+            "correctionEvidenceDigest": row["correction_evidence_digest"],
+            "diagnosisEvidenceDigest": row["diagnosis_evidence_digest"],
             "correctionCount": row["correction_count"],
             "diagnosisStatus": row["diagnosis_status"],
         }

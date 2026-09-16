@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -61,6 +63,104 @@ class InterventionTests(unittest.TestCase):
                     "correction_allowed",
                 )
                 self.assertEqual(ledger.read("task")["correctionCount"], 2)  # type: ignore[index]
+
+    def test_productive_diagnosis_consumes_original_and_diagnosis_evidence_replays(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            with StateStore(Path(project_dir), home=Path(home_dir)) as store:
+                run = store.create_run(objective="fix", profile_digest="p", source_digest="s")
+                ledger = InterventionLedger(store, run.local_id)
+                original = InterventionRecord("obligation", "failure", "hypothesis", "evidence one", "check")
+                productive = InterventionRecord("obligation", "failure", "hypothesis", "diagnosis evidence", "check")
+                genuinely_new = InterventionRecord("obligation", "failure", "hypothesis", "evidence three", "check")
+
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=original),
+                    "correction_allowed",
+                )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=original),
+                    "diagnosis_required",
+                )
+                self.assertEqual(
+                    ledger.finish_diagnosis(task_key="task", diagnosis_evidence="diagnosis evidence"),
+                    "correction_allowed",
+                )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=original),
+                    "unresolved",
+                )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=productive),
+                    "unresolved",
+                )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=genuinely_new),
+                    "correction_allowed",
+                )
+                state = ledger.read("task")
+                self.assertEqual(state["correctionCount"], 2)  # type: ignore[index]
+                self.assertEqual(state["diagnosisStatus"], "not_needed")  # type: ignore[index]
+
+    def test_old_productive_row_migrates_with_both_evidence_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as home_dir:
+            project = Path(project_dir)
+            home = Path(home_dir)
+            from orchestrate.state import project_key
+
+            state_dir = home / "projects" / project_key(project.resolve())
+            state_dir.mkdir(parents=True)
+            connection = sqlite3.connect(state_dir / "state.sqlite3")
+            original = InterventionRecord("obligation", "failure", "hypothesis", "evidence one", "check")
+            diagnosis = InterventionRecord("obligation", "failure", "hypothesis", "diagnosis evidence", "check")
+            encoded = json.dumps(
+                {
+                    "obligation": original.obligation,
+                    "failing_example": original.failing_example,
+                    "hypothesis": original.hypothesis,
+                    "last_meaningful_evidence": original.last_meaningful_evidence,
+                    "next_discriminating_check": original.next_discriminating_check,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            connection.executescript(
+                """
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta VALUES ('schema', 'orchestrate-state/v1');
+                CREATE TABLE interventions (
+                    run_local_id TEXT NOT NULL,
+                    task_key TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    correction_key TEXT NOT NULL,
+                    evidence_digest TEXT NOT NULL,
+                    correction_count INTEGER NOT NULL,
+                    diagnosis_status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (run_local_id, task_key)
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO interventions VALUES (?, ?, ?, ?, ?, 1, 'productive', ?, ?)",
+                ("run_old", "task", encoded, "same", diagnosis.evidence_digest, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+            )
+            connection.commit()
+            connection.close()
+
+            with StateStore(project, home=home) as store:
+                ledger = InterventionLedger(store, "run_old")
+                state = ledger.read("task")
+                self.assertEqual(state["correctionEvidenceDigest"], original.evidence_digest)  # type: ignore[index]
+                self.assertEqual(state["diagnosisEvidenceDigest"], diagnosis.evidence_digest)  # type: ignore[index]
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=original),
+                    "unresolved",
+                )
+                self.assertEqual(
+                    ledger.consider_correction(task_key="task", correction_key="same", record=diagnosis),
+                    "unresolved",
+                )
 
     def test_incomplete_intervention_record_fails_closed(self) -> None:
         with self.assertRaises(OrchestrateError) as caught:
