@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext, redirect_stdout
 import io
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -379,7 +380,13 @@ class MachineBootstrapTests(unittest.TestCase):
                 binding._provider = _NATIVE_WIN32_PROVIDER
                 kwargs = binding.runner_kwargs()
 
-            self.assertEqual(kwargs, {"executable": str(layout.scripts_root / "python.exe")})
+            self.assertEqual(
+                kwargs,
+                {
+                    "executable": str(layout.scripts_root / "python.exe"),
+                    "cwd": str(layout.venv_root),
+                },
+            )
 
     @unittest.skipUnless(sys.platform == "win32", "requires Windows sharing semantics")
     def test_windows_binding_denies_interpreter_replacement_while_effects_run(self) -> None:
@@ -507,6 +514,37 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(held.exception.code, "machine_bootstrap_commit_identity_changed")
             self.assertEqual(held.exception.data["component"], "commit.stagedSha256")
             self.assertFalse(drifted.exists())
+
+    def test_forced_named_staging_branch_commits_exact_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "named-stage"
+            with patch(
+                "orchestrate.machine_bootstrap._staging_strategy",
+                return_value="named",
+            ):
+                _atomic_write_owned(
+                    target,
+                    b"forced-named\n",
+                    executable=False,
+                    expected_target=None,
+                )
+            self.assertEqual(target.read_bytes(), b"forced-named\n")
+
+    @unittest.skipIf(sys.platform == "win32", "O_TMPFILE is a Linux test-provider branch")
+    def test_forced_anonymous_staging_branch_commits_exact_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "anonymous-stage"
+            with patch(
+                "orchestrate.machine_bootstrap._staging_strategy",
+                return_value="anonymous",
+            ):
+                _atomic_write_owned(
+                    target,
+                    b"forced-anonymous\n",
+                    executable=False,
+                    expected_target=None,
+                )
+            self.assertEqual(target.read_bytes(), b"forced-anonymous\n")
 
     @unittest.skipIf(sys.platform == "win32", "exercises the POSIX O_TMPFILE fallback")
     def test_anonymous_commit_exdev_falls_back_with_exact_bytes(self) -> None:
@@ -791,8 +829,9 @@ class MachineBootstrapTests(unittest.TestCase):
             def replace_after_commit(
                 selected_layout: MachineLayout,
                 source: _SourceBinding,
+                **kwargs: object,
             ) -> _ArchiveBinding:
-                binding = real_builder(selected_layout, source)
+                binding = real_builder(selected_layout, source, **kwargs)
                 os.replace(attacker_archive, selected_layout.source_archive)
                 return binding
 
@@ -839,6 +878,77 @@ class MachineBootstrapTests(unittest.TestCase):
                 _SIMULATED_WIN32_PROVIDER.close_path_pin(bridge)
             finally:
                 _SIMULATED_WIN32_PROVIDER.close_staging_file(descriptor)
+
+    @unittest.skipIf(sys.platform == "win32", "simulated provider uses descriptor-host APIs")
+    def test_retained_writer_cleanup_hands_off_before_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "orchestrate.machine_bootstrap._active_platform_provider",
+            return_value=_SIMULATED_WIN32_PROVIDER,
+        ):
+            target = Path(directory) / "stage.zip"
+            raw = b"retained-stage"
+            retained = _atomic_write_owned(
+                target,
+                raw,
+                executable=False,
+                expected_target=None,
+                retain_descriptor=True,
+            )
+            self.assertIsNotNone(retained)
+            self.assertIsNotNone(retained.temporary_path)
+            with self.assertRaises(PermissionError):
+                _SIMULATED_WIN32_PROVIDER.unlink_staging_file(retained.temporary_path)
+            with _ArchiveBinding(
+                target,
+                staged_descriptor=retained,
+                expected_digest=hashlib.sha256(raw).hexdigest(),
+                expected_size=len(raw),
+            ):
+                self.assertFalse(retained.temporary_path.exists())
+
+    @unittest.skipIf(sys.platform == "win32", "simulated provider uses descriptor-host APIs")
+    def test_simulated_share_admission_is_released_on_binding_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "orchestrate.machine_bootstrap._active_platform_provider",
+            return_value=_SIMULATED_WIN32_PROVIDER,
+        ):
+            root = Path(directory)
+            target = root / "first.zip"
+            retained = _atomic_write_owned(
+                target,
+                b"first",
+                executable=False,
+                expected_target=None,
+                retain_descriptor=True,
+            )
+            with self.assertRaises(OrchestrateError):
+                _ArchiveBinding(
+                    target,
+                    staged_descriptor=retained,
+                    expected_digest=hashlib.sha256(b"different").hexdigest(),
+                    expected_size=5,
+                )
+            reopened = os.open(target, os.O_RDONLY)
+            if reopened != retained.descriptor:
+                os.dup2(reopened, retained.descriptor)
+                os.close(reopened)
+                reopened = retained.descriptor
+            reopened_identity = _target_identity(target)
+            self.assertIsNotNone(reopened_identity)
+            _SIMULATED_WIN32_PROVIDER._admit(
+                reopened_identity,
+                wants_write=False,
+                shares_write=False,
+            )
+            os.close(reopened)
+            self.assertEqual(_SIMULATED_WIN32_PROVIDER._shares, {})
+
+            reused = _SIMULATED_WIN32_PROVIDER.open_staging_file(
+                root / "second.zip",
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            _SIMULATED_WIN32_PROVIDER.close_staging_file(reused)
 
     def test_same_inode_archive_change_between_commit_and_binding_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -922,6 +1032,78 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertEqual(observed, [b"[project]\nname='fixture'\n"])
             self.assertEqual(held.exception.code, "machine_bootstrap_source_identity_changed")
             self.assertFalse(layout.install_receipt.exists())
+
+    @unittest.skipIf(sys.platform == "win32", "non-native effect snapshot branch")
+    def test_forced_named_effect_snapshot_rejects_change_and_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            delegate = SyntheticInstaller(layout)
+            original_call = delegate.__call__
+            consumed: list[bytes] = []
+
+            attacker = io.BytesIO()
+            with zipfile.ZipFile(attacker, "w") as archive:
+                archive.writestr(
+                    "pyproject.toml",
+                    b"[project]\nname='attacker'\n",
+                )
+
+            def mutate_effect(
+                argv: tuple[str, ...], **kwargs: object
+            ) -> subprocess.CompletedProcess[object]:
+                if argv[1:4] == ("-m", "pip", "install") and "--upgrade" not in argv:
+                    effect = Path(argv[-1])
+                    original = effect.read_bytes()
+                    os.chmod(effect, 0o600)
+                    effect.write_bytes(attacker.getvalue())
+                    with zipfile.ZipFile(effect) as archive:
+                        consumed.append(archive.read("pyproject.toml"))
+                    effect.write_bytes(original)
+                    os.chmod(effect, 0o400)
+                return original_call(argv, **kwargs)
+
+            with patch(
+                "orchestrate.machine_bootstrap._effect_snapshot_strategy",
+                return_value="named",
+            ):
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        layout=layout,
+                        path_store=FakeUserPath(),
+                        resolver=lambda *_: None,
+                        runner=mutate_effect,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
+
+            self.assertEqual(consumed, [b"[project]\nname='attacker'\n"])
+            self.assertEqual(held.exception.code, "machine_bootstrap_source_identity_changed")
+            self.assertEqual(
+                held.exception.data["component"],
+                "sourceArchive.pinToEffectSha256",
+            )
+            self.assertFalse(layout.install_receipt.exists())
+
+    @unittest.skipIf(sys.platform == "win32", "non-native effect snapshot branch")
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd is unavailable")
+    def test_forced_memfd_effect_snapshot_installs_reviewed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            runner = SyntheticInstaller(layout)
+            with patch(
+                "orchestrate.machine_bootstrap._effect_snapshot_strategy",
+                return_value="memfd",
+            ):
+                result = ensure_machine(
+                    layout=layout,
+                    path_store=FakeUserPath(),
+                    resolver=lambda *_: str(layout.windows_shim),
+                    runner=runner,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+            self.assertEqual(result.state, "repaired")
+            self.assertTrue(layout.install_receipt.is_file())
 
     def test_archive_rejects_bytes_not_causally_bound_to_reviewed_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1086,6 +1268,54 @@ class MachineBootstrapTests(unittest.TestCase):
                 self.assertEqual(held.exception.data["component"], "venvTree.deniedRedirect")
                 self.assertEqual(list(unrelated.iterdir()), [])
 
+    @unittest.skipIf(sys.platform == "win32", "uses a POSIX child-process redirect analogue")
+    def test_later_child_effect_redirect_is_rejected_before_the_next_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            outside = root / "outside"
+            outside.mkdir()
+            delegate = SyntheticInstaller(layout)
+            original_call = delegate.__call__
+            child_ran = False
+
+            def child_effect(
+                argv: tuple[str, ...], **kwargs: object
+            ) -> subprocess.CompletedProcess[object]:
+                nonlocal child_ran
+                if argv[1:4] == ("-m", "pip", "install") and "--upgrade" in argv:
+                    child_ran = True
+                    script = (
+                        "import os, pathlib; "
+                        f"outside=pathlib.Path({os.fspath(outside)!r}); "
+                        "redirect=pathlib.Path('Lib/site-packages/late-redirect'); "
+                        "redirect.symlink_to(outside, target_is_directory=True); "
+                        "(redirect/'escaped.txt').write_text('outside', encoding='utf-8')"
+                    )
+                    subprocess.run(
+                        (sys.executable, "-c", script),
+                        check=True,
+                        cwd=kwargs["cwd"],
+                    )
+                return original_call(argv, **kwargs)
+
+            with self.assertRaises(OrchestrateError) as held:
+                ensure_machine(
+                    layout=layout,
+                    path_store=FakeUserPath(),
+                    resolver=lambda *_: None,
+                    runner=child_effect,
+                    platform="win32",
+                    version_info=(3, 13),
+                )
+
+            self.assertTrue(child_ran)
+            self.assertEqual(held.exception.code, "machine_bootstrap_venv_identity_changed")
+            self.assertEqual(held.exception.data["component"], "venvTree.nodeType")
+            self.assertTrue((outside / "escaped.txt").is_file())
+            self.assertFalse(layout.source_archive.exists())
+            self.assertFalse(layout.install_receipt.exists())
+
     def test_ancestry_creation_never_follows_a_replaced_earlier_component(self) -> None:
         generator = random.Random(771339)
         for iteration in range(3):
@@ -1117,6 +1347,42 @@ class MachineBootstrapTests(unittest.TestCase):
 
                 self.assertTrue(intercepted)
                 self.assertEqual(list(outside.iterdir()), [])
+
+    @unittest.skipIf(sys.platform == "win32", "native no-delete handles deny root rename")
+    def test_repair_keeps_one_retained_root_across_owned_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = fixture_layout(root)
+            runner = SyntheticInstaller(layout)
+            retained = root / "retained-install"
+            substitute = layout.install_root
+            intercepted = False
+
+            def replace_root(parent: Path) -> None:
+                nonlocal intercepted
+                if intercepted or parent != layout.install_root:
+                    return
+                intercepted = True
+                os.replace(layout.install_root, retained)
+                substitute.mkdir()
+
+            with patch(
+                "orchestrate.machine_bootstrap._before_staging_parent_open",
+                side_effect=replace_root,
+            ):
+                with self.assertRaises(OrchestrateError) as held:
+                    ensure_machine(
+                        layout=layout,
+                        path_store=FakeUserPath(),
+                        resolver=lambda *_: None,
+                        runner=runner,
+                        platform="win32",
+                        version_info=(3, 13),
+                    )
+
+            self.assertTrue(intercepted)
+            self.assertEqual(held.exception.code, "machine_bootstrap_install_identity_changed")
+            self.assertFalse((substitute / layout.source_archive.name).exists())
 
     def test_redirected_install_ancestry_is_refused_before_any_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
