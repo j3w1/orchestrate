@@ -294,6 +294,30 @@ class MachineBootstrapTests(unittest.TestCase):
             self.assertTrue(any("--editable" in call for call in runner.calls))
             self.assertTrue(layout.install_receipt.exists())
 
+    def test_duplicate_key_install_receipt_cannot_skip_reinstallation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            layout = fixture_layout(Path(directory))
+            install_ready_files(layout)
+            layout.install_receipt.write_text(
+                '{"schema":"orchestrate-machine-install/v1",'
+                '"sourceRoot":"wrong","sourceRoot":"also-wrong"}\n',
+                encoding="utf-8",
+            )
+            store = FakeUserPath(str(layout.bin_root))
+            runner = SyntheticInstaller(layout)
+
+            result = ensure_machine(
+                layout=layout,
+                path_store=store,
+                resolver=resolving(layout, store),
+                runner=runner,
+                platform="win32",
+                version_info=(3, 13),
+            )
+
+            self.assertEqual(result.actions, ("installed_editable_checkout",))
+            self.assertTrue(any("--editable" in call for call in runner.calls))
+
     def test_unsupported_python_and_incomplete_venv_fail_before_unrelated_effects(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             layout = fixture_layout(Path(directory))

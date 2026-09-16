@@ -26,6 +26,7 @@ MINIMUM_PYTHON = (3, 13)
 WINDOWS_COMMAND = "orchestrate.cmd"
 WSL_COMMAND = "orchestrate"
 INSTALL_RECEIPT_SCHEMA = "orchestrate-machine-install/v1"
+MAX_INSTALL_RECEIPT_BYTES = 4096
 
 
 class UserPathStore(Protocol):
@@ -232,9 +233,27 @@ def _shim_matches(path: Path, expected: str) -> bool:
 
 
 def _install_receipt_matches(layout: MachineLayout) -> bool:
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate receipt key: {key}")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"unsupported receipt constant: {value}")
+
     try:
-        value = json.loads(layout.install_receipt.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        if layout.install_receipt.stat().st_size > MAX_INSTALL_RECEIPT_BYTES:
+            return False
+        raw = layout.install_receipt.read_bytes().decode("utf-8", errors="strict")
+        value = json.loads(
+            raw,
+            object_pairs_hook=strict_object,
+            parse_constant=reject_constant,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return False
     return value == {
         "schema": INSTALL_RECEIPT_SCHEMA,
