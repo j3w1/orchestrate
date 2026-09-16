@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 import time
 import uuid
@@ -327,13 +328,46 @@ class RunLock(AbstractContextManager["RunLock"]):
 
     def __enter__(self) -> "RunLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.path.open("a+b")
-        self._file.seek(0)
-        if self._file.tell() == 0:
-            self._file.write(b"0")
-            self._file.flush()
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_APPEND
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(os.fspath(self.path), flags, 0o600)
+            opened = os.fstat(descriptor)
+            linked = self.path.lstat()
+            reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or getattr(linked, "st_file_attributes", 0) & reparse
+                or not stat.S_ISREG(linked.st_mode)
+                or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+            ):
+                raise OrchestrateError(
+                    "Host-local lock identity cannot be proven",
+                    code=self.contention_code,
+                    data={"lock": self.path.name},
+                )
+            # Preserve the original append-mode initialization discipline.  On
+            # Windows a contender must never write through the byte-zero lock
+            # before msvcrt.locking has had a chance to report contention.
+            self._file = os.fdopen(descriptor, "a+b", buffering=0)
+            descriptor = None
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
         deadline = time.monotonic() + self.timeout_seconds
         try:
+            self._file.seek(0)
+            if self._file.tell() == 0:
+                self._file.write(b"0")
+                self._file.flush()
             while True:
                 try:
                     self._acquire()

@@ -13,6 +13,7 @@ from .bootstrap import decode_payload, launch_controller
 from .controller import answer, explain, implement, packet, resume, status
 from .doctor import ProbeContractError, collect_doctor_report, create_run_probe, error_report, run_worker_probe
 from .errors import OrchestrateError
+from .machine_bootstrap import ensure_machine
 from .orca import OrcaClient, OrcaCommandError
 from .profile import setup_project
 from .state import StateStore
@@ -104,8 +105,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _print_human(report: dict[str, Any]) -> None:
     print(f"orchestrate: {report.get('status', 'ok')}")
-    if "checks" in report:
-        for check in report["checks"]:
+    machine = report.get("machineBootstrap")
+    if isinstance(machine, dict) and machine.get("state") == "repaired":
+        actions = machine.get("actions")
+        if isinstance(actions, list):
+            print(f"  Machine bootstrap: repaired ({', '.join(str(item) for item in actions)})")
+    checks = report.get("checks")
+    if isinstance(checks, list):
+        for check in checks:
             print(f"  {check['status'].upper():11} {check['name']}: {check['detail']}")
     for label, key in (("Run", "runId"), ("Task", "taskId"), ("Dispatch", "dispatchId")):
         if report.get(key):
@@ -150,6 +157,7 @@ def _execute(args: argparse.Namespace, raw_argv: list[str]) -> tuple[dict[str, A
         exit_code = launch_controller(root, raw_argv, client=client)
         return {"_bootstrapPassthrough": True, "controllerExitCode": exit_code}, False
     if args.command == "setup":
+        machine = ensure_machine()
         profile = setup_project(
             root,
             force=args.force,
@@ -170,6 +178,7 @@ def _execute(args: argparse.Namespace, raw_argv: list[str]) -> tuple[dict[str, A
             "instructions": profile.value["instructions"],
             "taskEntrypoints": profile.value["taskEntrypoints"],
             "checks": "NOT_RUN",
+            "machineBootstrap": machine.as_dict(),
         }, args.json
     if args.command == "implement":
         return implement(

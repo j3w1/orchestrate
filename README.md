@@ -36,19 +36,32 @@ Read [Execution contracts and recovery](docs/contracts-and-recovery.md) for the 
 
 ## Installation
 
-orchestrate requires Python 3.13 or newer. It is not published to PyPI.
+orchestrate requires Python 3.13 or newer and a reviewed checkout. It is not published to PyPI. You do not need to create a virtual environment, run pip, or edit PATH yourself.
 
 ### Windows
 
-Install a reviewed checkout into a virtual environment:
+From the reviewed orchestrate checkout, use its small first-entry script and name the project you want to configure:
 
 ```powershell
-py -3.13 -m venv .venv
-.\.venv\Scripts\python -m pip install --editable .
-.\.venv\Scripts\orchestrate doctor
+py -3.13 .\bootstrap.py setup --project C:\path\to\your-project --json
 ```
 
-`doctor` is read-only unless you explicitly select an active probe. The active compatibility probe has additional disposable-project requirements and is not needed for normal work.
+That one command verifies Python 3.13 and retains a no-follow component chain while it creates installation ancestry. Later installation-root directory creation and file writes stay anchored to that same retained root; POSIX test providers mutate through parent directory descriptors, while native Windows retains a no-delete-shared handle for every component. Child phases receive a verified working directory and bound effect inputs, and a bounded whole-tree scan after each phase rejects redirects that remain. This is containment of orchestrate's paths and acceptance checks, not a sandbox for a child process that deliberately accesses some other absolute path. The command builds a bounded archive from the exact reviewed source bytes and gives that content-bound input—not the mutable checkout pathname—to pip. It then installs the Windows and WSL-facing launchers and puts `%LOCALAPPDATA%\orchestrate\bin` first on the **user** PATH. Windows holds the interpreter and source archive for actual read access without write/delete sharing, passes the interpreter's exact path as the process application name, and checks the same identities before and after every effect; the synthetic provider models read/write/delete share admission. It then continues the requested project setup. It never edits the system PATH and never falls through to another Python environment.
+
+Open a new terminal after the first run. The normal command is now available:
+
+```powershell
+orchestrate doctor
+orchestrate setup --project C:\path\to\another-project --json
+```
+
+Every later `setup` begins with one user-PATH lookup, one command lookup, fixed launcher/receipt reads, and a bounded identity scan of the reviewed checkout. The installed package first loads the reviewed checkout path from the canonical v5 receipt, verifies the separate host-local anchor that authenticates that receipt path and source-tree digest together, and only then opens the recorded checkout; it never guesses from the installed package's `site-packages` location. The private v5 receipt binds its canonical payload, checkout tree, exact source archive, environment, and installed command. The archive builder computes the same framed tree digest from the bytes it writes and refuses any transient mismatch. Every Windows named stage remains a normal addressable node through commit; abandoned stages are closed and explicitly unlinked. Its retained commit record carries exact identity, size, digest, and change token into the archive binding; native Windows retains the archive temporary until a delete-sharing bridge can close the writer, remove only that name, and open the strict read pin without an identity gap. Non-native tests use a sealed `memfd` when available; the named fallback is checked before and after pip for bytes, identity, mode, and change token, and a mutation prevents the install from being receipted even if the bytes are restored. A separate canonical anchor under `%LOCALAPPDATA%\orchestrate-state` binds that receipt digest, source/archive digest, installation nonce, and command digest outside the checkout; its complete directory ancestry is physically pinned and redirected ancestors are refused. Recomputing only checkout-controlled receipt bytes therefore cannot launder a stale command or source path. When the checks are healthy setup performs no environment creation, pip command, install, upgrade, write, or model call and prints no bootstrap message. Missing launchers can be created, while a mismatching existing launcher is preserved and refused for inspection. PATH repair preserves the existing `REG_SZ` or `REG_EXPAND_SZ` kind and unrelated entry text through one transactional compare-and-replace plus read-back. The healthy path requires the one dedicated PATH entry to be first. Concurrent setup commands share one machine-bootstrap lock, so source installation is performed once and the follower reuses it.
+
+Receipt recording preserves the original proof component and expected/observed identity payload when it wraps an anchor-write failure.
+
+Diagnostic values labeled `redacted-string-id:sha256:` identify redacted arbitrary strings. Only a bare `sha256:` value in an explicit digest component represents a content digest.
+
+If bootstrap stops, its error names the failed phase and identity failures report the expected and observed proof component. Correct the reported Python, filesystem, pip/network, or user-registry problem and run the same checkout command again. Safe completed phases are reused; an unreceipted command or source archive left by an interrupted installer is deliberately not guessed to be owned. An incomplete, redirected, or identity-mismatched dedicated venv is never silently overwritten—move that one `%LOCALAPPDATA%\orchestrate\venv` directory aside after inspection, then rerun. Likewise, inspect and move aside an unrecognized receipt, command, anchor, archive, or launcher rather than asking bootstrap to overwrite it. Every included file in the recorded checkout uses the same recovery rule: a temporary access, sharing, or I/O failure is retryable and performs no repair, while a moved, removed, structurally replaced, or updated source is definitive and never falls through to a silent reinstall or fresh source grant. Present files are read through proved handles, and their relative names, executable bits, and exact bytes form the aggregate source digest authenticated by the anchor. When the initial ready scan establishes either classification—including from that aggregate digest—it returns the failure before installation-parent or installation-root preparation and before mutation-lock construction or acquisition. For a retryable result, correct the temporary problem and rerun the installed command; after reviewing a definitive change, move aside `%LOCALAPPDATA%\orchestrate\install.json`, `%LOCALAPPDATA%\orchestrate\installed-source.zip`, `%LOCALAPPDATA%\orchestrate\venv\Scripts\orchestrate.exe`, and `%LOCALAPPDATA%\orchestrate-state\machine-install.json`, then rerun that checkout's `bootstrap.py` first-entry path. The source scan excludes only `.git`, `.venv`, `venv`, names beginning `.venv-` or `venv-`, names ending `-venv` or `.egg-info`, `__pycache__`, `.pytest_cache`, `build`, `dist`, and files ending `.pyc` or `.pyo`. `doctor` is read-only unless you explicitly select an active probe; the active compatibility probe has additional disposable-project requirements and is not needed for normal work.
 
 ### Agent skill
 
@@ -74,18 +87,19 @@ The package never edits `AGENTS.md`, user prompts, or another agent's configurat
 
 The CI workflow runs the complete unit and incident suite on Windows, including the managed-admission and controller-lifecycle fixtures that require native Windows. Linux runs every host-neutral test and explicitly skips only tests whose intended assertion requires the win32-only managed worker admission path. Both jobs run explicit incident discovery, wheel build, isolated install, and CLI help smokes. A workflow definition is not proof that a particular candidate passed; [Validation evidence](docs/validation.md) keeps that distinction explicit. The Orca CLI resolver uses `ORCA_CLI_COMMAND` in a managed forwarded session, `orca-dev` in a dev checkout, `orca-ide` on Linux outside Orca, and `orca` on packaged Windows.
 
-`orchestrate-wsl` is a transport-only launcher. Configure its one machine-local pointer as a JSON argument array naming the reviewed Windows entry point, then pass ordinary CLI arguments:
+Machine bootstrap places an extensionless `orchestrate` shell launcher beside the Windows shim. With WSL's normal Windows-PATH import enabled, it is available in a new WSL shell without a Linux installation:
 
 ```bash
-export ORCHESTRATE_WINDOWS_COMMAND_JSON='["/mnt/c/path/to/windows/.venv/Scripts/orchestrate.exe"]'
-orchestrate-wsl status --json
+orchestrate status --json
 ```
 
-It forwards the exact `WSL_DISTRO_NAME`, absolute Linux working directory, Unicode-safe argument array, inherited streams, and exit code to the Windows receiver. It creates no Linux state directory; the Windows process remains the only state owner. The payload does not choose a worker host, translate an Orca recovery command, or replace Orca placement and lifecycle. A real Windows-coordinated WSL worker lifecycle is still `NOT_RUN` for this candidate, so Linux unit or CI success is not a WSL/provider claim.
+The launcher uses WSL's `python3` only to encode the bounded transport payload. It forwards the exact `WSL_DISTRO_NAME`, absolute Linux working directory, Unicode-safe argument array, inherited streams, and exit code to the Windows executable. It installs no Linux package and creates no Linux state directory; Windows remains the only installation and state owner. Environments that deliberately disable Windows-PATH import must expose the mounted `%LOCALAPPDATA%\orchestrate\bin` directory through their own WSL policy; bootstrap does not edit shell startup files.
+
+The packaged `orchestrate-wsl` entry point remains the same transport implementation for already configured environments using `ORCHESTRATE_WINDOWS_COMMAND_JSON`. Neither launcher chooses a worker host, translates an Orca recovery command, or replaces Orca placement and lifecycle. A real Windows PATH bootstrap and Windows-coordinated WSL lifecycle are still `NOT_RUN` for this candidate, so synthetic or Linux test success is not a live Windows/WSL claim.
 
 ## The Basic Workflow
 
-Start in the project you want to configure:
+After the one-time checkout entry above, start in any project you want to configure:
 
 ```powershell
 orchestrate setup --json
@@ -203,11 +217,15 @@ Live Orca exercises are separate. Use only disposable projects for mutations, ne
 
 ## Updating
 
-Pull the reviewed revision and reinstall it in the same environment:
+Pull a reviewed revision in the same checkout. The source-bound receipt will refuse to bless changed checkout bytes automatically. After review, move aside the prior receipt, pinned archive, installed command, and host-local anchor, then let the checkout entry install a new reviewed-source archive:
 
 ```powershell
 git pull --ff-only
-.\.venv\Scripts\python -m pip install --editable .
+Move-Item "$env:LOCALAPPDATA\orchestrate\install.json" "$env:LOCALAPPDATA\orchestrate\install.json.reviewed-old"
+Move-Item "$env:LOCALAPPDATA\orchestrate\installed-source.zip" "$env:LOCALAPPDATA\orchestrate\installed-source.zip.reviewed-old"
+Move-Item "$env:LOCALAPPDATA\orchestrate\venv\Scripts\orchestrate.exe" "$env:LOCALAPPDATA\orchestrate\venv\Scripts\orchestrate.exe.reviewed-old"
+Move-Item "$env:LOCALAPPDATA\orchestrate-state\machine-install.json" "$env:LOCALAPPDATA\orchestrate-state\machine-install.json.reviewed-old"
+py -3.13 .\bootstrap.py setup --project C:\path\to\your-project --json
 orchestrate doctor
 ```
 

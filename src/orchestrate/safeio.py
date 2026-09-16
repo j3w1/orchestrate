@@ -78,18 +78,47 @@ PROJECT_SOURCE_ENVIRONMENTAL_ERRNOS: Final[frozenset[int]] = frozenset(
         errno.EINTR,
     }
 )
+PROJECT_SOURCE_ABSENT_WINERRORS: Final[frozenset[int]] = frozenset({2, 3})
+PROJECT_SOURCE_STRUCTURAL_WINERRORS: Final[frozenset[int]] = frozenset(
+    {
+        123,  # ERROR_INVALID_NAME
+        1920,  # ERROR_CANT_ACCESS_FILE
+        267,  # ERROR_DIRECTORY
+        4390,  # ERROR_NOT_A_REPARSE_POINT
+    }
+)
+
+
+def project_source_error_codes_state(
+    error_number: int | None,
+    winerror: int | None = None,
+) -> ProjectSourceState:
+    """Partition portable and Windows source errors by their direct evidence."""
+
+    if error_number == errno.ENOENT or winerror in PROJECT_SOURCE_ABSENT_WINERRORS:
+        return ProjectSourceState.ABSENT
+    if (
+        error_number in PROJECT_SOURCE_STRUCTURAL_ERRNOS
+        or winerror in PROJECT_SOURCE_STRUCTURAL_WINERRORS
+    ):
+        return ProjectSourceState.CHANGED
+    # Permission, capacity, interruption, sharing, and unknown failures do not
+    # prove a semantic path change. Unknown error numbers therefore fail
+    # unavailable.
+    return ProjectSourceState.UNAVAILABLE
 
 
 def project_source_error_state(exc: OSError) -> ProjectSourceState:
     """Partition source I/O errors by the evidence carried by their errno."""
 
-    if isinstance(exc, (NotADirectoryError, IsADirectoryError)) or exc.errno in PROJECT_SOURCE_STRUCTURAL_ERRNOS:
+    if isinstance(exc, (NotADirectoryError, IsADirectoryError)):
         return ProjectSourceState.CHANGED
-    if isinstance(exc, FileNotFoundError) or exc.errno == errno.ENOENT:
+    if isinstance(exc, FileNotFoundError):
         return ProjectSourceState.ABSENT
-    # Permission, capacity, interruption, sharing, and unknown failures do not
-    # prove a semantic path change. Unknown errnos therefore fail unavailable.
-    return ProjectSourceState.UNAVAILABLE
+    return project_source_error_codes_state(
+        exc.errno,
+        getattr(exc, "winerror", None),
+    )
 
 
 def project_source_failure_state(exc: OrchestrateError) -> ProjectSourceState | None:
