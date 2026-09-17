@@ -913,7 +913,7 @@ def _create_task_and_packet(client: OrcaClient, store: StateStore, run: RunRecor
         profile=profile,
         sources=sources,
         launch={"agent": choice.agent, "model": choice.model, "effort": choice.effort},
-        python_executable=os.fspath(Path(sys.executable).resolve()),
+        python_executable=os.path.abspath(sys.executable),
         run_id=run.native_run_id,
         reader=reader,
     )
@@ -999,7 +999,7 @@ def _ensure_packet(store: StateStore, run: RunRecord, profile: ProjectProfile) -
         profile=profile,
         sources=sources,
         launch={"agent": choice.agent, "model": choice.model, "effort": choice.effort},
-        python_executable=os.fspath(Path(sys.executable).resolve()),
+        python_executable=os.path.abspath(sys.executable),
         run_id=run.native_run_id,
         reader=reader,
     )
@@ -2153,7 +2153,7 @@ def _runtime_milestone_plan(
             profile=profile,
             sources=sources,
             launch=choice.requested(),
-            python_executable=os.fspath(Path(sys.executable).resolve()),
+            python_executable=os.path.abspath(sys.executable),
             run_id=str(run.native_run_id),
             reader=reader,
         )

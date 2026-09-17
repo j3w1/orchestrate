@@ -13,6 +13,7 @@ from .bootstrap import decode_payload, launch_controller
 from .controller import answer, explain, implement, packet, resume, status
 from .doctor import ProbeContractError, collect_doctor_report, create_run_probe, error_report, run_worker_probe
 from .errors import OrchestrateError
+from .host import SUPPORTED_NATIVE_PLATFORMS, is_wsl
 from .machine_bootstrap import ensure_machine
 from .orca import OrcaClient, OrcaCommandError
 from .profile import setup_project
@@ -150,7 +151,21 @@ def _needs_bootstrap(command: str) -> bool:
     return command in {"implement", "resume", "answer"} and not os.environ.get("ORCA_TERMINAL_HANDLE")
 
 
+def _require_supported_cli_host() -> None:
+    if is_wsl():
+        raise OrchestrateError(
+            "A WSL-local orchestrate command cannot own Linux state or orchestration; use the Windows forwarding launcher",
+            code="wsl_native_host_unsupported",
+        )
+    if os.sys.platform not in SUPPORTED_NATIVE_PLATFORMS:
+        raise OrchestrateError(
+            "orchestrate supports native Windows and Linux hosts only",
+            code="native_host_unsupported",
+        )
+
+
 def _execute(args: argparse.Namespace, raw_argv: list[str]) -> tuple[dict[str, Any], bool]:
+    _require_supported_cli_host()
     client = OrcaClient()
     root = Path(getattr(args, "project", ".")).resolve()
     if _needs_bootstrap(args.command):
@@ -290,6 +305,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
     result_path: Path | None = None
     if args.command == "_controller":
+        try:
+            _require_supported_cli_host()
+        except OrchestrateError as exc:
+            print(json.dumps(_error(exc), indent=2, sort_keys=True))
+            return 1
         result_path = Path(args.result_path).resolve() if args.result_path else None
         raw = decode_payload(args.payload)
         args = build_parser().parse_args(raw)

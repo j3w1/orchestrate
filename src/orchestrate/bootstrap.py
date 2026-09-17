@@ -14,6 +14,7 @@ from typing import Any
 import uuid
 
 from .errors import OrchestrateError
+from .host import SUPPORTED_NATIVE_PLATFORMS, is_wsl
 from .identity import require_bootstrap_caller
 from .orca import OrcaClient, OrcaCommandError
 from .state import RunLock, make_private_state_directory, project_key, state_home, utc_now
@@ -21,8 +22,6 @@ from .state import RunLock, make_private_state_directory, project_key, state_hom
 
 BOOTSTRAP_SCHEMA = "orchestrate-bootstrap/v1"
 BOOTSTRAP_STATE_SCHEMA = "orchestrate-bootstrap-state/v1"
-
-
 def encode_payload(arguments: list[str]) -> str:
     raw = json.dumps({"schema": BOOTSTRAP_SCHEMA, "arguments": arguments}, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
@@ -300,12 +299,17 @@ def _confirm_created_terminal(
         raise OrchestrateError("Bootstrap journal omitted its terminal handle", code="bootstrap_state_unavailable")
     shown = client.run_json("terminal", "show", "--terminal", handle, "--json")
     terminal = _result(shown).get("terminal")
+    created = _terminal(json.loads(row["create_response_json"]))
     if (
         not isinstance(terminal, Mapping)
         or terminal.get("handle") != handle
         or not isinstance(terminal.get("worktreePath"), str)
         or Path(terminal["worktreePath"]).resolve() != root.resolve()
-        or terminal.get("worktreeId") != json.loads(row["create_response_json"])["result"]["terminal"]["worktreeId"]
+        or terminal.get("worktreeId") != created.get("worktreeId")
+        or created.get("executionHostId") != "local"
+        or terminal.get("executionHostId") != "local"
+        or created.get("hostPlatform") != sys.platform
+        or ("hostPlatform" in terminal and terminal.get("hostPlatform") != sys.platform)
         or (terminal.get("agentIdentity") is not None and terminal.get("agentIdentity") != "")
         or terminal.get("connected") is not True
         or terminal.get("writable") is not True
@@ -366,7 +370,7 @@ def _reconcile_uncertain_close(
         if (
             not all(isinstance(item, str) and item for item in (tab_id, incarnation_id, worktree_id, host_id))
             or host_id != "local"
-            or host_platform != "win32"
+            or host_platform != sys.platform
         ):
             raise OrchestrateError("Bootstrap create receipt omitted cleanup identity", code="bootstrap_effect_uncertain")
         expected_exit = row["exit_code"]
@@ -482,6 +486,11 @@ def _reconcile_uncertain_close(
 def launch_controller(root: Path, arguments: list[str], *, client: OrcaClient) -> int:
     """Create or resume one journaled terminal and reproduce its exact result."""
 
+    if sys.platform not in SUPPORTED_NATIVE_PLATFORMS or is_wsl():
+        raise OrchestrateError(
+            "Controller bootstrap supports only native Windows and Linux; WSL must use the Windows transport boundary",
+            code="bootstrap_host_unsupported",
+        )
     root = root.resolve()
     require_bootstrap_caller(client, root)
     journal = BootstrapJournal(root)

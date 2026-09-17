@@ -1,4 +1,4 @@
-"""Reviewed-checkout first entry point for Windows machine bootstrap."""
+"""Reviewed-checkout first entry point for native Windows and Linux setup."""
 
 from __future__ import annotations
 

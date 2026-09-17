@@ -47,8 +47,8 @@ from orchestrate.state import AdmissionEffectFence, StateStore
 
 LIVENESS_TIMEOUT = 120.0  # Outer deadlock detector, not a semantic progress budget.
 requires_native_windows_admission = unittest.skipUnless(
-    sys.platform == "win32",
-    "managed worker admission is win32-only by design",
+    sys.platform in {"linux", "win32"},
+    "managed worker admission requires native Windows or Linux",
 )
 
 
@@ -317,7 +317,7 @@ class RealPreflightClient:
                     "agentIdentity": "codex",
                     "connected": True,
                     "writable": True,
-                    "hostPlatform": "win32",
+                    "hostPlatform": sys.platform,
                 }
             })
         if arguments[:2] == ("worktree", "current"):
@@ -361,7 +361,7 @@ def _worker_start_with_real_preflight(
             packet_id=str(packet["packetId"]),
             client=preflight_client,  # type: ignore[arg-type]
             environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
-            platform="win32",
+            platform=sys.platform,
         )
         if result.get("status") != "admitted" or len(preflight_client.calls) != 4:
             raise AssertionError("real pre-receipt worker preflight did not pass exact public readbacks")
@@ -384,7 +384,7 @@ def _worker_start_with_real_preflight(
                     packet_id=str(packet["packetId"]),
                     client=second_client,  # type: ignore[arg-type]
                     environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
-                    platform="win32",
+                    platform=sys.platform,
                 )
             except OrchestrateError as exc:
                 cause = exc.data["cause"] if isinstance(exc.data, dict) else None
@@ -747,7 +747,7 @@ def _worker_start_with_preflight(root: Path) -> Response:
                     "terminalHandle": "term_worker",
                     "terminalResourceId": "terminal-resource-1",
                     "executionHostId": "local",
-                    "hostPlatform": "win32",
+                    "hostPlatform": sys.platform,
                     "worktreeId": f"repo::{root.resolve()}",
                     "worktreeRoot": str(root.resolve()),
                     "launch": launch,
@@ -875,7 +875,7 @@ class MilestoneClient:
             packet_id=packet_id,
             client=self,  # type: ignore[arg-type]
             environment={"ORCA_TERMINAL_HANDLE": str(self.workers[dispatch_id]["terminal"])},
-            platform="win32",
+            platform=sys.platform,
         )
 
     def _worker_show(self, dispatch_id: str) -> dict[str, object]:
@@ -998,7 +998,7 @@ class MilestoneClient:
                             "writable": True,
                             "executionHostId": "local",
                             "agentIdentity": record["launch"]["requested"]["agent"],  # type: ignore[index]
-                            "hostPlatform": "win32",
+                            "hostPlatform": sys.platform,
                             "worktreeId": record["worktree"],
                             "worktreePath": str(self.root.resolve()),
                         }
@@ -1239,15 +1239,19 @@ def identity_responses(
     agent: str | None = None,
     workers: list[dict[str, object]] | None = None,
     run_id: str | None = None,
+    execution_host_id: object = "local",
+    host_platform: object | None = None,
 ) -> list[Response]:
     terminal: dict[str, object] = {
         "handle": "term_plain",
         "worktreeId": "worktree_1",
         "worktreePath": str(root),
-        "executionHostId": "local",
+        "executionHostId": execution_host_id,
         "connected": True,
         "writable": True,
     }
+    if host_platform is not None:
+        terminal["hostPlatform"] = host_platform
     if agent is not None:
         terminal["agentIdentity"] = agent
     return [
@@ -2568,7 +2572,7 @@ class ControllerTests(MilestoneRepo):
             profile=profile,
             sources=sources,
             launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
-            python_executable=str(Path(sys.executable).resolve()),
+            python_executable=os.path.abspath(sys.executable),
             run_id="run_1",
             reader=reader,
         )
@@ -2626,6 +2630,30 @@ class ControllerTests(MilestoneRepo):
         with self.assertRaises(OrchestrateError) as caught:
             require_plain_controller(client, self.root)  # type: ignore[arg-type]
         self.assertEqual(caught.exception.code, "agent_terminal_not_controller")
+
+    def test_connected_host_controller_identity_is_rejected_before_mutation(self) -> None:
+        client = FakeClient(identity_responses(self.root, execution_host_id="connected-host")[:1])
+        with self.assertRaises(OrchestrateError) as caught:
+            require_plain_controller(client, self.root)  # type: ignore[arg-type]
+        self.assertEqual(caught.exception.code, "controller_host_unsupported")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_mismatched_controller_host_platform_is_rejected_before_mutation(self) -> None:
+        other_platform = "win32" if sys.platform == "linux" else "linux"
+        client = FakeClient(identity_responses(self.root, host_platform=other_platform)[:1])
+        with self.assertRaises(OrchestrateError) as caught:
+            require_plain_controller(client, self.root)  # type: ignore[arg-type]
+        self.assertEqual(caught.exception.code, "controller_host_unsupported")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_unsupported_controller_platform_is_rejected_before_native_readback(self) -> None:
+        client = FakeClient([])
+        with patch("orchestrate.identity.sys.platform", "darwin"), self.assertRaises(
+            OrchestrateError
+        ) as caught:
+            require_plain_controller(client, self.root)  # type: ignore[arg-type]
+        self.assertEqual(caught.exception.code, "controller_host_unsupported")
+        self.assertEqual(client.calls, [])
 
     def test_active_context_dispatch_is_rejected_by_dispatch_status(self) -> None:
         workers = [
@@ -3376,7 +3404,7 @@ class ControllerTests(MilestoneRepo):
                 packet_id=str(packet["packetId"]),
                 client=second_client,  # type: ignore[arg-type]
                 environment={"ORCA_TERMINAL_HANDLE": "term_other"},
-                platform="win32",
+                platform=sys.platform,
             )
 
         with patch.object(AdmissionEffectFence, "__enter__", observed_enter), patch.object(
@@ -3447,7 +3475,7 @@ class ControllerTests(MilestoneRepo):
                 packet_id=str(packet["packetId"]),
                 client=second_client,  # type: ignore[arg-type]
                 environment={"ORCA_TERMINAL_HANDLE": "term_other"},
-                platform="win32",
+                platform=sys.platform,
             )
         self.assertEqual(caught.exception.code, "preflight_rejected")
         self.assertEqual(second_client.calls, [])
@@ -3562,7 +3590,7 @@ class ControllerTests(MilestoneRepo):
                 packet_id=str(packet["packetId"]),
                 client=RealPreflightClient(self.root, packet, current_shape=True),  # type: ignore[arg-type]
                 environment={"ORCA_TERMINAL_HANDLE": "term_other"},
-                platform="win32",
+                platform=sys.platform,
             )
         before = self._answer_guard_snapshot(local_id)
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
@@ -4599,8 +4627,8 @@ class ControllerTests(MilestoneRepo):
         self.assertEqual(dispatched["schema"], "orchestrate-worker-packet/v3")
         self.assertEqual(dispatched["admission"]["commandTemplate"][1:4], ["-I", "-m", "orchestrate"])
         self.assertEqual(
-            Path(dispatched["admission"]["commandTemplate"][0]).resolve(),
-            Path(sys.executable).resolve(),
+            dispatched["admission"]["commandTemplate"][0],
+            os.path.abspath(sys.executable),
         )
         self.assertEqual(dispatched["native"]["taskIdSource"], "orca-injected-task-and-dispatch-preamble")
         self.assertNotIn("taskId", dispatched["native"])
@@ -4626,7 +4654,7 @@ class ControllerTests(MilestoneRepo):
                 profile=profile,
                 sources=sources,
                 launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
-                python_executable=str(Path(sys.executable).resolve()),
+                python_executable=os.path.abspath(sys.executable),
                 run_id="run_1",
                 reader=reader,
             )
@@ -5530,7 +5558,7 @@ class ControllerTests(MilestoneRepo):
             profile=profile,
             sources=sources,
             launch={"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
-            python_executable=str(Path(sys.executable).resolve()),
+            python_executable=os.path.abspath(sys.executable),
             run_id="run_1",
             reader=reader,
         )

@@ -5548,14 +5548,14 @@ def ensure_machine(
     selected_platform = (
         "win32" if provider.windows_semantics else sys.platform
     ) if platform is None else platform
-    if selected_platform != "win32":
-        return MachineBootstrapResult("not_applicable")
     selected_version = sys.version_info[:2] if version_info is None else version_info
     if selected_version < MINIMUM_PYTHON:
         raise OrchestrateError(
             "orchestrate requires Python 3.13 or newer; install it and rerun the checkout bootstrap entry point",
             code="machine_bootstrap_python_unsupported",
         )
+    if selected_platform != "win32":
+        return MachineBootstrapResult("not_applicable")
     selected_layout = default_layout() if layout is None else layout
     selected_store = _default_user_path_store(provider) if path_store is None else path_store
     if machine_ready(selected_layout, selected_store, resolver=resolver):

@@ -12,6 +12,7 @@ import sys
 from typing import Any
 
 from .errors import OrchestrateError
+from .host import SUPPORTED_NATIVE_PLATFORMS, is_wsl
 from .orca import JsonObject, OrcaClient, OrcaCommandError
 from .orca_compat import WorkerShowShapeError, worker_input_accepted_readback
 from .packets import (
@@ -81,8 +82,6 @@ _RETRYABLE_PREFLIGHT_CODES = frozenset(
         "source_temporarily_unavailable",
     }
 )
-
-
 def _digest(value: object) -> str:
     raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
@@ -490,6 +489,14 @@ def _native_identity(
     environment: Mapping[str, str],
     platform: str,
 ) -> dict[str, Any]:
+    if platform not in SUPPORTED_NATIVE_PLATFORMS or is_wsl(
+        environment,
+        platform_name=platform,
+    ):
+        raise OrchestrateError(
+            "Worker preflight supports only native Windows and Linux; WSL must use the Windows transport boundary",
+            code="preflight_host_unsupported",
+        )
     handle = environment.get("ORCA_TERMINAL_HANDLE", "").strip()
     if not handle:
         raise OrchestrateError("Worker preflight requires its invoking Orca terminal", code="preflight_terminal_missing")
@@ -513,14 +520,21 @@ def _native_identity(
     command = admission.get("commandTemplate") if isinstance(admission, Mapping) else None
     if not isinstance(launch, Mapping):
         raise OrchestrateError("Worker packet omits its exact launch identity", code="preflight_packet_unsupported")
-    expected_python = os.path.normcase(os.path.abspath(sys.executable))
+    expected_python = os.path.abspath(sys.executable)
     command_python = (
-        os.path.normcase(os.path.abspath(command[0]))
+        os.path.abspath(command[0])
         if isinstance(command, list) and command and isinstance(command[0], str)
         else None
     )
+    try:
+        command_python_matches = command_python is not None and os.path.samefile(
+            command_python,
+            expected_python,
+        )
+    except OSError:
+        command_python_matches = False
     expected_command = [
-        command[0] if command_python == expected_python else sys.executable,
+        command[0] if command_python_matches else sys.executable,
         "-I",
         "-m",
         "orchestrate",
@@ -537,8 +551,11 @@ def _native_identity(
         "{packetId}",
         "--json",
     ]
-    if platform != "win32" or command_python != expected_python or command != expected_command:
-        raise OrchestrateError("Worker preflight supports only its exact controller Python on native Windows", code="preflight_host_unsupported")
+    if not command_python_matches or command != expected_command:
+        raise OrchestrateError(
+            "Worker preflight requires its exact controller Python on the native host",
+            code="preflight_host_unsupported",
+        )
     if not isinstance(terminal, Mapping):
         raise OrchestrateError("terminal show omitted the worker terminal object", code="preflight_identity_conflict")
     identity_mismatches: list[dict[str, Any]] = []
@@ -552,18 +569,18 @@ def _native_identity(
     for field, expected, actual in expected_terminal_fields:
         if actual != expected or type(actual) is not type(expected):
             identity_mismatches.append({"field": field, "expected": expected, "actual": actual})
-    if "hostPlatform" in terminal and terminal.get("hostPlatform") != "win32":
+    if "hostPlatform" in terminal and terminal.get("hostPlatform") != platform:
         identity_mismatches.append(
             {
                 "field": "terminal.hostPlatform",
-                "expected": "win32 when reported",
+                "expected": f"{platform} when reported",
                 "actual": terminal.get("hostPlatform"),
             }
         )
     if identity_mismatches:
         fields = ", ".join(item["field"] for item in identity_mismatches)
         raise OrchestrateError(
-            f"terminal show did not prove the exact local Windows worker actor: {fields}",
+            f"terminal show did not prove the exact local {platform} worker actor: {fields}",
             code="preflight_identity_conflict",
             data={"fields": identity_mismatches},
         )
@@ -630,7 +647,7 @@ def _native_identity(
         "terminalHostPlatform": terminal.get("hostPlatform"),
         "hostPlatformEvidence": (
             "terminal-show"
-            if terminal.get("hostPlatform") == "win32"
+            if terminal.get("hostPlatform") == platform
             else "native-controller-and-local-execution-host"
         ),
         "worktreeId": worktree_id,

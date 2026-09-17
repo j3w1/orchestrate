@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import sys
 import tempfile
@@ -18,8 +19,8 @@ from orchestrate.orca import OrcaCommandError, OrcaCommandResult
 
 
 requires_native_windows_admission = unittest.skipUnless(
-    sys.platform == "win32",
-    "managed worker admission is win32-only by design",
+    sys.platform in {"linux", "win32"},
+    "managed worker admission requires native Windows or Linux",
 )
 
 
@@ -50,7 +51,7 @@ class FakeClient:
                         "title": "orchestrate controller",
                         "executionHostId": "local",
                         "incarnationId": "incarnation_controller",
-                        "hostPlatform": "win32",
+                        "hostPlatform": sys.platform,
                         "surface": "visible",
                     }
                 },
@@ -67,7 +68,7 @@ class FakeClient:
                         "tabId": "tab_controller",
                         "incarnationId": "incarnation_controller",
                         "orphaned": False,
-                        "hostPlatform": "win32",
+                        "hostPlatform": sys.platform,
                         "connected": True,
                         "writable": True,
                     }
@@ -79,10 +80,15 @@ class FakeClient:
             if self.interrupt_first and self.waits == 1:
                 raise KeyboardInterrupt
             if self.write_result:
-                marker = "--result-path '"
-                start = self.command.index(marker) + len(marker)
-                end = self.command.index("'", start)
-                Path(self.command[start:end]).write_text(
+                if sys.platform == "win32":
+                    marker = "--result-path '"
+                    start = self.command.index(marker) + len(marker)
+                    end = self.command.index("'", start)
+                    result_path = self.command[start:end]
+                else:
+                    command = shlex.split(self.command)
+                    result_path = command[command.index("--result-path") + 1]
+                Path(result_path).write_text(
                     json.dumps(
                         {
                             "schema": "orchestrate-bootstrap/v1",
@@ -293,7 +299,115 @@ class BootstrapTests(unittest.TestCase):
                 launch_controller(Path(directory), ["status"], client=client)  # type: ignore[arg-type]
             self.assertEqual(caught.exception.code, "state_storage_unsafe")
             self.assertEqual(client.calls, [])
+
+    @unittest.skipUnless(sys.platform == "linux", "requires native Linux")
+    def test_wsl_controller_bootstrap_is_rejected_before_terminal_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "orchestrate.bootstrap.is_wsl",
+            return_value=True,
+        ):
+            client = UncertainCreateClient()
+            with self.assertRaises(OrchestrateError) as rejected:
+                launch_controller(Path(directory), ["status"], client=client)  # type: ignore[arg-type]
+            self.assertEqual(rejected.exception.code, "bootstrap_host_unsupported")
+            self.assertEqual(client.calls, [])
+
+    @unittest.skipUnless(sys.platform == "linux", "requires native Linux")
+    def test_wsl_common_cli_boundary_rejects_before_setup_or_orchestration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"ORCA_TERMINAL_HANDLE": "term_existing"},
+        ), patch(
+            "orchestrate.cli.is_wsl",
+            return_value=True,
+        ), patch("orchestrate.cli.setup_project") as project_setup, patch(
+            "orchestrate.cli.implement"
+        ) as implementation, patch("orchestrate.cli.launch_controller") as controller_launch:
+            for arguments in (
+                ["setup", "--project", directory, "--json"],
+                ["implement", "fixture", "--project", directory, "--json"],
+            ):
+                with self.subTest(command=arguments[0]), redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(main(arguments), 1)
+                    self.assertIn('"code": "wsl_native_host_unsupported"', output.getvalue())
+            project_setup.assert_not_called()
+            implementation.assert_not_called()
+            controller_launch.assert_not_called()
             self.assertFalse((Path(directory) / ".private").exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires native Linux")
+    def test_wsl_private_controller_rejects_before_result_path_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "orchestrate.cli.is_wsl",
+            return_value=True,
+        ), patch("orchestrate.cli.setup_project") as project_setup, redirect_stdout(
+            io.StringIO()
+        ) as output:
+            result_path = Path(directory) / "new-parent" / "result.json"
+            exit_code = main(
+                [
+                    "_controller",
+                    "--payload",
+                    encode_payload(["setup", "--project", directory, "--json"]),
+                    "--result-path",
+                    str(result_path),
+                ]
+            )
+            self.assertEqual(exit_code, 1)
+            self.assertIn('"code": "wsl_native_host_unsupported"', output.getvalue())
+            project_setup.assert_not_called()
+            self.assertFalse(result_path.parent.exists())
+
+    def test_unsupported_platform_rejects_before_setup_or_preflight_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "orchestrate.cli.os.sys.platform",
+            "darwin",
+        ), patch("orchestrate.cli.is_wsl", return_value=False), patch(
+            "orchestrate.cli.setup_project"
+        ) as project_setup, patch("orchestrate.cli.worker_preflight") as preflight:
+            commands = (
+                ["setup", "--project", directory, "--json"],
+                [
+                    "worker-preflight",
+                    "--project",
+                    directory,
+                    "--run",
+                    "run_1",
+                    "--task",
+                    "task_1",
+                    "--dispatch",
+                    "dispatch_1",
+                    "--packet-id",
+                    "packet_1",
+                    "--json",
+                ],
+            )
+            for arguments in commands:
+                with self.subTest(command=arguments[0]), redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(main(arguments), 1)
+                    self.assertIn('"code": "native_host_unsupported"', output.getvalue())
+            project_setup.assert_not_called()
+            preflight.assert_not_called()
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_unsupported_platform_private_controller_rejects_before_result_path_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "orchestrate.cli.os.sys.platform",
+            "darwin",
+        ), patch("orchestrate.cli.is_wsl", return_value=False), redirect_stdout(io.StringIO()) as output:
+            result_path = Path(directory) / "new-parent" / "result.json"
+            exit_code = main(
+                [
+                    "_controller",
+                    "--payload",
+                    encode_payload(["setup", "--project", directory, "--json"]),
+                    "--result-path",
+                    str(result_path),
+                ]
+            )
+            self.assertEqual(exit_code, 1)
+            self.assertIn('"code": "native_host_unsupported"', output.getvalue())
+            self.assertFalse(result_path.parent.exists())
 
     def test_commands_preserve_foreground_exit_contract_on_both_shells(self) -> None:
         payload = encode_payload(["status"])
@@ -470,7 +584,8 @@ class BootstrapTests(unittest.TestCase):
 
     @requires_native_windows_admission
     def test_uncertain_close_rejects_contradictory_historical_host_platform(self) -> None:
-        for host_platform in ("linux", None, False):
+        other_platform = "linux" if sys.platform == "win32" else "win32"
+        for host_platform in (other_platform, None, False):
             with self.subTest(host_platform=host_platform), tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, patch.dict(
                 os.environ,
                 {"ORCHESTRATE_HOME": state, "ORCA_TERMINAL_HANDLE": ""},

@@ -2887,6 +2887,11 @@ class MachineBootstrapTests(unittest.TestCase):
         result = ensure_machine(platform="linux", version_info=(3, 13))
         self.assertEqual(result.state, "not_applicable")
 
+    def test_non_windows_setup_still_enforces_minimum_python(self) -> None:
+        with self.assertRaises(OrchestrateError) as rejected:
+            ensure_machine(platform="linux", version_info=(3, 12))
+        self.assertEqual(rejected.exception.code, "machine_bootstrap_python_unsupported")
+
     def test_cli_machine_failure_prevents_project_setup(self) -> None:
         failure = OrchestrateError("synthetic machine failure", code="machine_bootstrap_test_failure")
         output = io.StringIO()

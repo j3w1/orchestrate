@@ -33,8 +33,8 @@ from tests.path_faults import ResolvedPathFault
 
 LIVENESS_TIMEOUT = 120.0  # Outer deadlock detector, not a semantic progress budget.
 requires_native_windows_admission = unittest.skipUnless(
-    sys.platform == "win32",
-    "managed worker admission is win32-only by design",
+    sys.platform in {"linux", "win32"},
+    "managed worker admission requires native Windows or Linux",
 )
 
 
@@ -681,6 +681,71 @@ class AdmissionTests(unittest.TestCase):
             environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
             platform="win32",
         )
+        self.assertEqual(report["status"], "admitted")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires native Linux")
+    def test_linux_worker_show_identity_is_admitted_explicitly(self) -> None:
+        report = worker_preflight(
+            self.root,
+            run_id="run_1",
+            task_id="task_1",
+            dispatch_id="dispatch_1",
+            packet_id=str(self.packet["packetId"]),
+            client=PreflightClient(self.root, self.packet, host_platform="linux"),  # type: ignore[arg-type]
+            environment={"ORCA_TERMINAL_HANDLE": "term_worker"},
+            platform="linux",
+        )
+        native = report["observation"]["native"]  # type: ignore[index]
+        self.assertEqual(report["status"], "admitted")
+        self.assertEqual(native["controllerPlatform"], "linux")
+        self.assertEqual(native["terminalHostPlatform"], "linux")
+        self.assertEqual(native["hostPlatformEvidence"], "terminal-show")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires native Linux")
+    def test_wsl_worker_preflight_is_rejected_before_native_readback(self) -> None:
+        client = PreflightClient(self.root, self.packet, host_platform="linux")
+        with self.assertRaises(OrchestrateError) as rejected:
+            worker_preflight(
+                self.root,
+                run_id="run_1",
+                task_id="task_1",
+                dispatch_id="dispatch_1",
+                packet_id=str(self.packet["packetId"]),
+                client=client,  # type: ignore[arg-type]
+                environment={
+                    "ORCA_TERMINAL_HANDLE": "term_worker",
+                    "WSL_DISTRO_NAME": "fixture",
+                },
+                platform="linux",
+            )
+        self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(rejected.exception.data["cause"], "preflight_host_unsupported")  # type: ignore[index]
+        self.assertEqual(client.calls, [])
+
+    @requires_native_windows_admission
+    def test_unprovable_interpreter_identity_never_falls_back_to_spelling(self) -> None:
+        with patch(
+            "orchestrate.admission.os.path.samefile",
+            side_effect=PermissionError("fixture identity unavailable"),
+        ), self.assertRaises(OrchestrateError) as rejected:
+            self._run()
+        self.assertEqual(rejected.exception.code, "preflight_rejected")
+        self.assertEqual(rejected.exception.data["cause"], "preflight_host_unsupported")  # type: ignore[index]
+
+    @requires_native_windows_admission
+    def test_interpreter_identity_is_not_case_folded_before_samefile(self) -> None:
+        real_normcase = os.path.normcase
+
+        def reject_interpreter_case_fold(path: str) -> str:
+            if os.path.abspath(path) == os.path.abspath(sys.executable):
+                raise AssertionError("interpreter identity must preserve exact path spelling")
+            return real_normcase(path)
+
+        with patch(
+            "orchestrate.admission.os.path.normcase",
+            side_effect=reject_interpreter_case_fold,
+        ):
+            report = self._run()
         self.assertEqual(report["status"], "admitted")
 
     @requires_native_windows_admission

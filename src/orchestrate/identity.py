@@ -6,9 +6,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 from .errors import OrchestrateError
+from .host import SUPPORTED_NATIVE_PLATFORMS, is_wsl
 from .orca import OrcaClient
 
 
@@ -48,11 +50,30 @@ def require_plain_controller(
             "No owned Orca terminal is present; use the bootstrap command",
             code="controller_terminal_missing",
         )
+    if sys.platform not in SUPPORTED_NATIVE_PLATFORMS or is_wsl(env):
+        raise OrchestrateError(
+            "Controller identity supports only native Windows and Linux; WSL must use the Windows transport boundary",
+            code="controller_host_unsupported",
+        )
 
     terminal_payload = client.run_json("terminal", "show", "--terminal", handle, "--json")
     terminal = _result(terminal_payload).get("terminal")
     if not isinstance(terminal, Mapping) or terminal.get("handle") != handle:
         raise OrchestrateError("terminal show did not prove the invoking terminal", code="orca_contract_error")
+    execution_host_id = terminal.get("executionHostId")
+    if execution_host_id != "local" or (
+        "hostPlatform" in terminal and terminal.get("hostPlatform") != sys.platform
+    ):
+        raise OrchestrateError(
+            "The controller terminal is not on the local native host platform",
+            code="controller_host_unsupported",
+            data={
+                "expectedExecutionHostId": "local",
+                "actualExecutionHostId": execution_host_id,
+                "expectedHostPlatform": sys.platform,
+                "actualHostPlatform": terminal.get("hostPlatform"),
+            },
+        )
     agent_identity = terminal.get("agentIdentity")
     if agent_identity is not None and agent_identity != "":
         raise OrchestrateError(
@@ -61,14 +82,11 @@ def require_plain_controller(
         )
     path = terminal.get("worktreePath")
     worktree_id = terminal.get("worktreeId")
-    execution_host_id = terminal.get("executionHostId")
     if (
         not isinstance(path, str)
         or Path(path).resolve() != root.resolve()
         or not isinstance(worktree_id, str)
         or not worktree_id
-        or not isinstance(execution_host_id, str)
-        or not execution_host_id
         or terminal.get("connected") is not True
         or terminal.get("writable") is not True
     ):

@@ -321,7 +321,7 @@ def make_packet(
             *sources.value["limitations"],
             "Preflight is a durable managed observation, not enforcement against hostile bypass.",
             "Source reads are bounded observations and do not exclude concurrent external writers.",
-            "Worker admission is limited to native Windows in this milestone; WSL is not admitted.",
+            "Worker admission requires a local native Windows or Linux execution host; WSL transport is not admitted as a native worker host.",
         ],
         "requiredChecks": list(profile.value["checks"]),
         "outputs": {

@@ -36,7 +36,7 @@ Read [Execution contracts and recovery](docs/contracts-and-recovery.md) for the 
 
 ## Installation
 
-orchestrate requires Python 3.13 or newer and a reviewed checkout. It is not published to PyPI. You do not need to create a virtual environment, run pip, or edit PATH yourself.
+orchestrate requires Python 3.13 or newer and a reviewed checkout. It is not published to PyPI. Windows has a managed first-machine bootstrap; native Linux uses a conventional isolated installation from that checkout.
 
 ### Windows
 
@@ -85,9 +85,21 @@ The package never edits `AGENTS.md`, user prompts, or another agent's configurat
 
 ### Linux and WSL
 
-The CI workflow runs the complete unit and incident suite on Windows, including the managed-admission and controller-lifecycle fixtures that require native Windows. Linux runs every host-neutral test and explicitly skips only tests whose intended assertion requires the win32-only managed worker admission path. Both jobs run explicit incident discovery, wheel build, isolated install, and CLI help smokes. A workflow definition is not proof that a particular candidate passed; [Validation evidence](docs/validation.md) keeps that distinction explicit. The Orca CLI resolver uses `ORCA_CLI_COMMAND` in a managed forwarded session, `orca-dev` in a dev checkout, `orca-ide` on Linux outside Orca, and `orca` on packaged Windows.
+Native Linux supports the same controller, managed worker admission, source binding, lifecycle, recovery, and XDG host-local state model as native Windows. Install the reviewed checkout into an isolated environment, activate it, and configure a project normally:
 
-Machine bootstrap places an extensionless `orchestrate` shell launcher beside the Windows shim. With WSL's normal Windows-PATH import enabled, it is available in a new WSL shell without a Linux installation:
+```bash
+python3.13 -m venv /path/to/private/orchestrate-venv
+/path/to/private/orchestrate-venv/bin/python -m pip install /path/to/reviewed/orchestrate
+source /path/to/private/orchestrate-venv/bin/activate
+orchestrate setup --project /path/to/project --json
+orchestrate doctor
+```
+
+On Linux, the managed Windows machine installer reports `not_applicable`; it does not edit shell startup files or PATH. Runtime state defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/orchestrate`. The controller uses a POSIX shell command, requires a local Orca terminal reporting `hostPlatform=linux` when that field is present, and binds worker preflight to the exact same Python executable by file identity. The Orca CLI resolver uses `ORCA_CLI_COMMAND` in a managed forwarded session, `orca-dev` in a dev checkout, `orca-ide` on Linux outside Orca, and `orca` on packaged Windows.
+
+The CI matrix runs the complete host-neutral and native lifecycle suite on both Windows and Linux. OS-specific machine-bootstrap primitives remain covered on their owning host, and both jobs run explicit incident discovery, wheel build, isolated install, and CLI help smokes. A workflow definition is not proof that a particular candidate passed; [Validation evidence](docs/validation.md) keeps that distinction explicit.
+
+WSL is a separate transport mode, not native Linux operation. A Linux controller or worker preflight running under WSL is rejected; WSL must forward to the canonical Windows installation. The Windows machine bootstrap places an extensionless `orchestrate` shell launcher beside the Windows shim. With WSL's normal Windows-PATH import enabled, it is available in a new WSL shell without a Linux installation:
 
 ```bash
 orchestrate status --json
@@ -165,12 +177,12 @@ For a copyable disposable live exercise, use [Live first-increment exercise](doc
 - Host-local owner/specialist/reviewer launch choices with explicit Claude provider IDs and requested/effective receipt validation.
 - Exact-terminal reuse or Dispatch release decisions, including fail-closed `release_unknown` containment.
 - Durable intervention records and one bounded diagnosis before an unchanged correction can repeat without new evidence.
-- A state-free `orchestrate-wsl` argument/exit forwarding boundary to the canonical Windows installation.
+- Native Windows and Linux controller/admission paths, plus a state-free `orchestrate-wsl` forwarding boundary to the canonical Windows installation.
 - Non-consuming `status`, model-free `explain`, and exact `packet` output.
 - A focused ordinary-terminal bootstrap with durable result, exit, and exact uncertain-close reconciliation receipts.
 - Passive compatibility diagnostics and a separately contained no-edit active probe.
 - Synthetic practical regressions under `tests/incidents`, including ignored dependency authority, Task-history tampering, and capacity waves.
-- A CI workflow with the complete suite on Windows, the host-neutral subset on Linux, and explicit incident-discovery, build, and isolated-install smoke checks on both.
+- A CI workflow with the common native lifecycle suite on Windows and Linux, plus OS-specific checks, explicit incident discovery, build, and isolated-install smokes on both.
 - A sanitized evidence matrix in [`docs/validation.md`](docs/validation.md).
 
 Detailed role, dependency, review-invalidation, intervention, and uncertain-release shapes live in [Execution contracts and recovery](docs/contracts-and-recovery.md).
