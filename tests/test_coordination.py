@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -17,6 +18,7 @@ from orchestrate.coordination import (
     next_session_action,
     require_current_review,
     validate_effective_launch,
+    validate_immutable_worker_start_readback,
     validate_release_receipt,
 )
 from orchestrate.errors import OrchestrateError
@@ -416,19 +418,152 @@ class CoordinationTests(unittest.TestCase):
             SharedContract(digest, "settled", {"nested": {"version": 9}})
         self.assertEqual(mismatch.exception.code, "shared_contract_digest_mismatch")
 
-    def test_exact_session_is_reused_only_for_immediate_same_agent_work(self) -> None:
+    def test_new_task_always_releases_the_prior_session_even_for_the_same_agent(self) -> None:
         session = WorkerSession(
             "dispatch_1", "task_1", "term_exact", "resource_1", "worktree_1", "codex", "run_1"
         )
         reused = next_session_action(session, next_task_id="task_2", next_agent="codex")
-        self.assertEqual(reused.kind, "reuse")
-        self.assertEqual(
-            reused.argv[-4:],
-            ("--terminal", "term_exact", "--worktree", "id:worktree_1"),
-        )
+        self.assertEqual(reused.kind, "release")
+        self.assertNotIn("--terminal", reused.argv)
         released = next_session_action(session, next_task_id="task_2", next_agent="claude")
         self.assertEqual(released.kind, "release")
         self.assertEqual(released.argv[-1], "dispatch_1")
+
+    def test_settlement_rejoins_every_observed_immutable_start_field(self) -> None:
+        launch = {
+            "requested": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+            "effective": {"agent": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+        }
+        initial = {
+            "result": {
+                "dispatch": {
+                    "id": "dispatch_1",
+                    "runId": "run_1",
+                    "taskId": "task_1",
+                    "task_id": "task_1",
+                    "status": "dispatched",
+                    "lastFailure": None,
+                    "agent": "codex",
+                    "agentIdentity": "codex",
+                },
+                "worker": {
+                    "id": "worker_1",
+                    "dispatchId": "dispatch_1",
+                    "worktreeId": "worktree_1",
+                    "agentTerminalHandle": "term_1",
+                    "agent": "codex",
+                    "agentIdentity": "codex",
+                    "state": "ready",
+                    "stage": "input_accepted",
+                    "lastError": None,
+                    "startOptions": {
+                        "worktree": "path:/fixture",
+                        "resolvedWorktreeId": "worktree_1",
+                        "terminal": None,
+                        "agent": "codex",
+                        "setup": "not_applicable",
+                        "setupSource": "existing_worktree",
+                        "launch": launch,
+                    },
+                },
+                "terminal": {
+                    "handle": "term_1",
+                    "ptyId": "pty_1",
+                    "incarnationId": "incarnation_1",
+                    "worktreeId": "worktree_1",
+                    "executionHostId": "local",
+                    "agentIdentity": "codex",
+                },
+                "terminalResource": {
+                    "id": "resource_1",
+                    "originDispatchId": "dispatch_1",
+                    "ownerDispatchId": "dispatch_1",
+                    "terminalHandle": "term_1",
+                    "worktreeId": "worktree_1",
+                    "endpointId": "endpoint_1",
+                    "endpointIncarnation": "endpoint_incarnation_1",
+                    "ownershipState": "owned",
+                    "releaseState": "not_requested",
+                },
+            }
+        }
+        current = deepcopy(initial)
+        current["result"]["dispatch"]["status"] = "completed"  # type: ignore[index]
+        current["result"]["worker"]["state"] = "succeeded"  # type: ignore[index]
+        current["result"]["worker"]["stage"] = "settled"  # type: ignore[index]
+        current["result"]["terminal"]["hostPlatform"] = "win32"  # type: ignore[index]
+        validate_immutable_worker_start_readback(initial, current)
+
+        paths = (
+            ("dispatch", "id"),
+            ("dispatch", "runId"),
+            ("dispatch", "taskId"),
+            ("dispatch", "task_id"),
+            ("dispatch", "agent"),
+            ("dispatch", "agentIdentity"),
+            ("worker", "id"),
+            ("worker", "dispatchId"),
+            ("worker", "worktreeId"),
+            ("worker", "agentTerminalHandle"),
+            ("worker", "agent"),
+            ("worker", "agentIdentity"),
+            ("terminal", "handle"),
+            ("terminal", "ptyId"),
+            ("terminal", "incarnationId"),
+            ("terminal", "worktreeId"),
+            ("terminal", "executionHostId"),
+            ("terminal", "agentIdentity"),
+            ("terminalResource", "id"),
+            ("terminalResource", "originDispatchId"),
+            ("terminalResource", "ownerDispatchId"),
+            ("terminalResource", "terminalHandle"),
+            ("terminalResource", "worktreeId"),
+            ("terminalResource", "endpointId"),
+            ("terminalResource", "endpointIncarnation"),
+            ("worker", "startOptions", "worktree"),
+            ("worker", "startOptions", "resolvedWorktreeId"),
+            ("worker", "startOptions", "terminal"),
+            ("worker", "startOptions", "agent"),
+            ("worker", "startOptions", "setup"),
+            ("worker", "startOptions", "setupSource"),
+            ("worker", "startOptions", "launch", "requested", "agent"),
+            ("worker", "startOptions", "launch", "requested", "model"),
+            ("worker", "startOptions", "launch", "requested", "effort"),
+            ("worker", "startOptions", "launch", "effective", "agent"),
+            ("worker", "startOptions", "launch", "effective", "model"),
+            ("worker", "startOptions", "launch", "effective", "effort"),
+        )
+        for path in paths:
+            with self.subTest(path=".".join(path), fault="exact"):
+                validate_immutable_worker_start_readback(initial, current)
+            with self.subTest(path=".".join(path), fault="changed"):
+                changed = deepcopy(current)
+                target = changed["result"]
+                for key in path[:-1]:
+                    target = target[key]  # type: ignore[index,assignment]
+                target[path[-1]] = "replacement"  # type: ignore[index]
+                with self.assertRaises(OrchestrateError) as caught:
+                    validate_immutable_worker_start_readback(initial, changed)
+                self.assertEqual(caught.exception.code, "release_unconfirmed")
+            with self.subTest(path=".".join(path), fault="missing"):
+                missing = deepcopy(current)
+                target = missing["result"]
+                for key in path[:-1]:
+                    target = target[key]  # type: ignore[index,assignment]
+                del target[path[-1]]  # type: ignore[index]
+                with self.assertRaises(OrchestrateError) as caught:
+                    validate_immutable_worker_start_readback(initial, missing)
+                self.assertEqual(caught.exception.code, "release_unconfirmed")
+
+        detached = deepcopy(current)
+        detached["result"]["terminal"] = None  # type: ignore[index]
+        with self.assertRaises(OrchestrateError):
+            validate_immutable_worker_start_readback(initial, detached)
+        validate_immutable_worker_start_readback(
+            initial,
+            detached,
+            allow_released_terminal_detachment=True,
+        )
 
     def test_wsl_release_unknown_is_contained_without_a_second_release(self) -> None:
         session = WorkerSession(

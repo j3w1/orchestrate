@@ -29,10 +29,20 @@ from .coordination import (
     milestone_plan_relative_path,
     native_task_create_arguments,
     require_current_review,
+    validate_immutable_worker_start_readback,
+    validate_owned_session_readback,
     validate_release_receipt,
+    validate_session_readback,
 )
 from .admission import joined_preflight_status, other_dispatch_observations, validate_packet_sources
 from .errors import OrchestrateError
+from .efficiency import (
+    efficiency_report,
+    ensure_capacity_grant,
+    initialize_efficiency_observation,
+    occupied_milestone_tasks,
+    record_efficiency_event,
+)
 from .identity import ControllerIdentity, require_plain_controller
 from .orca import JsonObject, OrcaClient, OrcaCommandError, orca_task_title
 from .orca_compat import (
@@ -441,6 +451,18 @@ def _reconcile_confirmed_worker_start(
         worktree_id=resource_identity.worktree_id,
         readback=readback,
     )
+    binding_row = store.connection.execute(
+        "SELECT created_at FROM worker_resource_bindings WHERE run_local_id = ?",
+        (run.local_id,),
+    ).fetchone()
+    record_efficiency_event(
+        store,
+        run.local_id,
+        event="session_created",
+        identity=str(dispatch_id),
+        details={"taskId": str(run.task_id), "kind": "implementation-owner"},
+        observed_at=binding_row["created_at"] if binding_row is not None else None,
+    )
     store.mark_intention(
         intention_id,
         "applied",
@@ -807,6 +829,7 @@ def _run_summary(store: StateStore, run: RunRecord, *, live: object = None) -> J
         "nextObligation": next_obligation,
         "live": live,
         "evidence": store.evidence(run.local_id),
+        "efficiency": efficiency_report(store, run),
     }
 
 
@@ -856,6 +879,42 @@ def _milestone_plan_path(store: StateStore, run: RunRecord) -> str | None:
         (run.local_id,),
     ).fetchone()
     return str(row["relative_path"]) if row is not None else None
+
+
+def _run_capacity_binding(store: StateStore, run: RunRecord) -> tuple[str | None, int]:
+    row = store.connection.execute(
+        "SELECT relative_path, plan_digest, plan_json FROM milestone_plan_bindings WHERE run_local_id = ?",
+        (run.local_id,),
+    ).fetchone()
+    if row is None:
+        return None, 1
+    loaded = load_stored_milestone_plan(
+        row["relative_path"],
+        row["plan_json"],
+        objective=run.objective,
+        candidate_digest=run.source_digest,
+    )
+    if loaded.digest != row["plan_digest"]:
+        raise OrchestrateError("Stored milestone plan digest changed", code="milestone_plan_changed")
+    return loaded.digest, loaded.plan.max_workers
+
+
+def _ensure_run_capacity(
+    store: StateStore,
+    run: RunRecord,
+    *,
+    allow_exceptional_capacity: bool = False,
+    capacity_reason: str | None = None,
+) -> None:
+    plan_digest, requested = _run_capacity_binding(store, run)
+    ensure_capacity_grant(
+        store,
+        run,
+        plan_digest=plan_digest,
+        requested_limit=requested,
+        allow_exceptional_capacity=allow_exceptional_capacity,
+        capacity_reason=capacity_reason,
+    )
 
 
 def _has_milestone_history(store: StateStore, run: RunRecord) -> bool:
@@ -1538,7 +1597,11 @@ def _record_input_submission_diagnostic(
     )
 
 
-def _validate_native_settlement(client: OrcaClient, run: RunRecord, outcome: str) -> None:
+def _validate_native_settlement(
+    client: OrcaClient,
+    run: RunRecord,
+    outcome: str,
+) -> None:
     worker = client.run_json("orchestration", "worker-show", "--dispatch", str(run.dispatch_id), "--json")
     tasks = client.run_json("orchestration", "task-list", "--run", str(run.native_run_id), "--json")
     dispatch = _result(worker).get("dispatch")
@@ -1562,6 +1625,87 @@ def _validate_native_settlement(client: OrcaClient, run: RunRecord, outcome: str
     matching = [item for item in task_rows or [] if isinstance(item, Mapping) and item.get("id") == run.task_id]
     if len(matching) != 1 or matching[0].get("status") != expected or matching[0].get("run_id") != run.native_run_id:
         raise OrchestrateError("worker_done does not match native Task settlement", code="settlement_mismatch")
+
+
+def _validate_native_milestone_settlement(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    worker: object,
+    outcome: Literal["succeeded", "failed"],
+    *,
+    initial_readback: Mapping[str, Any],
+) -> None:
+    readback = client.run_json(
+        "orchestration",
+        "worker-show",
+        "--dispatch",
+        worker["dispatch_id"],  # type: ignore[index]
+        "--json",
+    )
+    session = WorkerSession(
+        worker["dispatch_id"],  # type: ignore[index]
+        worker["task_id"],  # type: ignore[index]
+        worker["terminal_handle"],  # type: ignore[index]
+        worker["resource_id"],  # type: ignore[index]
+        worker["worktree_id"],  # type: ignore[index]
+        worker["agent"],  # type: ignore[index]
+        str(run.native_run_id),
+        outcome,
+    )
+    release_rows = store.connection.execute(
+        "SELECT status, response_json FROM intentions WHERE run_local_id = ? AND operation = ? ORDER BY created_at",
+        (run.local_id, f"milestone-worker-release:{worker['task_key']}"),  # type: ignore[index]
+    ).fetchall()
+    try:
+        if not release_rows:
+            validate_immutable_worker_start_readback(initial_readback, readback)
+            validate_owned_session_readback(session, readback)
+        elif len(release_rows) == 1 and release_rows[0]["status"] == "applied" and release_rows[0]["response_json"]:
+            # A crash may follow an already validated release but precede the
+            # local outcome transaction. Rejoin every immutable identity still
+            # present after Orca's required terminal detachment; the stored
+            # release receipt is validated before finalization.
+            try:
+                stored_release = json.loads(release_rows[0]["response_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise OrchestrateError(
+                    "Milestone settlement has a malformed applied release receipt",
+                    code="release_unconfirmed",
+                ) from exc
+            if not isinstance(stored_release, Mapping):
+                raise OrchestrateError(
+                    "Milestone settlement has a malformed applied release receipt",
+                    code="release_unconfirmed",
+                )
+            current_resource = _result(readback).get("terminalResource")
+            released_detachment = (
+                isinstance(current_resource, Mapping)
+                and current_resource.get("ownershipState") == "released"
+                and current_resource.get("releaseState") == "released"
+            )
+            validate_immutable_worker_start_readback(
+                initial_readback,
+                readback,
+                allow_released_terminal_detachment=released_detachment,
+            )
+            validate_session_readback(session, readback)
+            decision = validate_release_receipt(session, stored_release, worker_readback=readback)
+            if decision.state == "uncertain":
+                raise OrchestrateError(
+                    "Milestone settlement still has an uncertain applied release",
+                    code="release_unconfirmed",
+                )
+        else:
+            raise OrchestrateError(
+                "Milestone settlement has an unresolved release transition",
+                code="release_unconfirmed",
+            )
+    except OrchestrateError as exc:
+        raise OrchestrateError(
+            "worker_done does not match the exact native Dispatch settlement and owned resource",
+            code="settlement_mismatch",
+        ) from exc
 
 
 def _recover_prompt_stall_resource_binding(
@@ -1784,6 +1928,13 @@ def _release_disposition(
                 "worker-show release readback still exposes an attached terminal",
                 code="release_unconfirmed",
             )
+        record_efficiency_event(
+            store,
+            run.local_id,
+            event="session_released",
+            identity=str(run.dispatch_id),
+            details={"disposition": "released" if released_resource else "retained"},
+        )
         return
     if release_state == "release_pending":
         raise OrchestrateError(
@@ -2182,6 +2333,484 @@ def _milestone_gate_rows(store: StateStore, run: RunRecord) -> dict[str, NativeG
     }
 
 
+def _milestone_worker_start_arguments(
+    run: RunRecord,
+    profile: ProjectProfile,
+    binding: NativeTaskBinding,
+    choice: RoleChoice,
+) -> tuple[str, list[str]]:
+    selector = f"path:{profile.root.resolve()}"
+    arguments = [
+        "orchestration",
+        "worker-start",
+        "--run",
+        str(run.native_run_id),
+        "--task",
+        binding.task_id,
+        "--worktree",
+        selector,
+        "--agent",
+        choice.agent,
+    ]
+    if choice.model is not None:
+        arguments.extend(("--model", choice.model))
+    if choice.effort is not None:
+        arguments.extend(("--effort", choice.effort))
+    arguments.extend(("--timeout-ms", "60000"))
+    return selector, arguments
+
+
+def _validate_milestone_worker_readback(
+    readback: Mapping[str, Any],
+    run: RunRecord,
+    profile: ProjectProfile,
+    binding: NativeTaskBinding,
+    choice: RoleChoice,
+    *,
+    dispatch_id: str,
+    actual_worktree: str,
+    terminal: str,
+) -> TerminalResourceIdentity:
+    task_run = replace(run, task_id=binding.task_id, dispatch_id=None)
+    selector = f"path:{profile.root.resolve()}"
+    try:
+        resource = _validate_worker_start_readback(
+            readback,
+            run=task_run,
+            dispatch_id=dispatch_id,
+            worktree_id=actual_worktree,
+            worktree_selector=selector,
+            terminal_id=terminal,
+            agent=choice.agent,
+            model=choice.model,
+            effort=choice.effort,
+        )
+    except OrchestrateError as initial_error:
+        result = _result(readback)
+        dispatch = result.get("dispatch")
+        worker = result.get("worker")
+        terminal_resource = result.get("terminalResource")
+        if not all(isinstance(item, Mapping) for item in (dispatch, worker, terminal_resource)):
+            raise initial_error
+        assert isinstance(dispatch, Mapping)
+        assert isinstance(worker, Mapping)
+        assert isinstance(terminal_resource, Mapping)
+        semantics = "succeeded" if dispatch.get("status") == "completed" else "failed"
+        try:
+            settled = worker_execution_identity(
+                dispatch,
+                worker,
+                semantics=semantics,  # type: ignore[arg-type]
+                terminal_handle=terminal,
+            )
+            resource = worker_terminal_resource_identity(terminal_resource, dispatch_id=dispatch_id)
+        except WorkerShowShapeError:
+            raise initial_error
+        options = worker.get("startOptions")
+        expected_launch = choice.requested()
+        if (
+            settled.dispatch.run_id != run.native_run_id
+            or settled.dispatch.task_id != binding.task_id
+            or settled.dispatch_id != dispatch_id
+            or settled.worktree_id != actual_worktree
+            or resource.worktree_id != actual_worktree
+            or resource.terminal_handle != terminal
+            or terminal_resource.get("ownershipState") != "owned"
+            or terminal_resource.get("releaseState") != "not_requested"
+            or terminal_resource.get("retainedReason") is not None
+            or not isinstance(options, Mapping)
+            or options.get("worktree") != selector
+            or options.get("resolvedWorktreeId") != actual_worktree
+            or options.get("terminal") is not None
+            or options.get("agent") != choice.agent
+            or options.get("setup") != "not_applicable"
+            or options.get("setupSource") != "existing_worktree"
+            or not isinstance(options.get("launch"), Mapping)
+            or options["launch"].get("requested") != expected_launch
+            or options["launch"].get("effective") != expected_launch
+        ):
+            raise initial_error
+        _validate_residual_resources(
+            worker.get("residualResources"),
+            worktree_id=actual_worktree,
+            terminal_id=terminal,
+        )
+    result = _result(readback)
+    readback_dispatch = result.get("dispatch")
+    readback_worker = result.get("worker")
+    readback_resource = result.get("terminalResource")
+    readback_terminal = result.get("terminal")
+    if (
+        not isinstance(readback_dispatch, Mapping)
+        or not isinstance(readback_worker, Mapping)
+        or not isinstance(readback_resource, Mapping)
+    ):
+        raise OrchestrateError("worker-show omitted immutable start identity", code="native_worker_binding_mismatch")
+    optional_expected_fields = (
+        (readback_dispatch, "agent", choice.agent),
+        (readback_dispatch, "agentIdentity", choice.agent),
+        (readback_worker, "dispatchId", dispatch_id),
+        (readback_worker, "dispatch_id", dispatch_id),
+        (readback_worker, "runId", run.native_run_id),
+        (readback_worker, "run_id", run.native_run_id),
+        (readback_worker, "taskId", binding.task_id),
+        (readback_worker, "task_id", binding.task_id),
+        (readback_worker, "worktreeId", actual_worktree),
+        (readback_worker, "worktree_id", actual_worktree),
+        (readback_worker, "agentTerminalHandle", terminal),
+        (readback_worker, "agent_terminal_handle", terminal),
+        (readback_worker, "agent", choice.agent),
+        (readback_worker, "agentIdentity", choice.agent),
+    )
+    changed_optional = [
+        field
+        for component, field, expected in optional_expected_fields
+        if field in component and component.get(field) != expected
+    ]
+    if changed_optional:
+        raise OrchestrateError(
+            "worker-show changed an observed worker or Dispatch start identity",
+            code="native_worker_binding_mismatch",
+            data={"fields": changed_optional},
+        )
+    if readback_terminal is not None:
+        if not isinstance(readback_terminal, Mapping):
+            raise OrchestrateError("worker-show returned a malformed terminal identity", code="native_worker_binding_mismatch")
+        if (
+            readback_terminal.get("handle") != terminal
+            or ("worktreeId" in readback_terminal and readback_terminal.get("worktreeId") != actual_worktree)
+            or ("agentIdentity" in readback_terminal and readback_terminal.get("agentIdentity") != choice.agent)
+        ):
+            raise OrchestrateError("worker-show terminal does not match the accepted start", code="native_worker_binding_mismatch")
+        for field in ("ptyId", "incarnationId", "executionHostId"):
+            if field in readback_terminal and (
+                not isinstance(readback_terminal[field], str) or not readback_terminal[field]
+            ):
+                raise OrchestrateError(
+                    "worker-show terminal has a malformed immutable identity",
+                    code="native_worker_binding_mismatch",
+                    data={"field": f"terminal.{field}"},
+                )
+    for field in ("endpointId", "endpointIncarnation"):
+        if field in readback_resource and readback_resource[field] is not None and (
+            not isinstance(readback_resource[field], str) or not readback_resource[field]
+        ):
+            raise OrchestrateError(
+                "worker-show terminal resource has a malformed endpoint identity",
+                code="native_worker_binding_mismatch",
+                data={"field": f"terminalResource.{field}"},
+            )
+    return resource
+
+
+def _validate_milestone_worker_projection(
+    client: OrcaClient,
+    run: RunRecord,
+    profile: ProjectProfile,
+    binding: NativeTaskBinding,
+    choice: RoleChoice,
+    response: Mapping[str, Any],
+    *,
+    returncode: int,
+    worktree_id: str | None,
+) -> tuple[str, TerminalResourceIdentity, Mapping[str, Any]]:
+    _validate_worker_start_returncode(response, returncode)
+    if _result(response).get("state") != "ready":
+        raise OrchestrateError(
+            "Milestone worker did not reach the exact ready state; its resources require explicit recovery",
+            code="milestone_worker_start_failed",
+        )
+    task_run = replace(run, task_id=binding.task_id, dispatch_id=None)
+    actual_worktree, terminal = _validate_worker_start(
+        response,
+        run=task_run,
+        worktree_id=worktree_id,
+        agent=choice.agent,
+        model=choice.model,
+        effort=choice.effort,
+    )
+    dispatch_id = _result(response).get("dispatchId")
+    if not isinstance(dispatch_id, str):
+        raise OrchestrateError("worker-start omitted Dispatch identity", code="orca_contract_error")
+    readback = client.run_json("orchestration", "worker-show", "--dispatch", dispatch_id, "--json")
+    resource = _validate_milestone_worker_readback(
+        readback,
+        run,
+        profile,
+        binding,
+        choice,
+        dispatch_id=dispatch_id,
+        actual_worktree=actual_worktree,
+        terminal=terminal,
+    )
+    return dispatch_id, resource, readback
+
+
+def _project_milestone_worker(
+    store: StateStore,
+    run: RunRecord,
+    task: MilestoneTask,
+    binding: NativeTaskBinding,
+    choice: RoleChoice,
+    dispatch_id: str,
+    resource: TerminalResourceIdentity,
+    readback: Mapping[str, Any],
+    *,
+    observed_at: str,
+) -> None:
+    existing = store.connection.execute(
+        "SELECT * FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = ?",
+        (run.local_id, task.key),
+    ).fetchone()
+    expected = (
+        binding.task_id,
+        dispatch_id,
+        task.role,
+        choice.agent,
+        resource.resource_id,
+        resource.terminal_handle,
+        resource.worktree_id,
+    )
+    if existing is None:
+        store.connection.execute(
+            """INSERT INTO milestone_worker_bindings
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'owned', ?, ?, ?)""",
+            (
+                run.local_id,
+                task.key,
+                *expected,
+                json.dumps(readback, sort_keys=True),
+                observed_at,
+                observed_at,
+            ),
+        )
+    else:
+        actual = tuple(
+            existing[field]
+            for field in (
+                "task_id",
+                "dispatch_id",
+                "role",
+                "agent",
+                "resource_id",
+                "terminal_handle",
+                "worktree_id",
+            )
+        )
+        if actual != expected:
+            raise OrchestrateError(
+                "Stored milestone worker conflicts with its applied launch receipt",
+                code="native_worker_binding_mismatch",
+            )
+    record_efficiency_event(
+        store,
+        run.local_id,
+        event="session_created",
+        identity=dispatch_id,
+        details={"taskId": binding.task_id, "taskKey": task.key, "kind": "milestone"},
+        observed_at=observed_at,
+    )
+
+
+def _recover_milestone_worker_projections(
+    client: OrcaClient,
+    store: StateStore,
+    run: RunRecord,
+    profile: ProjectProfile,
+    plan: MilestonePlan,
+    *,
+    worktree_id: str | None,
+) -> None:
+    """Rebuild exact derived worker rows before mail or frontier selection."""
+
+    intention_rows = store.connection.execute(
+        """SELECT * FROM intentions
+           WHERE run_local_id = ? AND operation LIKE 'milestone-worker-start:%'
+           ORDER BY created_at, id""",
+        (run.local_id,),
+    ).fetchall()
+    by_task: dict[str, list[object]] = {}
+    for row in intention_rows:
+        task_key = row["operation"].partition(":")[2]
+        by_task.setdefault(task_key, []).append(row)
+    if any(len(rows) != 1 for rows in by_task.values()):
+        raise OrchestrateError(
+            "Milestone worker launch history is ambiguous",
+            code="unknown_external_effect",
+        )
+
+    planned = {task.key: task for task in plan.tasks if not task.integration_owner}
+    for task_key, rows in by_task.items():
+        row = rows[0]  # type: ignore[index]
+        existing = store.connection.execute(
+            "SELECT 1 FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = ?",
+            (run.local_id, task_key),
+        ).fetchone()
+        if row["status"] != "applied" and existing is None:
+            raise OrchestrateError(
+                "A prior milestone worker launch is unresolved; no duplicate was issued",
+                code="unknown_external_effect",
+                data={"taskKey": task_key, "requestId": row["request_id"], "status": row["status"]},
+            )
+        if row["status"] != "applied" or task_key not in planned:
+            raise OrchestrateError(
+                "Milestone worker binding conflicts with unresolved or unplanned launch history",
+                code="native_worker_binding_mismatch",
+            )
+    task_rows = {
+        row["task_key"]: row
+        for row in store.connection.execute(
+            "SELECT * FROM milestone_task_bindings WHERE run_local_id = ?",
+            (run.local_id,),
+        ).fetchall()
+    }
+    roster = load_role_roster()
+    for task_key, rows in by_task.items():
+        row = rows[0]  # type: ignore[index]
+        task = planned.get(task_key)
+        task_row = task_rows.get(task_key)
+        if task is None or task_row is None:
+            raise OrchestrateError(
+                "Applied milestone worker launch has no exact planned Task binding",
+                code="native_worker_binding_mismatch",
+            )
+        dependency_ids = [
+            str(run.task_id) if dependency == next(item.key for item in plan.tasks if item.integration_owner)
+            else str(task_rows[dependency]["task_id"])
+            for dependency in task.dependencies
+            if dependency == next(item.key for item in plan.tasks if item.integration_owner) or dependency in task_rows
+        ]
+        try:
+            stored_dependencies = json.loads(task_row["dependencies_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise OrchestrateError(
+                "Milestone worker Task binding is malformed",
+                code="native_worker_binding_mismatch",
+            ) from exc
+        if (
+            len(dependency_ids) != len(task.dependencies)
+            or stored_dependencies != dependency_ids
+            or task_row["candidate_digest"] != task.candidate_digest
+            or task_row["contract_digest"] != task.contract_digest
+            or task_row["spec"] != task.spec
+            or packet_spec_from_json(store.get_packet_json(run.local_id, task_row["task_id"])) != task.spec
+        ):
+            raise OrchestrateError(
+                "Milestone worker Task or packet identity changed before projection recovery",
+                code="native_worker_binding_mismatch",
+            )
+        binding = NativeTaskBinding(task.key, task_row["task_id"], tuple(stored_dependencies), task.spec)
+        choice = roster.choice(task.role)
+        _, expected_arguments = _milestone_worker_start_arguments(run, profile, binding, choice)
+        try:
+            arguments = json.loads(row["arguments_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise OrchestrateError("Milestone worker launch intention is malformed", code="unknown_external_effect") from exc
+        existing = store.connection.execute(
+            "SELECT * FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = ?",
+            (run.local_id, task.key),
+        ).fetchone()
+        if arguments != expected_arguments or not row["response_json"] or type(row["returncode"]) is not int:
+            raise OrchestrateError(
+                "Applied milestone worker receipt cannot be projected exactly",
+                code="unknown_external_effect",
+                data={"taskKey": task.key},
+            )
+        try:
+            response = json.loads(row["response_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise OrchestrateError("Applied milestone worker receipt is malformed", code="unknown_external_effect") from exc
+        if not isinstance(response, Mapping) or _mutation_request_id(response) != row["request_id"]:
+            raise OrchestrateError(
+                "Applied milestone worker receipt lost its exact request identity",
+                code="unknown_external_effect",
+                data={"taskKey": task.key},
+            )
+        if existing is not None:
+            try:
+                _validate_worker_start_returncode(response, row["returncode"])
+                task_run = replace(run, task_id=binding.task_id, dispatch_id=None)
+                receipt_worktree, receipt_terminal = _validate_worker_start(
+                    response,
+                    run=task_run,
+                    worktree_id=worktree_id,
+                    agent=choice.agent,
+                    model=choice.model,
+                    effort=choice.effort,
+                )
+                receipt_dispatch = _result(response).get("dispatchId")
+                stored_readback = json.loads(existing["readback_json"])
+                stored_resource = _validate_milestone_worker_readback(
+                    stored_readback,
+                    run,
+                    profile,
+                    binding,
+                    choice,
+                    dispatch_id=receipt_dispatch,
+                    actual_worktree=receipt_worktree,
+                    terminal=receipt_terminal,
+                )
+            except (TypeError, json.JSONDecodeError, OrchestrateError) as exc:
+                cause = exc.code if isinstance(exc, OrchestrateError) else "malformed_readback"
+                raise OrchestrateError(
+                    "Stored milestone worker projection conflicts with its applied receipt",
+                    code="native_worker_binding_mismatch",
+                    data={"taskKey": task.key, "cause": cause},
+                ) from exc
+            if (
+                existing["task_id"] != binding.task_id
+                or existing["dispatch_id"] != receipt_dispatch
+                or existing["role"] != task.role
+                or existing["agent"] != choice.agent
+                or existing["resource_id"] != stored_resource.resource_id
+                or existing["terminal_handle"] != stored_resource.terminal_handle
+                or existing["worktree_id"] != stored_resource.worktree_id
+            ):
+                raise OrchestrateError(
+                    "Stored milestone worker projection conflicts with its applied receipt",
+                    code="native_worker_binding_mismatch",
+                    data={"taskKey": task.key},
+                )
+            record_efficiency_event(
+                store,
+                run.local_id,
+                event="session_created",
+                identity=existing["dispatch_id"],
+                details={"taskId": binding.task_id, "taskKey": task.key, "kind": "milestone"},
+                observed_at=existing["created_at"],
+            )
+            continue
+        try:
+            dispatch_id, resource, readback = _validate_milestone_worker_projection(
+                client,
+                run,
+                profile,
+                binding,
+                choice,
+                response,
+                returncode=row["returncode"],
+                worktree_id=worktree_id,
+            )
+        except OrchestrateError as exc:
+            raise OrchestrateError(
+                "Applied milestone worker receipt does not match its live worker identity",
+                code="native_worker_binding_mismatch",
+                data={"taskKey": task.key, "cause": exc.code},
+            ) from exc
+        with store.transaction():
+            _project_milestone_worker(
+                store,
+                run,
+                task,
+                binding,
+                choice,
+                dispatch_id,
+                resource,
+                readback,
+                observed_at=row["updated_at"],
+            )
+
+
 def _start_milestone_worker(
     client: OrcaClient,
     store: StateStore,
@@ -2201,6 +2830,14 @@ def _start_milestone_worker(
     if existing is not None:
         if existing["task_id"] != binding.task_id or existing["role"] != task.role or existing["agent"] != choice.agent:
             raise OrchestrateError("Stored milestone worker conflicts with its planned Task", code="native_worker_binding_mismatch")
+        record_efficiency_event(
+            store,
+            run.local_id,
+            event="session_created",
+            identity=existing["dispatch_id"],
+            details={"taskId": binding.task_id, "taskKey": task.key, "kind": "milestone"},
+            observed_at=existing["created_at"],
+        )
         return
     operation = f"milestone-worker-start:{task.key}"
     unresolved = store.connection.execute(
@@ -2220,24 +2857,7 @@ def _start_milestone_worker(
         packet_json,
         milestone_sources=_run_milestone_sources(store, run),
     )
-    selector = f"path:{profile.root.resolve()}"
-    arguments = [
-        "orchestration",
-        "worker-start",
-        "--run",
-        str(run.native_run_id),
-        "--task",
-        binding.task_id,
-        "--worktree",
-        selector,
-        "--agent",
-        choice.agent,
-    ]
-    if choice.model is not None:
-        arguments.extend(("--model", choice.model))
-    if choice.effort is not None:
-        arguments.extend(("--effort", choice.effort))
-    arguments.extend(("--timeout-ms", "60000"))
+    _, arguments = _milestone_worker_start_arguments(run, profile, binding, choice)
     intention_id = store.prepare_intention(run.local_id, operation, arguments)
     store.mark_intention(intention_id, "invoking")
     try:
@@ -2264,34 +2884,15 @@ def _start_milestone_worker(
     returncode = _response_returncode(response)
     request_id = _mutation_request_id(response)
     try:
-        _validate_worker_start_returncode(response, returncode)
-        if _result(response).get("state") != "ready":
-            raise OrchestrateError(
-                "Milestone worker did not reach the exact ready state; its resources require explicit recovery",
-                code="milestone_worker_start_failed",
-            )
-        actual_worktree, terminal = _validate_worker_start(
+        dispatch_id, resource, readback = _validate_milestone_worker_projection(
+            client,
+            run,
+            profile,
+            binding,
+            choice,
             response,
-            run=task_run,
+            returncode=returncode,
             worktree_id=worktree_id,
-            agent=choice.agent,
-            model=choice.model,
-            effort=choice.effort,
-        )
-        dispatch_id = _result(response).get("dispatchId")
-        if not isinstance(dispatch_id, str):
-            raise OrchestrateError("worker-start omitted Dispatch identity", code="orca_contract_error")
-        readback = client.run_json("orchestration", "worker-show", "--dispatch", dispatch_id, "--json")
-        resource = _validate_worker_start_readback(
-            readback,
-            run=task_run,
-            dispatch_id=dispatch_id,
-            worktree_id=actual_worktree,
-            worktree_selector=selector,
-            terminal_id=terminal,
-            agent=choice.agent,
-            model=choice.model,
-            effort=choice.effort,
         )
     except OrchestrateError as exc:
         store.mark_intention(
@@ -2302,32 +2903,26 @@ def _start_milestone_worker(
             error={"code": exc.code, "message": str(exc), "response": response},
         )
         raise
-    store.mark_intention(
-        intention_id,
-        "applied",
-        request_id=request_id,
-        returncode=returncode,
-        response=response,
-    )
     now = utc_now()
-    store.connection.execute(
-        """INSERT INTO milestone_worker_bindings
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'owned', ?, ?, ?)""",
-        (
-            run.local_id,
-            task.key,
-            binding.task_id,
+    with store.transaction():
+        store.mark_intention(
+            intention_id,
+            "applied",
+            request_id=request_id,
+            returncode=returncode,
+            response=response,
+        )
+        _project_milestone_worker(
+            store,
+            run,
+            task,
+            binding,
+            choice,
             dispatch_id,
-            task.role,
-            choice.agent,
-            resource.resource_id,
-            resource.terminal_handle,
-            resource.worktree_id,
-            json.dumps(readback, sort_keys=True),
-            now,
-            now,
-        ),
-    )
+            resource,
+            readback,
+            observed_at=now,
+        )
 
 
 def _read_milestone_result(
@@ -2437,6 +3032,13 @@ def _release_milestone_worker(
             code="release_pending",
             data={"taskKey": worker["task_key"], "recovery": dict(decision.recovery_metadata or {})},  # type: ignore[index]
         )
+    record_efficiency_event(
+        store,
+        run.local_id,
+        event="session_released",
+        identity=worker["dispatch_id"],  # type: ignore[index]
+        details={"disposition": decision.state, "taskKey": worker["task_key"]},  # type: ignore[index]
+    )
     return decision.state
 
 
@@ -2495,6 +3097,7 @@ def _process_milestone_delivery(
     client: OrcaClient,
     store: StateStore,
     run: RunRecord,
+    profile: ProjectProfile,
     plan: MilestonePlan,
     delivery_id: str,
     messages: list[dict[str, Any]],
@@ -2558,10 +3161,67 @@ def _process_milestone_delivery(
             raise OrchestrateError("Milestone Delivery contains unsupported mail", code="delivery_unsupported")
         outcome = str(payload["outcome"])
         task = task_map[worker["task_key"]]
-        _validate_native_settlement(
+        if not isinstance(run.task_id, str) or not run.task_id:
+            raise OrchestrateError(
+                "Milestone settlement lost the integration owner's native Task identity",
+                code="integration_owner_invalid",
+            )
+        scheduler = NativeDagScheduler(client, store, run.local_id)
+        owner = next(item for item in plan.tasks if item.integration_owner)
+        bindings = scheduler.existing_bindings(
+            plan,
+            integration_owner=NativeTaskBinding(owner.key, run.task_id, (), "first-increment-owner"),
+        )
+        binding = bindings[task.key]
+        choice = load_role_roster().choice(task.role)
+        try:
+            initial_readback = json.loads(worker["readback_json"])
+        except (TypeError, json.JSONDecodeError) as exc:  # type: ignore[index]
+            raise OrchestrateError(
+                "Milestone worker lost its validated start readback",
+                code="settlement_mismatch",
+            ) from exc
+        if not isinstance(initial_readback, Mapping):
+            raise OrchestrateError(
+                "Milestone worker start readback is malformed",
+                code="settlement_mismatch",
+            )
+        try:
+            initial_resource = _validate_milestone_worker_readback(
+                initial_readback,
+                run,
+                profile,
+                binding,
+                choice,
+                dispatch_id=worker["dispatch_id"],  # type: ignore[index]
+                actual_worktree=worker["worktree_id"],  # type: ignore[index]
+                terminal=worker["terminal_handle"],  # type: ignore[index]
+            )
+        except OrchestrateError as exc:
+            raise OrchestrateError(
+                "Milestone worker start readback no longer proves its immutable binding",
+                code="settlement_mismatch",
+            ) from exc
+        if initial_resource.resource_id != worker["resource_id"]:  # type: ignore[index]
+            raise OrchestrateError(
+                "Milestone worker start readback changed its resource identity",
+                code="settlement_mismatch",
+            )
+        scheduler.validate_settlement_readback(
+            str(run.native_run_id),
+            plan,
+            bindings,
+            _milestone_gate_rows(store, run),
+            task_key=task.key,
+            outcome=outcome,  # type: ignore[arg-type]
+        )
+        _validate_native_milestone_settlement(
             client,
+            store,
             replace(run, task_id=worker["task_id"], dispatch_id=worker["dispatch_id"]),
-            outcome,
+            worker,
+            outcome,  # type: ignore[arg-type]
+            initial_readback=initial_readback,
         )
         result_outcome, result_digest = _read_milestone_result(store, run, plan, task, worker, payload)
         release_state = _release_milestone_worker(
@@ -3287,6 +3947,14 @@ def _advance_milestone(
     runtime_plan, packets = _runtime_milestone_plan(profile, store, run, loaded, sources, reader)
     if run.phase == "milestone_blocked":
         return run, runtime_plan
+    _recover_milestone_worker_projections(
+        client,
+        store,
+        run,
+        profile,
+        runtime_plan,
+        worktree_id=worktree_id,
+    )
     owner = next(task for task in runtime_plan.tasks if task.integration_owner)
     if not run.task_id:
         raise OrchestrateError("Integration owner lost its native Task identity", code="integration_owner_invalid")
@@ -3354,39 +4022,49 @@ def _advance_milestone(
         )
         return run, runtime_plan
 
-    active = {row["task_key"] for row in workers if row["outcome"] is None}
+    active = occupied_milestone_tasks(store, run.local_id)
     finished = {owner.key, *(row["task_key"] for row in workers if row["outcome"] is not None)}
     gate_rows = _milestone_gate_rows(store, run)
     roster = load_role_roster()
-    remaining_capacity = runtime_plan.max_workers - len(active)
-    for binding in scheduler.ready_wave(
-        str(run.native_run_id),
-        runtime_plan,
-        bindings,
-        active=active,
-        finished=finished,
-        remaining_capacity=remaining_capacity,
-    ):
-        task = next(item for item in runtime_plan.tasks if item.key == binding.key)
-        gate = gate_rows.get(task.key)
-        if task.gate in {"verification", "review"} and (
-            gate is None or gate.status != "resolved" or gate.resolution != "accepted"
+    launch_authorized = True
+    try:
+        _ensure_run_capacity(store, run)
+    except OrchestrateError as exc:
+        if exc.code != "exceptional_capacity_required" or not active:
+            raise
+        # Historical wider Runs may reconcile their exact existing workers,
+        # but this missing launch grant cannot authorize even one new start.
+        launch_authorized = False
+    if launch_authorized:
+        remaining_capacity = runtime_plan.max_workers - len(active)
+        for binding in scheduler.ready_wave(
+            str(run.native_run_id),
+            runtime_plan,
+            bindings,
+            active=active,
+            finished=finished,
+            remaining_capacity=remaining_capacity,
         ):
-            raise OrchestrateError("Native ready view bypassed an unresolved planned gate", code="native_ready_gate_mismatch")
-        if len(active) >= runtime_plan.max_workers:
-            break
-        _start_milestone_worker(
-            client,
-            store,
-            run,
-            profile,
-            task,
-            binding,
-            packets[task.key],
-            roster.choice(task.role),
-            worktree_id=worktree_id,
-        )
-        active.add(task.key)
+            task = next(item for item in runtime_plan.tasks if item.key == binding.key)
+            gate = gate_rows.get(task.key)
+            if task.gate in {"verification", "review"} and (
+                gate is None or gate.status != "resolved" or gate.resolution != "accepted"
+            ):
+                raise OrchestrateError("Native ready view bypassed an unresolved planned gate", code="native_ready_gate_mismatch")
+            if len(active) >= runtime_plan.max_workers:
+                break
+            _start_milestone_worker(
+                client,
+                store,
+                run,
+                profile,
+                task,
+                binding,
+                packets[task.key],
+                roster.choice(task.role),
+                worktree_id=worktree_id,
+            )
+            active.add(task.key)
     run = store.update_run(run.local_id, phase="milestone_waiting", verification_status="pending")
     return run, runtime_plan
 
@@ -3403,13 +4081,21 @@ def _supervise_milestone(
     if run.delivery_id:
         loaded, sources, reader = _reload_milestone_plan(profile, store, run)
         plan, _ = _runtime_milestone_plan(profile, store, run, loaded, sources, reader)
+        _recover_milestone_worker_projections(
+            client,
+            store,
+            run,
+            profile,
+            plan,
+            worktree_id=worktree_id,
+        )
         messages = store.delivery_messages(run.local_id, run.delivery_id)
         if not messages:
             raise OrchestrateError(
                 "The bound milestone Delivery is missing its immutable journal",
                 code="delivery_journal_missing",
             )
-        run = _process_milestone_delivery(client, store, run, plan, run.delivery_id, messages)
+        run = _process_milestone_delivery(client, store, run, profile, plan, run.delivery_id, messages)
         if not store.pending_questions(run.local_id):
             _ack_if_resolved(client, store, run)
             run = store.get_run(run.local_id)
@@ -3441,7 +4127,7 @@ def _supervise_milestone(
                 continue
             store.journal_delivery(current.local_id, delivery_id, payload, messages)
             current = store.update_run(current.local_id, delivery_id=delivery_id)
-            current = _process_milestone_delivery(client, store, current, plan, delivery_id, messages)
+            current = _process_milestone_delivery(client, store, current, profile, plan, delivery_id, messages)
             if store.pending_questions(current.local_id):
                 break
             _ack_if_resolved(client, store, current)
@@ -3458,6 +4144,8 @@ def implement(
     *,
     client: OrcaClient,
     milestone_plan: str | None = None,
+    allow_exceptional_capacity: bool = False,
+    capacity_reason: str | None = None,
     wait_timeout_ms: int = 300_000,
     require_context: bool = True,
 ) -> JsonObject:
@@ -3468,6 +4156,8 @@ def implement(
             None,
             client=client,
             milestone_plan=milestone_plan,
+            allow_exceptional_capacity=allow_exceptional_capacity,
+            capacity_reason=capacity_reason,
             wait_timeout_ms=wait_timeout_ms,
             require_context=require_context,
         )
@@ -3510,10 +4200,17 @@ def implement(
                 else None
             )
             run = store.create_run(objective=normalized, profile_digest=profile.digest, source_digest=sources.digest)
+            initialize_efficiency_observation(store, run)
             if loaded_plan is not None:
                 _record_milestone_plan(store, run, loaded_plan)
             with store.lock(run.local_id):
                 run = _create_native_run(client, store, run)
+                _ensure_run_capacity(
+                    store,
+                    run,
+                    allow_exceptional_capacity=allow_exceptional_capacity,
+                    capacity_reason=capacity_reason,
+                )
                 run = _create_task_and_packet(client, store, run, profile)
                 packet_json = _ensure_packet(store, run, profile)
                 run = _start_worker(
@@ -3544,6 +4241,8 @@ def resume(
     *,
     client: OrcaClient,
     milestone_plan: str | None = None,
+    allow_exceptional_capacity: bool = False,
+    capacity_reason: str | None = None,
     wait_timeout_ms: int = 300_000,
     require_context: bool = True,
 ) -> JsonObject:
@@ -3559,6 +4258,13 @@ def resume(
                         "Resume plan does not match the Run's immutable selected plan",
                         code="milestone_plan_changed",
                     )
+            if (allow_exceptional_capacity or capacity_reason is not None) and run.native_run_id:
+                _ensure_run_capacity(
+                    store,
+                    run,
+                    allow_exceptional_capacity=allow_exceptional_capacity,
+                    capacity_reason=capacity_reason,
+                )
             if bound_plan_path is not None and (
                 run.phase.startswith("milestone_")
                 or (run.phase == "worker_succeeded" and run.delivery_id is None)
@@ -3680,9 +4386,17 @@ def resume(
                 run = _finish_prompt_stall_cleanup(client, store, run)
             if run.phase == "preparing":
                 run = _create_native_run(client, store, run)
+            if run.phase in {"run_created", "task_created"}:
+                _ensure_run_capacity(
+                    store,
+                    run,
+                    allow_exceptional_capacity=allow_exceptional_capacity,
+                    capacity_reason=capacity_reason,
+                )
             if run.phase == "run_created":
                 run = _create_task_and_packet(client, store, run, profile)
             if run.phase == "task_created":
+                _ensure_run_capacity(store, run)
                 packet_json = _ensure_packet(store, run, profile)
                 _validate_task_binding(
                     client,
@@ -3816,8 +4530,8 @@ def explain(root: Path, run_id: str | None) -> JsonObject:
 
 
 def packet(root: Path, run_id: str, task_id: str) -> JsonObject:
-    profile = ProjectProfile.load(root)
-    with StateStore(profile.root) as store:
+    project_root = find_project_root(root)
+    with StateStore.open_read_only(project_root) as store:
         run = store.get_run(run_id)
         return store.get_packet(run.local_id, task_id)
 

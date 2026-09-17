@@ -118,10 +118,22 @@ REQUIRED_STATE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
             "record_json",
             "correction_key",
             "evidence_digest",
+            "correction_evidence_digest",
+            "diagnosis_evidence_digest",
             "correction_count",
             "diagnosis_status",
             "created_at",
             "updated_at",
+        }
+    ),
+    "intervention_evidence_history": frozenset(
+        {
+            "run_local_id",
+            "task_key",
+            "correction_key",
+            "evidence_digest",
+            "evidence_kind",
+            "consumed_at",
         }
     ),
     "milestone_task_bindings": frozenset(
@@ -639,11 +651,24 @@ class StateStore(AbstractContextManager["StateStore"]):
                 record_json TEXT NOT NULL,
                 correction_key TEXT NOT NULL,
                 evidence_digest TEXT NOT NULL,
+                correction_evidence_digest TEXT NOT NULL,
+                diagnosis_evidence_digest TEXT,
                 correction_count INTEGER NOT NULL,
                 diagnosis_status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (run_local_id, task_key)
+            );
+            CREATE TABLE IF NOT EXISTS intervention_evidence_history (
+                run_local_id TEXT NOT NULL,
+                task_key TEXT NOT NULL,
+                correction_key TEXT NOT NULL,
+                evidence_digest TEXT NOT NULL,
+                evidence_kind TEXT NOT NULL,
+                consumed_at TEXT NOT NULL,
+                PRIMARY KEY (run_local_id, task_key, correction_key, evidence_digest),
+                FOREIGN KEY (run_local_id, task_key)
+                    REFERENCES interventions(run_local_id, task_key)
             );
             CREATE TABLE IF NOT EXISTS milestone_task_bindings (
                 run_local_id TEXT NOT NULL REFERENCES runs(local_id),
@@ -701,15 +726,71 @@ class StateStore(AbstractContextManager["StateStore"]):
             );
             """
         )
-        intention_columns = {
-            row["name"] for row in self.connection.execute("PRAGMA table_info(intentions)").fetchall()
-        }
-        if "returncode" not in intention_columns:
-            self.connection.execute("ALTER TABLE intentions ADD COLUMN returncode INTEGER")
-        self.connection.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema', ?)",
-            (STATE_SCHEMA,),
-        )
+        with self.transaction():
+            intention_columns = {
+                row["name"] for row in self.connection.execute("PRAGMA table_info(intentions)").fetchall()
+            }
+            if "returncode" not in intention_columns:
+                self.connection.execute("ALTER TABLE intentions ADD COLUMN returncode INTEGER")
+            intervention_columns = {
+                row["name"] for row in self.connection.execute("PRAGMA table_info(interventions)").fetchall()
+            }
+            if "correction_evidence_digest" not in intervention_columns:
+                self.connection.execute("ALTER TABLE interventions ADD COLUMN correction_evidence_digest TEXT")
+            if "diagnosis_evidence_digest" not in intervention_columns:
+                self.connection.execute("ALTER TABLE interventions ADD COLUMN diagnosis_evidence_digest TEXT")
+            legacy_interventions = self.connection.execute(
+                """SELECT run_local_id, task_key, record_json, evidence_digest, diagnosis_status
+                   FROM interventions WHERE correction_evidence_digest IS NULL"""
+            ).fetchall()
+            for row in legacy_interventions:
+                correction_digest = row["evidence_digest"]
+                try:
+                    record = json.loads(row["record_json"])
+                    evidence = record.get("last_meaningful_evidence") if isinstance(record, dict) else None
+                    if isinstance(evidence, str) and evidence.strip():
+                        correction_digest = "evidence_sha256_" + hashlib.sha256(evidence.encode("utf-8")).hexdigest()
+                except (TypeError, json.JSONDecodeError):
+                    pass
+                diagnosis_digest = row["evidence_digest"] if row["diagnosis_status"] == "productive" else None
+                self.connection.execute(
+                    """UPDATE interventions
+                       SET correction_evidence_digest = ?, diagnosis_evidence_digest = ?
+                       WHERE run_local_id = ? AND task_key = ?""",
+                    (correction_digest, diagnosis_digest, row["run_local_id"], row["task_key"]),
+                )
+            recoverable_interventions = self.connection.execute(
+                """SELECT run_local_id, task_key, correction_key,
+                          correction_evidence_digest, diagnosis_evidence_digest,
+                          created_at, updated_at
+                   FROM interventions"""
+            ).fetchall()
+            for row in recoverable_interventions:
+                recoverable = (
+                    (row["correction_evidence_digest"], "correction", row["created_at"]),
+                    (row["diagnosis_evidence_digest"], "diagnosis", row["updated_at"]),
+                )
+                for evidence_digest, evidence_kind, consumed_at in recoverable:
+                    if not isinstance(evidence_digest, str) or not evidence_digest:
+                        continue
+                    self.connection.execute(
+                        """INSERT OR IGNORE INTO intervention_evidence_history(
+                               run_local_id, task_key, correction_key, evidence_digest,
+                               evidence_kind, consumed_at
+                           ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            row["run_local_id"],
+                            row["task_key"],
+                            row["correction_key"],
+                            evidence_digest,
+                            evidence_kind,
+                            consumed_at,
+                        ),
+                    )
+            self.connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema', ?)",
+                (STATE_SCHEMA,),
+            )
 
     def _validate_read_schema(self) -> None:
         """Reject state that the writable path would have to create or migrate."""
@@ -1333,13 +1414,54 @@ class StateStore(AbstractContextManager["StateStore"]):
             (f"evidence_{uuid.uuid4().hex}", run_local_id, kind, status, subject, json.dumps(payload, sort_keys=True), utc_now()),
         )
 
+    def record_stable_evidence(
+        self,
+        run_local_id: str,
+        *,
+        evidence_id: str,
+        kind: str,
+        status: str,
+        subject: str,
+        payload: object,
+        created_at: str | None = None,
+    ) -> None:
+        """Insert one replay-safe evidence event with an externally stable identity."""
+
+        if not evidence_id or not evidence_id.startswith("evidence_"):
+            raise ValueError("Stable evidence IDs must use the evidence_ prefix")
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        existing = self.connection.execute(
+            "SELECT run_local_id, kind, status, subject, payload_json FROM evidence WHERE id = ?",
+            (evidence_id,),
+        ).fetchone()
+        if existing is not None:
+            observed = (
+                existing["run_local_id"],
+                existing["kind"],
+                existing["status"],
+                existing["subject"],
+                existing["payload_json"],
+            )
+            expected = (run_local_id, kind, status, subject, encoded)
+            if observed != expected:
+                raise OrchestrateError(
+                    "Stable evidence identity conflicts with its recorded event",
+                    code="evidence_identity_conflict",
+                )
+            return
+        self.connection.execute(
+            "INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (evidence_id, run_local_id, kind, status, subject, encoded, created_at or utc_now()),
+        )
+
     def evidence(self, run_local_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute(
-            "SELECT kind, status, subject, payload_json, created_at FROM evidence WHERE run_local_id = ? ORDER BY created_at",
+            "SELECT id, kind, status, subject, payload_json, created_at FROM evidence WHERE run_local_id = ? ORDER BY created_at, id",
             (run_local_id,),
         ).fetchall()
         return [
             {
+                "eventId": row["id"],
                 "kind": row["kind"],
                 "status": row["status"],
                 "subject": row["subject"],

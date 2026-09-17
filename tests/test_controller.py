@@ -23,6 +23,7 @@ from orchestrate.controller import (
     _mutation,
     _process_delivery,
     _record_input_submission_diagnostic,
+    _recover_milestone_worker_projections,
     _release_disposition,
     _request_id,
     _run_summary,
@@ -30,16 +31,18 @@ from orchestrate.controller import (
     answer,
     explain,
     implement,
+    packet,
     reconcile_intentions,
     resume,
     status,
 )
 from orchestrate.cli import main as cli_main
 from orchestrate.errors import OrchestrateError
+from orchestrate.coordination import MilestonePlan, MilestoneTask, SharedContract
 from orchestrate.identity import require_plain_controller
 from orchestrate.orca import OrcaCommandError, OrcaCommandResult, OrcaJsonResponse
 from orchestrate.packets import canonical_packet_json, expected_packet_id, make_packet, packet_spec
-from orchestrate.profile import setup_project
+from orchestrate.profile import ProjectProfile, setup_project
 from orchestrate.readers import read_project
 from orchestrate.sources import build_source_index
 from orchestrate.state import AdmissionEffectFence, StateStore
@@ -836,6 +839,7 @@ class MilestoneClient:
             "launch": launch,
             "state": "ready",
             "released": False,
+            "delivery_sent": False,
         }
         self.peak_active_workers = max(
             self.peak_active_workers,
@@ -881,7 +885,9 @@ class MilestoneClient:
     def _worker_show(self, dispatch_id: str) -> dict[str, object]:
         record = self.workers[dispatch_id]
         task_id = record["task_id"]
-        settled = record["state"] == "succeeded"
+        outcome = record["state"]
+        settled = outcome in {"succeeded", "failed"}
+        failed = outcome == "failed"
         released = bool(record["released"])
         terminal = record["terminal"]
         worktree = record["worktree"]
@@ -893,15 +899,16 @@ class MilestoneClient:
                     "runId": "run_1",
                     "taskId": task_id,
                     "task_id": task_id,
-                    "status": "completed" if settled else "dispatched",
-                    "lastFailure": None,
+                    "status": "failed" if failed else "completed" if settled else "dispatched",
+                    "lastFailure": "worker_failed" if failed else None,
                 },
                 "worker": {
                     "dispatchId": dispatch_id,
                     "worktreeId": worktree,
                     "agentTerminalHandle": terminal,
-                    "lastError": None,
-                    "state": "succeeded" if settled else "ready",
+                    "agent": record["launch"]["requested"]["agent"],  # type: ignore[index]
+                    "lastError": "worker_failed" if failed else None,
+                    "state": outcome if settled else "ready",
                     "stage": "settled" if settled else "input_accepted",
                     "residualResources": [
                         {"kind": "terminal", "role": "agent", "action": "created", "id": terminal}
@@ -916,7 +923,14 @@ class MilestoneClient:
                         "setupSource": "existing_worktree",
                     },
                 },
-                "terminal": None if released else {"handle": terminal},
+                "terminal": None if released else {
+                    "handle": terminal,
+                    "ptyId": f"pty_{dispatch_id}",
+                    "incarnationId": f"incarnation_{dispatch_id}",
+                    "worktreeId": worktree,
+                    "executionHostId": "local",
+                    "agentIdentity": record["launch"]["requested"]["agent"],  # type: ignore[index]
+                },
                 "terminalResource": {
                     "id": resource,
                     "ownershipState": "released" if released else "owned",
@@ -926,6 +940,8 @@ class MilestoneClient:
                     "ownerDispatchId": dispatch_id,
                     "terminalHandle": terminal,
                     "worktreeId": worktree,
+                    "endpointId": f"endpoint_{dispatch_id}",
+                    "endpointIncarnation": f"endpoint_incarnation_{dispatch_id}",
                     "releaseRequestedAt": "2026-01-01T00:00:00Z" if released else None,
                     "releaseCompletedAt": "2026-01-01T00:00:01Z" if released else None,
                     "releaseError": None,
@@ -936,13 +952,20 @@ class MilestoneClient:
         }
 
     def _delivery(self) -> dict[str, object]:
-        active = next(record for record in self.workers.values() if record["state"] == "ready")
+        active = next(
+            record
+            for record in self.workers.values()
+            if record["state"] in {"ready", "succeeded", "failed"} and not record["delivery_sent"]
+        )
         task_id = active["task_id"]
         dispatch_id = next(key for key, value in self.workers.items() if value is active)
-        active["state"] = "succeeded"
-        self.tasks[task_id]["status"] = "completed"
-        payload: dict[str, object] = {"taskId": task_id, "dispatchId": dispatch_id, "outcome": "succeeded"}
-        if task_id != "task_1":
+        if active["state"] == "ready":
+            active["state"] = "succeeded"
+        outcome = str(active["state"])
+        active["delivery_sent"] = True
+        self.tasks[task_id]["status"] = "completed" if outcome == "succeeded" else "failed"
+        payload: dict[str, object] = {"taskId": task_id, "dispatchId": dispatch_id, "outcome": outcome}
+        if task_id != "task_1" and outcome == "succeeded":
             with StateStore(self.root) as store:
                 run = store.select_run(None)
                 packet = store.get_packet(run.local_id, task_id)
@@ -982,6 +1005,15 @@ class MilestoneClient:
                 ],
             }
         }
+
+    def settle_without_delivery(self, dispatch_id: str, *, outcome: str) -> None:
+        if outcome not in {"succeeded", "failed"}:
+            raise AssertionError(f"unsupported synthetic outcome: {outcome}")
+        record = self.workers[dispatch_id]
+        if record["delivery_sent"]:
+            raise AssertionError("synthetic worker Delivery was already consumed")
+        record["state"] = outcome
+        self.tasks[str(record["task_id"])]["status"] = "completed" if outcome == "succeeded" else "failed"
 
     def run_json(self, *arguments: str, **_: object) -> dict[str, object]:
         self.calls.append(arguments)
@@ -1329,6 +1361,7 @@ class MilestoneRepo(unittest.TestCase):
         objective: str,
         *,
         specialist_keys: tuple[str, ...] = ("verify",),
+        max_workers: int = 2,
     ) -> str:
         relative = "milestone-plan.json"
         specialist_tasks = [
@@ -1347,7 +1380,7 @@ class MilestoneRepo(unittest.TestCase):
                 {
                     "schema": "orchestrate-milestone-plan/v1",
                     "contract": {"interface": "frozen-v1", "checks": ["focused"]},
-                    "maxWorkers": 2,
+                    "maxWorkers": max_workers,
                     "tasks": [
                         {
                             "key": "owner",
@@ -1378,6 +1411,24 @@ class MilestoneRepo(unittest.TestCase):
 
 
 class ControllerTests(MilestoneRepo):
+    def test_packet_uses_the_existing_read_only_state_store(self) -> None:
+        with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+            run = store.create_run(objective="read one packet", profile_digest="p", source_digest="s")
+            run = store.update_run(run.local_id, task_id="task_packet")
+            store.save_packet(run.local_id, "task_packet", '{"schema":"fixture-packet/v1"}')
+
+        observed_modes: list[bool] = []
+        original_init = StateStore.__init__
+
+        def observe_init(instance: StateStore, *arguments: object, **keywords: object) -> None:
+            observed_modes.append(keywords.get("read_only") is True)
+            original_init(instance, *arguments, **keywords)  # type: ignore[arg-type]
+
+        with patch.object(StateStore, "__init__", new=observe_init):
+            observed = packet(self.root, run.local_id, "task_packet")
+        self.assertEqual(observed, {"schema": "fixture-packet/v1"})
+        self.assertEqual(observed_modes, [True])
+
     def test_public_implement_prelaunch_accepts_bound_milestone_plan_source(self) -> None:
         objective = "Validate the bound milestone plan before native launch"
         plan = self._write_milestone_plan(objective)
@@ -1400,6 +1451,93 @@ class ControllerTests(MilestoneRepo):
                 require_context=False,
             )
         self.assertTrue(any(call[:2] == ("orchestration", "worker-start") for call in client.calls))
+
+    def test_public_implement_records_exceptional_grant_before_native_launch(self) -> None:
+        objective = "Grant four bounded workers before the first launch"
+        plan = self._write_milestone_plan(
+            objective,
+            specialist_keys=("verify_a", "verify_b", "verify_c"),
+            max_workers=4,
+        )
+
+        class PrelaunchReached(RuntimeError):
+            pass
+
+        class PrelaunchProbe(MilestoneClient):
+            def _launch(self, task_id: str, arguments: tuple[str, ...]) -> OrcaJsonResponse:
+                with StateStore(self.root, home=Path(self.state_home)) as store:
+                    run = store.select_run(None)
+                    grants = [item for item in store.evidence(run.local_id) if item["kind"] == "capacity-grant"]
+                self.asserted_grants = grants
+                raise PrelaunchReached(f"validated {task_id}")
+
+        client = PrelaunchProbe(self.root)
+        client.state_home = self.state_temp.name
+        with self.assertRaisesRegex(PrelaunchReached, "validated task_1"):
+            implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                allow_exceptional_capacity=True,
+                capacity_reason="four independent bounded checks",
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(len(client.asserted_grants), 1)
+        payload = client.asserted_grants[0]["payload"]
+        self.assertEqual(payload["runId"], "run_1")
+        self.assertEqual(payload["limit"], 4)
+        self.assertEqual(payload["reason"], "four independent bounded checks")
+
+    def test_public_resume_can_record_exceptional_grant_before_first_launch(self) -> None:
+        objective = "Resume a held four-worker Run with an exact grant"
+        plan = self._write_milestone_plan(
+            objective,
+            specialist_keys=("verify_a", "verify_b", "verify_c"),
+            max_workers=4,
+        )
+        client = MilestoneClient(self.root)
+        with self.assertRaises(OrchestrateError) as held:
+            implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(held.exception.code, "exceptional_capacity_required")
+        self.assertFalse(any(call[:2] == ("orchestration", "worker-start") for call in client.calls))
+
+        class PrelaunchReached(RuntimeError):
+            pass
+
+        original_launch = client._launch
+
+        def stop_at_launch(task_id: str, arguments: tuple[str, ...]) -> OrcaJsonResponse:
+            with StateStore(self.root, home=Path(self.state_temp.name)) as store:
+                run = store.select_run(None)
+                grants = [item for item in store.evidence(run.local_id) if item["kind"] == "capacity-grant"]
+            self.assertEqual(len(grants), 1)
+            self.assertEqual(grants[0]["payload"]["limit"], 4)
+            raise PrelaunchReached(f"validated {task_id}")
+
+        client._launch = stop_at_launch  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(PrelaunchReached, "validated task_1"):
+                resume(
+                    self.root,
+                    None,
+                    client=client,  # type: ignore[arg-type]
+                    milestone_plan=plan,
+                    allow_exceptional_capacity=True,
+                    capacity_reason="resume four independent bounded checks",
+                    wait_timeout_ms=60_000,
+                    require_context=False,
+                )
+        finally:
+            client._launch = original_launch  # type: ignore[method-assign]
 
     @requires_native_windows_admission
     def test_production_controller_executes_tracked_native_milestone_plan(self) -> None:
@@ -1495,7 +1633,7 @@ class ControllerTests(MilestoneRepo):
     @requires_native_windows_admission
     def test_resume_executes_valid_mixed_later_waves_under_remaining_capacity(self) -> None:
         objective = "Resume every valid later specialist wave"
-        specialists = ("verify_a", "verify_b", "verify_c")
+        specialists = ("verify_a", "verify_b", "verify_c", "verify_d", "verify_e")
         plan = self._write_milestone_plan(objective, specialist_keys=specialists)
         client = MilestoneClient(self.root, pause_after_owner=True)
 
@@ -1553,7 +1691,14 @@ class ControllerTests(MilestoneRepo):
                 for call in client.calls
                 if call[:2] == ("orchestration", "worker-start")
             ],
-            ["task_1", "task_2", "task_3", "task_4", "task_5"],
+            ["task_1", "task_2", "task_3", "task_4", "task_5", "task_6", "task_7"],
+        )
+        self.assertTrue(
+            all(
+                "--terminal" not in call
+                for call in client.calls
+                if call[:2] == ("orchestration", "worker-start")
+            )
         )
 
     @requires_native_windows_admission
@@ -1991,7 +2136,8 @@ class ControllerTests(MilestoneRepo):
                         (local_run_id,),
                     )
                 elif kind == "noncanonical_plan_json":
-                    noncanonical = json.dumps(json.loads(plan_row["plan_json"]), indent=2)
+                    noncanonical = json.dumps(json.loads(plan_row["plan_json"]), separators=(",", ":"))
+                    self.assertNotEqual(noncanonical, plan_row["plan_json"])
                     store.connection.execute(
                         "UPDATE milestone_plan_bindings SET plan_json = ? WHERE run_local_id = ?",
                         (noncanonical, local_run_id),
@@ -2490,6 +2636,879 @@ class ControllerTests(MilestoneRepo):
                 require_context=False,
             )
         self.assertEqual(resumed.exception.code, "unknown_external_effect")
+        starts_after = len([call for call in client.calls if call[:2] == ("orchestration", "worker-start")])
+        self.assertEqual(starts_after, starts_before)
+
+    def test_unresolved_milestone_launch_precedes_native_ready_validation(self) -> None:
+        contract = SharedContract.draft({"interface": "frozen-v1"}).settle()
+        candidate = "candidate_exact"
+        plan = MilestonePlan(
+            contract,
+            candidate,
+            (
+                MilestoneTask(
+                    "owner",
+                    "Owner",
+                    "Own integration",
+                    "owner",
+                    gate="integration",
+                    integration_owner=True,
+                    writes_shared_contract=True,
+                    candidate_digest=candidate,
+                    contract_digest=contract.digest,
+                ),
+                MilestoneTask(
+                    "verify",
+                    "Verify",
+                    "Verify exact candidate",
+                    "specialist",
+                    dependencies=("owner",),
+                    gate="verification",
+                    independently_useful=True,
+                    candidate_digest=candidate,
+                    contract_digest=contract.digest,
+                ),
+            ),
+        )
+        client = FakeClient([])
+        with StateStore(self.root) as store:
+            run = store.create_run(objective="recover", profile_digest="p", source_digest="s")
+            run = store.update_run(run.local_id, native_run_id="run_1", task_id="task_1")
+            intention = store.prepare_intention(
+                run.local_id,
+                "milestone-worker-start:verify",
+                ["orchestration", "worker-start"],
+            )
+            store.mark_intention(intention, "uncertain", request_id="request_unknown")
+            with self.assertRaises(OrchestrateError) as caught:
+                _recover_milestone_worker_projections(
+                    client,  # type: ignore[arg-type]
+                    store,
+                    run,
+                    ProjectProfile.load(self.root),
+                    plan,
+                    worktree_id=None,
+                )
+        self.assertEqual(caught.exception.code, "unknown_external_effect")
+        self.assertEqual(client.calls, [])
+
+    @requires_native_windows_admission
+    def test_resume_reconstructs_applied_milestone_start_before_queued_completion(self) -> None:
+        objective = "Integrate then recover the exact applied follow-up launch"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+        first = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        self.assertEqual(first["status"], "milestone_waiting")
+        starts_before = [call for call in client.calls if call[:2] == ("orchestration", "worker-start")]
+        self.assertEqual(sum(call[call.index("--task") + 1] == "task_2" for call in starts_before), 1)
+
+        queued = client._delivery()
+        delivery_id = queued["result"]["deliveryId"]  # type: ignore[index]
+        messages = queued["result"]["messages"]  # type: ignore[index]
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            store.journal_delivery(run.local_id, delivery_id, queued, messages)  # type: ignore[arg-type]
+            store.update_run(run.local_id, delivery_id=delivery_id)
+            store.connection.execute(
+                "DELETE FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            )
+            store.connection.execute(
+                """DELETE FROM evidence WHERE run_local_id = ? AND kind = 'efficiency-event'
+                   AND payload_json LIKE '%\"identity\":\"dispatch_2\"%'""",
+                (run.local_id,),
+            )
+        client.deliveries_paused = False
+
+        resumed = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        self.assertEqual(resumed["status"], "worker_succeeded")
+        self.assertEqual(resumed["verification"], "review_accepted")
+        starts_after = [call for call in client.calls if call[:2] == ("orchestration", "worker-start")]
+        self.assertEqual(sum(call[call.index("--task") + 1] == "task_2" for call in starts_after), 1)
+        releases = [call for call in client.calls if call[:2] == ("orchestration", "worker-release")]
+        self.assertEqual(sum(call[call.index("--dispatch") + 1] == "dispatch_2" for call in releases), 1)
+
+    def _resume_settled_milestone_before_delivery(
+        self,
+        *,
+        outcome: str,
+        remove_binding: bool,
+    ) -> tuple[dict[str, object], MilestoneClient]:
+        objective = f"Integrate then receive {outcome} after native settlement"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+        first = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        self.assertEqual(first["status"], "milestone_waiting")
+        client.settle_without_delivery("dispatch_2", outcome=outcome)
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            run_local_id = run.local_id
+            self.assertIsNone(run.delivery_id)
+            self.assertIsNone(
+                store.connection.execute(
+                    "SELECT 1 FROM deliveries WHERE run_local_id = ? AND delivery_id = 'delivery_2'",
+                    (run.local_id,),
+                ).fetchone()
+            )
+            if remove_binding:
+                store.connection.execute(
+                    "DELETE FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                    (run.local_id,),
+                )
+        starts_before = len(
+            [
+                call
+                for call in client.calls
+                if call[:2] == ("orchestration", "worker-start")
+                and call[call.index("--task") + 1] == "task_2"
+            ]
+        )
+        client.deliveries_paused = False
+        report = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        starts_after = len(
+            [
+                call
+                for call in client.calls
+                if call[:2] == ("orchestration", "worker-start")
+                and call[call.index("--task") + 1] == "task_2"
+            ]
+        )
+        self.assertEqual(starts_before, 1)
+        self.assertEqual(starts_after, starts_before)
+        releases = [
+            call
+            for call in client.calls
+            if call[:2] == ("orchestration", "worker-release")
+            and call[call.index("--dispatch") + 1] == "dispatch_2"
+        ]
+        self.assertEqual(len(releases), 1)
+        with StateStore(self.root) as store:
+            run = store.get_run(run_local_id)
+            worker = store.connection.execute(
+                "SELECT outcome, release_state FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            ).fetchone()
+            self.assertEqual(worker["outcome"], outcome)
+            self.assertEqual(worker["release_state"], "released")
+        return report, client
+
+    @requires_native_windows_admission
+    def test_resume_receives_success_settled_before_delivery_with_original_binding(self) -> None:
+        report, _ = self._resume_settled_milestone_before_delivery(
+            outcome="succeeded",
+            remove_binding=False,
+        )
+        self.assertEqual(report["status"], "worker_succeeded")
+        self.assertEqual(report["verification"], "review_accepted")
+
+    @requires_native_windows_admission
+    def test_resume_receives_success_settled_before_delivery_with_reconstructed_binding(self) -> None:
+        report, _ = self._resume_settled_milestone_before_delivery(
+            outcome="succeeded",
+            remove_binding=True,
+        )
+        self.assertEqual(report["status"], "worker_succeeded")
+        self.assertEqual(report["verification"], "review_accepted")
+
+    @requires_native_windows_admission
+    def test_resume_receives_failure_settled_before_delivery_with_original_binding(self) -> None:
+        report, client = self._resume_settled_milestone_before_delivery(
+            outcome="failed",
+            remove_binding=False,
+        )
+        self.assertEqual(report["status"], "milestone_blocked")
+        self.assertEqual(report["verification"], "not_run")
+        self.assertNotIn("dispatch_3", client.workers)
+
+    @requires_native_windows_admission
+    def test_resume_receives_failure_settled_before_delivery_with_reconstructed_binding(self) -> None:
+        report, client = self._resume_settled_milestone_before_delivery(
+            outcome="failed",
+            remove_binding=True,
+        )
+        self.assertEqual(report["status"], "milestone_blocked")
+        self.assertEqual(report["verification"], "not_run")
+        self.assertNotIn("dispatch_3", client.workers)
+
+    @requires_native_windows_admission
+    def test_settled_before_delivery_still_requires_exact_native_task_identity(self) -> None:
+        objective = "Integrate then reject changed settled Task identity"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+        implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        client.settle_without_delivery("dispatch_2", outcome="succeeded")
+        client.tasks["task_2"]["run_id"] = "run_replacement"
+        client.deliveries_paused = False
+        with self.assertRaises(OrchestrateError) as caught:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(caught.exception.code, "native_task_binding_mismatch")
+        self.assertFalse(
+            any(
+                call[:2] == ("orchestration", "worker-release")
+                and call[call.index("--dispatch") + 1] == "dispatch_2"
+                for call in client.calls
+            )
+        )
+
+    @requires_native_windows_admission
+    def test_settled_reconstruction_rejects_replacement_worker_identity(self) -> None:
+        objective = "Integrate then reject replaced settled worker identity"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+        implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        client.settle_without_delivery("dispatch_2", outcome="failed")
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            store.connection.execute(
+                "DELETE FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            )
+        client.workers["dispatch_2"]["worktree"] = "repo::replacement"
+        client.deliveries_paused = False
+        with self.assertRaises(OrchestrateError) as caught:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(caught.exception.code, "native_worker_binding_mismatch")
+        self.assertFalse(
+            any(
+                call[:2] == ("orchestration", "worker-release")
+                and call[call.index("--dispatch") + 1] == "dispatch_2"
+                for call in client.calls
+            )
+        )
+
+    @requires_native_windows_admission
+    def test_delivery_revalidates_task_identity_after_check_before_success_effects(self) -> None:
+        objective = "Revalidate the complete native Task after lifecycle Delivery"
+        plan = self._write_milestone_plan(objective)
+
+        class PostCheckTaskDriftClient(MilestoneClient):
+            exact_task: dict[str, object] | None = None
+
+            def run_json(self, *arguments: str, **keywords: object) -> dict[str, object]:
+                response = super().run_json(*arguments, **keywords)
+                if (
+                    arguments[:2] == ("orchestration", "check")
+                    and "--ack" not in arguments
+                    and response["result"].get("deliveryId") == "delivery_2"  # type: ignore[index,union-attr]
+                    and self.exact_task is None
+                ):
+                    self.exact_task = dict(self.tasks["task_2"])
+                    self.tasks["task_2"]["task_title"] = "replacement title"
+                return response
+
+        client = PostCheckTaskDriftClient(self.root, pause_after_owner=True)
+        implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        client.settle_without_delivery("dispatch_2", outcome="succeeded")
+        client.deliveries_paused = False
+        with self.assertRaises(OrchestrateError) as caught:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(caught.exception.code, "native_task_binding_mismatch")
+        self.assertIsNotNone(client.exact_task)
+        self.assertFalse(client.workers["dispatch_2"]["released"])
+        self.assertFalse(
+            any(
+                call[:2] == ("orchestration", "check")
+                and "--ack" in call
+                and call[call.index("--ack") + 1] == "delivery_2"
+                for call in client.calls
+            )
+        )
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            worker = store.connection.execute(
+                "SELECT outcome, result_outcome, release_state FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            ).fetchone()
+            delivery = store.connection.execute(
+                "SELECT acked FROM deliveries WHERE run_local_id = ? AND delivery_id = 'delivery_2'",
+                (run.local_id,),
+            ).fetchone()
+            message = store.connection.execute(
+                "SELECT effect_status FROM delivery_messages WHERE run_local_id = ? AND delivery_id = 'delivery_2'",
+                (run.local_id,),
+            ).fetchone()
+            self.assertEqual((worker["outcome"], worker["result_outcome"], worker["release_state"]), (None, None, "owned"))
+            self.assertEqual(delivery["acked"], 0)
+            self.assertEqual(message["effect_status"], "observed")
+
+        for field, replacement in (
+            ("spec", "replacement spec"),
+            ("deps", ["task_replacement"]),
+        ):
+            with self.subTest(field=field):
+                client.tasks["task_2"] = dict(client.exact_task or {})
+                client.tasks["task_2"][field] = replacement
+                with self.assertRaises(OrchestrateError) as later_drift:
+                    resume(
+                        self.root,
+                        None,
+                        client=client,  # type: ignore[arg-type]
+                        milestone_plan=plan,
+                        wait_timeout_ms=60_000,
+                        require_context=False,
+                    )
+                self.assertEqual(later_drift.exception.code, "native_task_binding_mismatch")
+                self.assertFalse(client.workers["dispatch_2"]["released"])
+
+        client.tasks["task_2"] = dict(client.exact_task or {})
+        recovered = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        self.assertEqual(recovered["status"], "worker_succeeded")
+        self.assertEqual(recovered["verification"], "review_accepted")
+        self.assertTrue(client.workers["dispatch_2"]["released"])
+
+    @requires_native_windows_admission
+    def test_delivery_revalidates_gate_identity_after_check_before_failed_effects(self) -> None:
+        objective = "Revalidate the complete native gate after lifecycle Delivery"
+        plan = self._write_milestone_plan(objective)
+
+        class PostCheckGateDriftClient(MilestoneClient):
+            exact_gate: dict[str, object] | None = None
+
+            def run_json(self, *arguments: str, **keywords: object) -> dict[str, object]:
+                response = super().run_json(*arguments, **keywords)
+                if (
+                    arguments[:2] == ("orchestration", "check")
+                    and "--ack" not in arguments
+                    and response["result"].get("deliveryId") == "delivery_2"  # type: ignore[index,union-attr]
+                    and self.exact_gate is None
+                ):
+                    gate_id, gate = next(
+                        (key, value) for key, value in self.gates.items() if value["task_id"] == "task_2"
+                    )
+                    self.exact_gate = dict(gate)
+                    gate["id"] = f"{gate_id}_replacement"
+                return response
+
+        client = PostCheckGateDriftClient(self.root, pause_after_owner=True)
+        implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        client.settle_without_delivery("dispatch_2", outcome="failed")
+        client.deliveries_paused = False
+        with self.assertRaises(OrchestrateError) as caught:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(caught.exception.code, "native_gate_mismatch")
+        self.assertIsNotNone(client.exact_gate)
+        self.assertFalse(client.workers["dispatch_2"]["released"])
+        self.assertFalse(
+            any(
+                call[:2] == ("orchestration", "check")
+                and "--ack" in call
+                and call[call.index("--ack") + 1] == "delivery_2"
+                for call in client.calls
+            )
+        )
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            worker = store.connection.execute(
+                "SELECT outcome, result_outcome, release_state FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            ).fetchone()
+            delivery = store.connection.execute(
+                "SELECT acked FROM deliveries WHERE run_local_id = ? AND delivery_id = 'delivery_2'",
+                (run.local_id,),
+            ).fetchone()
+            self.assertEqual((worker["outcome"], worker["result_outcome"], worker["release_state"]), (None, None, "owned"))
+            self.assertEqual(delivery["acked"], 0)
+
+        gate_id = next(key for key, value in client.gates.items() if value["task_id"] == "task_2")
+        for field, replacement in (("status", "pending"), ("resolution", "rejected")):
+            with self.subTest(field=field):
+                client.gates[gate_id] = dict(client.exact_gate or {})
+                client.gates[gate_id][field] = replacement
+                with self.assertRaises(OrchestrateError) as later_drift:
+                    resume(
+                        self.root,
+                        None,
+                        client=client,  # type: ignore[arg-type]
+                        milestone_plan=plan,
+                        wait_timeout_ms=60_000,
+                        require_context=False,
+                    )
+                self.assertEqual(later_drift.exception.code, "native_gate_mismatch")
+                self.assertFalse(client.workers["dispatch_2"]["released"])
+
+        client.gates[gate_id] = dict(client.exact_gate or {})
+        recovered = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        self.assertEqual(recovered["status"], "milestone_blocked")
+        self.assertEqual(recovered["verification"], "not_run")
+        self.assertTrue(client.workers["dispatch_2"]["released"])
+
+    def _assert_post_check_worker_identity_hold(
+        self,
+        *,
+        outcome: str,
+        fault_path: tuple[str, ...],
+        remove: bool,
+    ) -> None:
+        objective = f"Revalidate immutable worker identity after {outcome} Delivery"
+        plan = self._write_milestone_plan(objective)
+
+        class PostCheckWorkerDriftClient(MilestoneClient):
+            inject_fault = False
+
+            def _worker_show(self, dispatch_id: str) -> dict[str, object]:
+                response = super()._worker_show(dispatch_id)
+                if self.inject_fault and dispatch_id == "dispatch_2" and not self.workers[dispatch_id]["released"]:
+                    target = response["result"]
+                    for key in fault_path[:-1]:
+                        target = target[key]  # type: ignore[index,assignment]
+                    if remove:
+                        del target[fault_path[-1]]  # type: ignore[index]
+                    else:
+                        target[fault_path[-1]] = "replacement"  # type: ignore[index]
+                return response
+
+            def run_json(self, *arguments: str, **keywords: object) -> dict[str, object]:
+                response = super().run_json(*arguments, **keywords)
+                if (
+                    arguments[:2] == ("orchestration", "check")
+                    and "--ack" not in arguments
+                    and response["result"].get("deliveryId") == "delivery_2"  # type: ignore[index,union-attr]
+                ):
+                    self.inject_fault = True
+                return response
+
+        client = PostCheckWorkerDriftClient(self.root, pause_after_owner=True)
+        implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        client.settle_without_delivery("dispatch_2", outcome=outcome)
+        starts_before = len(
+            [
+                call
+                for call in client.calls
+                if call[:2] == ("orchestration", "worker-start")
+                and call[call.index("--task") + 1] == "task_2"
+            ]
+        )
+        client.deliveries_paused = False
+        with self.assertRaises(OrchestrateError) as caught:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(caught.exception.code, "settlement_mismatch")
+        self.assertFalse(client.workers["dispatch_2"]["released"])
+        self.assertFalse(
+            any(
+                call[:2] == ("orchestration", "worker-release")
+                and call[call.index("--dispatch") + 1] == "dispatch_2"
+                for call in client.calls
+            )
+        )
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            worker = store.connection.execute(
+                "SELECT outcome, result_outcome, release_state FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            ).fetchone()
+            delivery = store.connection.execute(
+                "SELECT acked FROM deliveries WHERE run_local_id = ? AND delivery_id = 'delivery_2'",
+                (run.local_id,),
+            ).fetchone()
+            message = store.connection.execute(
+                "SELECT effect_status FROM delivery_messages WHERE run_local_id = ? AND delivery_id = 'delivery_2'",
+                (run.local_id,),
+            ).fetchone()
+            self.assertEqual((worker["outcome"], worker["result_outcome"], worker["release_state"]), (None, None, "owned"))
+            self.assertEqual(delivery["acked"], 0)
+            self.assertEqual(message["effect_status"], "observed")
+
+        client.inject_fault = False
+        recovered = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        self.assertEqual(
+            recovered["status"],
+            "worker_succeeded" if outcome == "succeeded" else "milestone_blocked",
+        )
+        releases = [
+            call
+            for call in client.calls
+            if call[:2] == ("orchestration", "worker-release")
+            and call[call.index("--dispatch") + 1] == "dispatch_2"
+        ]
+        task_starts = [
+            call
+            for call in client.calls
+            if call[:2] == ("orchestration", "worker-start")
+            and call[call.index("--task") + 1] == "task_2"
+        ]
+        self.assertEqual(len(releases), 1)
+        self.assertEqual(len(task_starts), starts_before)
+
+    @requires_native_windows_admission
+    def test_success_delivery_holds_changed_terminal_incarnation_until_exact_restoration(self) -> None:
+        self._assert_post_check_worker_identity_hold(
+            outcome="succeeded",
+            fault_path=("terminal", "incarnationId"),
+            remove=False,
+        )
+
+    @requires_native_windows_admission
+    def test_failed_delivery_holds_missing_endpoint_incarnation_until_exact_restoration(self) -> None:
+        self._assert_post_check_worker_identity_hold(
+            outcome="failed",
+            fault_path=("terminalResource", "endpointIncarnation"),
+            remove=True,
+        )
+
+    @requires_native_windows_admission
+    def test_grantless_historical_wide_run_reconciles_before_holding_new_launches(self) -> None:
+        objective = "Reconcile a historical capacity-four worker before any replacement launch"
+        plan = self._write_milestone_plan(objective, max_workers=4)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+        first = implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            allow_exceptional_capacity=True,
+            capacity_reason="historical capacity-four fixture",
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        self.assertEqual(first["status"], "milestone_waiting")
+        client.settle_without_delivery("dispatch_2", outcome="succeeded")
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            store.connection.execute(
+                "DELETE FROM evidence WHERE run_local_id = ? AND kind = 'capacity-grant'",
+                (run.local_id,),
+            )
+        client.deliveries_paused = False
+        starts_before = len([call for call in client.calls if call[:2] == ("orchestration", "worker-start")])
+        checks_before = len(
+            [call for call in client.calls if call[:2] == ("orchestration", "check") and "--ack" not in call]
+        )
+        with self.assertRaises(OrchestrateError) as held:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(held.exception.code, "exceptional_capacity_required")
+        self.assertEqual(
+            len([call for call in client.calls if call[:2] == ("orchestration", "worker-start")]),
+            starts_before,
+        )
+        self.assertGreater(
+            len([call for call in client.calls if call[:2] == ("orchestration", "check") and "--ack" not in call]),
+            checks_before,
+        )
+        self.assertTrue(client.workers["dispatch_2"]["released"])
+        self.assertTrue(
+            any(
+                call[:2] == ("orchestration", "check")
+                and "--ack" in call
+                and call[call.index("--ack") + 1] == "delivery_2"
+                for call in client.calls
+            )
+        )
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            worker = store.connection.execute(
+                "SELECT outcome, result_outcome, release_state FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            ).fetchone()
+            self.assertEqual(
+                (worker["outcome"], worker["result_outcome"], worker["release_state"]),
+                ("succeeded", "accepted", "released"),
+            )
+
+        calls_after_reconciliation = len(client.calls)
+        with self.assertRaises(OrchestrateError) as restarted_hold:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(restarted_hold.exception.code, "exceptional_capacity_required")
+        new_calls = client.calls[calls_after_reconciliation:]
+        self.assertFalse(any(call[:2] == ("orchestration", "worker-start") for call in new_calls))
+        self.assertFalse(any(call[:2] == ("orchestration", "worker-release") for call in new_calls))
+        self.assertFalse(any(call[:2] == ("orchestration", "check") for call in new_calls))
+
+        client.deliveries_paused = True
+        granted = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            allow_exceptional_capacity=True,
+            capacity_reason="  authorize the remaining bounded review launch  ",
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        self.assertEqual(granted["status"], "milestone_waiting")
+        starts_after_grant = [call for call in client.calls if call[:2] == ("orchestration", "worker-start")]
+        self.assertEqual(len(starts_after_grant), starts_before + 1)
+        client.deliveries_paused = False
+        completed = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            allow_exceptional_capacity=True,
+            capacity_reason="  authorize the remaining bounded review launch  ",
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        self.assertEqual(completed["status"], "worker_succeeded")
+        self.assertEqual(completed["verification"], "review_accepted")
+        starts_after = [call for call in client.calls if call[:2] == ("orchestration", "worker-start")]
+        self.assertEqual(len(starts_after), starts_before + 1)
+        self.assertEqual(starts_after[-1][starts_after[-1].index("--task") + 1], "task_3")
+
+    @requires_native_windows_admission
+    def test_settlement_restart_rejoins_an_applied_release_before_local_outcome(self) -> None:
+        objective = "Resume exact milestone settlement after release readback loss"
+        plan = self._write_milestone_plan(objective)
+
+        class ReleaseReadbackLossClient(MilestoneClient):
+            lost_release_readback = False
+
+            def run_json(self, *arguments: str, **keywords: object) -> dict[str, object]:
+                if (
+                    arguments[:2] == ("orchestration", "worker-show")
+                    and arguments[arguments.index("--dispatch") + 1] == "dispatch_2"
+                    and self.workers.get("dispatch_2", {}).get("released") is True
+                    and not self.lost_release_readback
+                ):
+                    self.calls.append(arguments)
+                    self.lost_release_readback = True
+                    raise OrcaCommandError(
+                        "synthetic release readback loss",
+                        OrcaCommandResult(arguments, -1, "", "lost", None),
+                    )
+                return super().run_json(*arguments, **keywords)
+
+        client = ReleaseReadbackLossClient(self.root, pause_after_owner=True)
+        implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        client.settle_without_delivery("dispatch_2", outcome="succeeded")
+        client.deliveries_paused = False
+        with self.assertRaises(OrcaCommandError):
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            worker = store.connection.execute(
+                "SELECT outcome, result_outcome, release_state FROM milestone_worker_bindings WHERE run_local_id = ? AND task_key = 'verify'",
+                (run.local_id,),
+            ).fetchone()
+            release = store.connection.execute(
+                "SELECT status FROM intentions WHERE run_local_id = ? AND operation = 'milestone-worker-release:verify'",
+                (run.local_id,),
+            ).fetchone()
+            self.assertEqual((worker["outcome"], worker["result_outcome"], worker["release_state"]), (None, None, "owned"))
+            self.assertEqual(release["status"], "applied")
+
+        client.workers["dispatch_2"]["launch"]["effective"]["effort"] = "replacement"  # type: ignore[index]
+        with self.assertRaises(OrchestrateError) as drifted:
+            resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=60_000,
+                require_context=False,
+            )
+        self.assertEqual(drifted.exception.code, "settlement_mismatch")
+        client.workers["dispatch_2"]["launch"]["effective"]["effort"] = "high"  # type: ignore[index]
+        recovered = resume(
+            self.root,
+            None,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=60_000,
+            require_context=False,
+        )
+        self.assertEqual(recovered["status"], "worker_succeeded")
+        self.assertEqual(recovered["verification"], "review_accepted")
+        releases = [
+            call
+            for call in client.calls
+            if call[:2] == ("orchestration", "worker-release")
+            and call[call.index("--dispatch") + 1] == "dispatch_2"
+        ]
+        self.assertEqual(len(releases), 1)
+        starts = [
+            call
+            for call in client.calls
+            if call[:2] == ("orchestration", "worker-start")
+            and call[call.index("--task") + 1] == "task_2"
+        ]
+        self.assertEqual(len(starts), 1)
+
+    @requires_native_windows_admission
+    def test_resume_repairs_missing_session_projection_idempotently(self) -> None:
+        objective = "Integrate then repair interrupted telemetry projection"
+        plan = self._write_milestone_plan(objective)
+        client = MilestoneClient(self.root, pause_after_owner=True)
+        implement(
+            self.root,
+            objective,
+            client=client,  # type: ignore[arg-type]
+            milestone_plan=plan,
+            wait_timeout_ms=500,
+            require_context=False,
+        )
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            store.connection.execute(
+                """DELETE FROM evidence WHERE run_local_id = ? AND kind = 'efficiency-event'
+                   AND payload_json LIKE '%\"identity\":\"dispatch_2\"%'""",
+                (run.local_id,),
+            )
+        starts_before = len([call for call in client.calls if call[:2] == ("orchestration", "worker-start")])
+        for _ in range(2):
+            report = resume(
+                self.root,
+                None,
+                client=client,  # type: ignore[arg-type]
+                milestone_plan=plan,
+                wait_timeout_ms=1,
+                require_context=False,
+            )
+            self.assertEqual(report["status"], "milestone_waiting")
+        with StateStore(self.root) as store:
+            run = store.select_run(None)
+            events = store.connection.execute(
+                """SELECT payload_json FROM evidence WHERE run_local_id = ? AND kind = 'efficiency-event'
+                   AND payload_json LIKE '%\"identity\":\"dispatch_2\"%'""",
+                (run.local_id,),
+            ).fetchall()
+        self.assertEqual(len(events), 1)
         starts_after = len([call for call in client.calls if call[:2] == ("orchestration", "worker-start")])
         self.assertEqual(starts_after, starts_before)
 
@@ -3918,6 +4937,7 @@ class ControllerTests(MilestoneRepo):
         ]
         self.assertEqual(len(diagnostics), 1)
         self.assertEqual(diagnostics[0]["status"], "unresolved")
+
         self.assertFalse(diagnostics[0]["payload"]["taskInputResent"])
         self.assertEqual(sum("worker-start" in call for call in client.calls), 1)
         self.assertEqual(sum(call[:2] == ("orchestration", "worker-show") for call in client.calls), 2)
@@ -3933,6 +4953,38 @@ class ControllerTests(MilestoneRepo):
                 sum(item["subject"] == "worker input submission unproven" for item in store.evidence(run.local_id)),
                 1,
             )
+
+    def test_thirty_minute_healthy_wait_uses_native_checks_without_coordination_model_launches(self) -> None:
+        objective = "Wait efficiently for the already-running implementation owner"
+        responses = completion_responses(self.root, objective)[:6]
+        responses.extend(
+            {"result": {"deliveryId": None, "messages": [], "timedOut": True}}
+            for _ in range(30)
+        )
+        client = FakeClient(responses)
+        clock = (0.0, *(float(index * 60) for index in range(30)), 1800.0)
+
+        with patch("orchestrate.controller._monotonic", side_effect=clock) as controlled_clock:
+            report = implement(
+                self.root,
+                objective,
+                client=client,  # type: ignore[arg-type]
+                wait_timeout_ms=1_800_000,
+                require_context=False,
+            )
+
+        checks = [call for call in client.calls if call[:2] == ("orchestration", "check")]
+        starts = [call for call in client.calls if call[:2] == ("orchestration", "worker-start")]
+        self.assertEqual(report["status"], "waiting")
+        self.assertEqual(controlled_clock.call_count, 32)
+        self.assertEqual(len(checks), 30)
+        self.assertTrue(all(call[call.index("--timeout-ms") + 1] == "60000" for call in checks))
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(
+            report["efficiency"]["usage"]["controllerModelCalls"],
+            {"value": 0, "scope": "instrumented deterministic controller only"},
+        )
+        self.assertEqual(client.responses, [])
 
     def test_controller_rejects_both_versioned_input_accepted_failure_fields(self) -> None:
         with StateStore(self.root, home=Path(self.state_temp.name)) as store:
@@ -4514,7 +5566,7 @@ class ControllerTests(MilestoneRepo):
 
             self.assertEqual(recovered.phase, "worker_unadmitted")
             self.assertFalse(any("worker-release" in call for call in recovery_client.calls))
-            self.assertEqual(len(store.evidence(run.local_id)), 2)
+            self.assertEqual(len(store.evidence(run.local_id)), 3)
 
     def test_resume_reprocesses_terminal_phase_observed_delivery_and_acks(self) -> None:
         profile = setup_project(self.root)

@@ -177,7 +177,7 @@ class MilestonePlan:
     contract: SharedContract
     candidate_digest: str
     tasks: tuple[MilestoneTask, ...]
-    max_workers: int = 3
+    max_workers: int = 2
 
     def validated(self) -> "MilestonePlan":
         if not self.candidate_digest:
@@ -336,7 +336,8 @@ def load_milestone_plan(
         )
     raw = read_project_bytes(root, relative)
     try:
-        decoded = json.loads(raw.decode("utf-8"))
+        original_json = raw.decode("utf-8")
+        decoded = json.loads(original_json)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OrchestrateError("Milestone plan is not strict UTF-8 JSON", code="milestone_plan_invalid") from exc
     plan = _validated_milestone_plan_value(
@@ -344,9 +345,8 @@ def load_milestone_plan(
         objective=objective,
         candidate_digest=candidate_digest,
     )
-    canonical = _canonical_json(decoded)
-    digest = _canonical_digest_from_json(canonical, "plan")
-    return LoadedMilestonePlan(relative, digest, canonical, plan)
+    digest = _canonical_digest_from_json(original_json, "plan")
+    return LoadedMilestonePlan(relative, digest, original_json, plan)
 
 
 def load_stored_milestone_plan(
@@ -362,12 +362,6 @@ def load_stored_milestone_plan(
         decoded = json.loads(plan_json)
     except (TypeError, json.JSONDecodeError) as exc:
         raise OrchestrateError("Stored milestone plan is not strict JSON", code="milestone_plan_invalid") from exc
-    canonical = _canonical_json(decoded)
-    if canonical != plan_json:
-        raise OrchestrateError(
-            "Stored milestone plan bytes are not canonical",
-            code="milestone_plan_invalid",
-        )
     plan = _validated_milestone_plan_value(
         decoded,
         objective=objective,
@@ -375,8 +369,8 @@ def load_stored_milestone_plan(
     )
     return LoadedMilestonePlan(
         relative_path,
-        _canonical_digest_from_json(canonical, "plan"),
-        canonical,
+        _canonical_digest_from_json(plan_json, "plan"),
+        plan_json,
         plan,
     )
 
@@ -389,11 +383,14 @@ def _validated_milestone_plan_value(
 ) -> MilestonePlan:
     """Validate the complete v1 schema, contract, Tasks, roles, dependencies, and gates."""
 
-    if not isinstance(decoded, Mapping) or set(decoded) != {"schema", "contract", "maxWorkers", "tasks"}:
+    if not isinstance(decoded, Mapping) or set(decoded) not in (
+        {"schema", "contract", "tasks"},
+        {"schema", "contract", "maxWorkers", "tasks"},
+    ):
         raise OrchestrateError("Milestone plan has unsupported or missing fields", code="milestone_plan_invalid")
     if decoded.get("schema") != MILESTONE_PLAN_SCHEMA:
         raise OrchestrateError("Milestone plan schema is unsupported", code="milestone_plan_invalid")
-    max_workers = decoded.get("maxWorkers")
+    max_workers = decoded.get("maxWorkers", 2)
     raw_tasks = decoded.get("tasks")
     raw_contract = decoded.get("contract")
     if type(max_workers) is not int or not isinstance(raw_tasks, list) or not isinstance(raw_contract, Mapping):
@@ -557,6 +554,14 @@ class NativeDagScheduler:
             if stored_arguments != arguments or not isinstance(native, Mapping) or not isinstance(native.get("id"), str):
                 raise OrchestrateError("Applied milestone Task receipt changed identity", code="native_task_binding_mismatch")
             return self._record_binding(task, native["id"], dependency_ids)
+        return self._validated_binding(task, dependency_ids, row)
+
+    @staticmethod
+    def _validated_binding(
+        task: MilestoneTask,
+        dependency_ids: list[str],
+        row: Mapping[str, Any],
+    ) -> NativeTaskBinding:
         expected = (
             task.candidate_digest,
             task.contract_digest,
@@ -574,7 +579,48 @@ class NativeDagScheduler:
                 "Stored milestone Task binding conflicts with the selected plan",
                 code="native_task_binding_mismatch",
             )
+        if not isinstance(row["task_id"], str) or not row["task_id"]:
+            raise OrchestrateError(
+                "Stored milestone Task binding lost its native identity",
+                code="native_task_binding_mismatch",
+            )
         return NativeTaskBinding(task.key, row["task_id"], tuple(dependency_ids), task.spec)
+
+    def existing_bindings(
+        self,
+        plan: MilestonePlan,
+        *,
+        integration_owner: NativeTaskBinding,
+    ) -> dict[str, NativeTaskBinding]:
+        """Load exact existing Task bindings without creating or reconstructing any."""
+
+        plan.validated()
+        owner = next(task for task in plan.tasks if task.integration_owner)
+        if (
+            integration_owner.key != owner.key
+            or integration_owner.dependencies
+            or integration_owner.task_id == ""
+        ):
+            raise OrchestrateError(
+                "The existing implementation Task is not the exact integration owner",
+                code="integration_owner_invalid",
+            )
+        bindings = {owner.key: integration_owner}
+        for task in plan.topological():
+            if task.integration_owner:
+                continue
+            dependency_ids = [bindings[key].task_id for key in task.dependencies]
+            row = self.store.connection.execute(
+                "SELECT * FROM milestone_task_bindings WHERE run_local_id = ? AND task_key = ?",
+                (self.run_local_id, task.key),
+            ).fetchone()
+            if row is None:
+                raise OrchestrateError(
+                    "Milestone settlement lost an exact planned Task binding",
+                    code="native_task_binding_mismatch",
+                )
+            bindings[task.key] = self._validated_binding(task, dependency_ids, row)
+        return bindings
 
     def _record_binding(
         self,
@@ -715,6 +761,8 @@ class NativeDagScheduler:
         run_id: str,
         plan: MilestonePlan,
         bindings: Mapping[str, NativeTaskBinding],
+        *,
+        required_statuses: Mapping[str, str] | None = None,
     ) -> None:
         response = self.client.run_json("orchestration", "task-list", "--run", run_id, "--json")
         rows = _result(response).get("tasks")
@@ -733,9 +781,16 @@ class NativeDagScheduler:
             if worker is None:
                 allowed_statuses = {"ready", "pending"}
             elif worker["outcome"] is None:
-                allowed_statuses = {"dispatched"}
+                # Native settlement can precede receipt of the lifecycle
+                # Delivery that authoritatively records the local outcome.
+                # The exact bound worker continues to occupy capacity until
+                # that Delivery is validated, released, and journaled.
+                allowed_statuses = {"dispatched", "completed", "failed"}
             else:
                 allowed_statuses = {"completed" if worker["outcome"] == "succeeded" else "failed"}
+            required_status = required_statuses.get(key) if required_statuses is not None else None
+            if required_status is not None:
+                allowed_statuses = {required_status}
             if (
                 not isinstance(row, Mapping)
                 or row.get("run_id") != run_id
@@ -748,6 +803,47 @@ class NativeDagScheduler:
                     f"Native Task readback changed {task.key}'s identity, title, spec, dependencies, or gate state",
                     code="native_task_binding_mismatch",
                 )
+
+    def validate_settlement_readback(
+        self,
+        run_id: str,
+        plan: MilestonePlan,
+        bindings: Mapping[str, NativeTaskBinding],
+        gates: Mapping[str, NativeGateBinding],
+        *,
+        task_key: str,
+        outcome: Literal["succeeded", "failed"],
+    ) -> None:
+        """Revalidate a Delivery's exact current Task and gate before settlement effects."""
+
+        task_map = {task.key: task for task in plan.tasks}
+        task = task_map.get(task_key)
+        binding = bindings.get(task_key)
+        if task is None or binding is None or task.integration_owner:
+            raise OrchestrateError(
+                "Milestone settlement has no exact planned follow-up Task",
+                code="native_task_binding_mismatch",
+            )
+        required_status = "completed" if outcome == "succeeded" else "failed"
+        self._validate_readback(
+            run_id,
+            plan,
+            {task_key: binding},
+            required_statuses={task_key: required_status},
+        )
+        if task.gate not in {"verification", "review"}:
+            raise OrchestrateError(
+                "Milestone settlement Task has no exact lifecycle gate",
+                code="native_gate_mismatch",
+            )
+        gate = gates.get(task_key)
+        if gate is None:
+            raise OrchestrateError(
+                "Milestone settlement lost its exact planned gate",
+                code="native_gate_mismatch",
+            )
+        self._validate_stored_gate(task, binding.task_id, self._gate_question(task, plan), gate)
+        self._gate_readback(gate)
 
     def ready_wave(
         self,
@@ -872,19 +968,16 @@ class NativeDagScheduler:
         ).fetchone()
         if row is None:
             return None
-        expected = (task_id, task.gate, question)
-        actual = (row["task_id"], row["gate_kind"], row["question"])
-        if actual != expected:
-            raise OrchestrateError("Stored gate conflicts with the selected plan", code="native_gate_mismatch")
         binding = NativeGateBinding(
-            task.key,
-            task_id,
+            row["task_key"],
+            row["task_id"],
             row["gate_id"],
-            task.gate,  # type: ignore[arg-type]
-            question,
+            row["gate_kind"],
+            row["question"],
             row["status"],
             row["resolution"],
         )
+        self._validate_stored_gate(task, task_id, question, binding)
         try:
             self._gate_readback(binding)
             return binding
@@ -936,6 +1029,27 @@ class NativeDagScheduler:
             (recovered.resolution, utc_now(), self.run_local_id, task.key),
         )
         return recovered
+
+    @staticmethod
+    def _validate_stored_gate(
+        task: MilestoneTask,
+        task_id: str,
+        question: str,
+        binding: NativeGateBinding,
+    ) -> None:
+        if (
+            binding.task_key != task.key
+            or binding.task_id != task_id
+            or binding.gate_kind != task.gate
+            or binding.question != question
+            or binding.status not in {"pending", "resolved"}
+            or (binding.status == "pending" and binding.resolution is not None)
+            or (binding.status == "resolved" and binding.resolution not in {"accepted", "rejected"})
+        ):
+            raise OrchestrateError(
+                "Stored gate conflicts with the selected plan",
+                code="native_gate_mismatch",
+            )
 
     def create_gates(
         self,
@@ -1229,20 +1343,9 @@ def next_session_action(
 ) -> SessionAction:
     """Choose exactly one post-settlement owner for the bound terminal."""
 
-    if next_task_id is not None and next_agent == session.agent:
-        return SessionAction(
-            "reuse",
-            (
-                "orchestration",
-                "worker-start",
-                "--task",
-                next_task_id,
-                "--terminal",
-                session.terminal_handle,
-                "--worktree",
-                f"id:{session.worktree_id}",
-            ),
-        )
+    # A Task boundary is a session boundary. Existing Dispatch recovery and
+    # answers retain their session, but a newly created Task always starts a
+    # fresh agent session even when its role selects the same agent.
     return SessionAction(
         "release",
         ("orchestration", "worker-release", "--dispatch", session.dispatch_id),
@@ -1255,6 +1358,201 @@ class ReleaseDecision:
     recovery: str | tuple[str, ...] | None
     repeat_release: bool = False
     recovery_metadata: Mapping[str, Any] | None = None
+
+
+_DISPATCH_START_IDENTITY_FIELDS = (
+    "id",
+    "runId",
+    "run_id",
+    "taskId",
+    "task_id",
+    "agent",
+    "agentIdentity",
+)
+_WORKER_START_IDENTITY_FIELDS = (
+    "id",
+    "dispatchId",
+    "dispatch_id",
+    "runId",
+    "run_id",
+    "taskId",
+    "task_id",
+    "worktreeId",
+    "worktree_id",
+    "agentTerminalHandle",
+    "agent_terminal_handle",
+    "agent",
+    "agentIdentity",
+)
+_TERMINAL_START_IDENTITY_FIELDS = (
+    "handle",
+    "ptyId",
+    "incarnationId",
+    "worktreeId",
+    "executionHostId",
+    "agentIdentity",
+)
+_TERMINAL_RESOURCE_START_IDENTITY_FIELDS = (
+    "id",
+    "originDispatchId",
+    "ownerDispatchId",
+    "terminalHandle",
+    "worktreeId",
+    "endpointId",
+    "endpointIncarnation",
+)
+_START_OPTION_IDENTITY_FIELDS = (
+    "worktree",
+    "resolvedWorktreeId",
+    "terminal",
+    "agent",
+    "setup",
+    "setupSource",
+)
+
+
+def _same_json_identity(expected: object, actual: object) -> bool:
+    if type(expected) is not type(actual):
+        return False
+    if isinstance(expected, Mapping):
+        return set(expected) == set(actual) and all(  # type: ignore[arg-type]
+            _same_json_identity(expected[key], actual[key])  # type: ignore[index]
+            for key in expected
+        )
+    if isinstance(expected, list):
+        return len(expected) == len(actual) and all(  # type: ignore[arg-type]
+            _same_json_identity(left, right)
+            for left, right in zip(expected, actual, strict=True)  # type: ignore[arg-type]
+        )
+    return expected == actual
+
+
+def _require_observed_start_fields(
+    initial: Mapping[str, Any],
+    current: Mapping[str, Any],
+    fields: Sequence[str],
+    *,
+    component: str,
+) -> None:
+    changed = [
+        f"{component}.{field}"
+        for field in fields
+        if field in initial
+        and (field not in current or not _same_json_identity(initial[field], current[field]))
+    ]
+    if changed:
+        raise OrchestrateError(
+            "worker-show changed immutable worker-start identity",
+            code="release_unconfirmed",
+            data={"fields": changed},
+        )
+
+
+def validate_immutable_worker_start_readback(
+    initial_payload: Mapping[str, Any],
+    current_payload: Mapping[str, Any],
+    *,
+    allow_released_terminal_detachment: bool = False,
+) -> None:
+    """Rejoin every supported immutable field observed in the validated start readback.
+
+    Runtime status, execution stage, ownership/release state, timestamps, archive,
+    and liveness are deliberately excluded.  A supported optional field becomes
+    mandatory once the initial worker-show reported it.
+    """
+
+    initial = _result(initial_payload)
+    current = _result(current_payload)
+    initial_dispatch = initial.get("dispatch")
+    current_dispatch = current.get("dispatch")
+    initial_worker = initial.get("worker")
+    current_worker = current.get("worker")
+    initial_resource = initial.get("terminalResource")
+    current_resource = current.get("terminalResource")
+    if not all(
+        isinstance(item, Mapping)
+        for item in (
+            initial_dispatch,
+            current_dispatch,
+            initial_worker,
+            current_worker,
+            initial_resource,
+            current_resource,
+        )
+    ):
+        raise OrchestrateError(
+            "worker-show omitted immutable worker-start identity",
+            code="release_unconfirmed",
+        )
+    assert isinstance(initial_dispatch, Mapping)
+    assert isinstance(current_dispatch, Mapping)
+    assert isinstance(initial_worker, Mapping)
+    assert isinstance(current_worker, Mapping)
+    assert isinstance(initial_resource, Mapping)
+    assert isinstance(current_resource, Mapping)
+    _require_observed_start_fields(
+        initial_dispatch,
+        current_dispatch,
+        _DISPATCH_START_IDENTITY_FIELDS,
+        component="dispatch",
+    )
+    _require_observed_start_fields(
+        initial_worker,
+        current_worker,
+        _WORKER_START_IDENTITY_FIELDS,
+        component="worker",
+    )
+    _require_observed_start_fields(
+        initial_resource,
+        current_resource,
+        _TERMINAL_RESOURCE_START_IDENTITY_FIELDS,
+        component="terminalResource",
+    )
+
+    initial_options = initial_worker.get("startOptions")
+    current_options = current_worker.get("startOptions")
+    if not isinstance(initial_options, Mapping) or not isinstance(current_options, Mapping):
+        raise OrchestrateError(
+            "worker-show omitted immutable worker startOptions",
+            code="release_unconfirmed",
+        )
+    _require_observed_start_fields(
+        initial_options,
+        current_options,
+        _START_OPTION_IDENTITY_FIELDS,
+        component="worker.startOptions",
+    )
+    initial_launch = initial_options.get("launch")
+    current_launch = current_options.get("launch")
+    if not isinstance(initial_launch, Mapping) or not isinstance(current_launch, Mapping):
+        raise OrchestrateError(
+            "worker-show omitted immutable requested/effective launch identity",
+            code="release_unconfirmed",
+        )
+    _require_observed_start_fields(
+        initial_launch,
+        current_launch,
+        ("requested", "effective"),
+        component="worker.startOptions.launch",
+    )
+
+    initial_terminal = initial.get("terminal")
+    current_terminal = current.get("terminal")
+    if isinstance(initial_terminal, Mapping):
+        if current_terminal is None and allow_released_terminal_detachment:
+            pass
+        elif not isinstance(current_terminal, Mapping):
+            raise OrchestrateError(
+                "worker-show lost the immutable worker terminal identity",
+                code="release_unconfirmed",
+            )
+        else:
+            _require_observed_start_fields(
+                initial_terminal,
+                current_terminal,
+                _TERMINAL_START_IDENTITY_FIELDS,
+                component="terminal",
+            )
 
 
 def validate_session_readback(session: WorkerSession, payload: Mapping[str, Any]) -> None:
@@ -1286,6 +1584,31 @@ def validate_session_readback(session: WorkerSession, payload: Mapping[str, Any]
         or resource_identity.worktree_id != session.worktree_id
     ):
         raise OrchestrateError("worker-show changed the exact session resource identity", code="release_unconfirmed")
+
+
+def validate_owned_session_readback(session: WorkerSession, payload: Mapping[str, Any]) -> None:
+    """Require an exact settled session whose resource is still owned and unreleased."""
+
+    validate_session_readback(session, payload)
+    result = _result(payload)
+    resource = result.get("terminalResource")
+    terminal = result.get("terminal")
+    if (
+        not isinstance(resource, Mapping)
+        or not isinstance(terminal, Mapping)
+        or terminal.get("handle") != session.terminal_handle
+        or resource.get("ownershipState") != "owned"
+        or resource.get("releaseState") != "not_requested"
+        or resource.get("retainedReason") is not None
+        or resource.get("releaseRequestedAt") is not None
+        or resource.get("releaseCompletedAt") is not None
+        or resource.get("releaseError") is not None
+        or resource.get("archive") is not None
+    ):
+        raise OrchestrateError(
+            "worker-show no longer has the exact owned settlement resource",
+            code="release_unconfirmed",
+        )
 
 
 def validate_release_receipt(
